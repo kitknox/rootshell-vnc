@@ -1001,6 +1001,83 @@ final class DisplayPresentationTests: XCTestCase {
             normalizedSelectedDisplayRegion(displays, displayCount: 2),
             CGRect(x: 0, y: 0, width: 4480, height: 1440))
     }
+
+    @MainActor
+    func testHighPerformanceInputDoesNotAddUnselectedMonitorOffset() async throws {
+        for origin in [CGPoint(x: 1920, y: 0), CGPoint(x: 0, y: 1080)] {
+            let session = VNCSession(configuration: VNCConfiguration(
+                videoQualityMode: .adaptive,
+                displaySizingMode: .remoteDisplay))
+            await session.updateRemoteDisplayRegions([
+                AppleDisplayInfo(
+                    displayIndex: 1, originX: Int32(origin.x), originY: Int32(origin.y),
+                    width: 2560, height: 1440, flags: 0),
+                AppleDisplayInfo(
+                    displayIndex: 2, originX: 0, originY: 0,
+                    width: 1920, height: 1080, flags: 0),
+            ])
+            session.isHighPerformanceMode = true
+
+            XCTAssertEqual(session.presentedVideoDisplayRegions.first?.origin, .zero)
+            XCTAssertEqual(session.presentedInputOrigin, .zero)
+            // A half-size viewport must still target framebuffer pixel (20, 12).
+            let point = try XCTUnwrap(RemoteViewportState().framebufferPoint(
+                for: CGPoint(x: 10, y: 6),
+                viewSize: CGSize(width: 1280, height: 720),
+                framebufferSize: session.presentedFramebufferSize))
+            XCTAssertEqual(CGPoint(
+                x: point.x + session.presentedInputOrigin.x,
+                y: point.y + session.presentedInputOrigin.y), CGPoint(x: 20, y: 12))
+
+            // Rendering/cropping metadata retains the physical desktop origin.
+            XCTAssertEqual(session.presentedFramebufferRegion?.origin, origin)
+            session.isHighPerformanceMode = false
+            XCTAssertEqual(session.presentedInputOrigin, origin,
+                "Fallback to Standard must restore the framebuffer crop offset")
+        }
+    }
+
+    @MainActor
+    func testHighPerformanceInputOriginForOtherDisplayModes() async {
+        for mode in [VNCConfiguration.DisplayMode.oneDisplay, .allDisplaysCombined,
+                     .twoVirtualDisplays] {
+            let session = VNCSession(configuration: VNCConfiguration(
+                videoQualityMode: .adaptive,
+                displaySizingMode: mode == .twoVirtualDisplays ? .matchClient : .remoteDisplay,
+                displayMode: mode))
+            await session.updateRemoteDisplayRegions([
+                AppleDisplayInfo(
+                    displayIndex: 1, originX: 0, originY: 0,
+                    width: 2560, height: 1440, flags: 0),
+                AppleDisplayInfo(
+                    displayIndex: 2, originX: 2560, originY: 0,
+                    width: 1920, height: 1080, flags: 0),
+            ])
+            session.isHighPerformanceMode = true
+            XCTAssertEqual(session.presentedInputOrigin, .zero)
+        }
+    }
+
+    @MainActor
+    func testMatchClientInputIgnoresPreviousPhysicalDisplayOrigin() async {
+        for count in [1, 2] {
+            let session = VNCSession(configuration: VNCConfiguration(
+                videoQualityMode: .adaptive,
+                displaySizingMode: .matchClient,
+                displayMode: count == 1 ? .oneDisplay : .twoVirtualDisplays))
+            await session.updateRemoteDisplayRegions([
+                AppleDisplayInfo(
+                    displayIndex: 1, originX: 1920, originY: 1080,
+                    width: 2560, height: 1440, flags: 0),
+                AppleDisplayInfo(
+                    displayIndex: 2, originX: 0, originY: 0,
+                    width: 1920, height: 1080, flags: 0),
+            ])
+            session.isHighPerformanceMode = true
+            XCTAssertEqual(session.presentedInputOrigin, .zero)
+            XCTAssertNil(session.presentedFramebufferRegion)
+        }
+    }
 }
 
 final class VNCReconnectionPolicyTests: XCTestCase {

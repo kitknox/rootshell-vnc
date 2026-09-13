@@ -2230,6 +2230,13 @@ public final class VNCSession {
             displayCount: configuration.displayCount)
     }
 
+    /// High Performance input is relative to the selected video canvas:
+    /// Apple's server adds the active screen origin before HiDPI conversion.
+    /// Standard framebuffer crops still need their offset within the desktop.
+    var presentedInputOrigin: CGPoint {
+        isHighPerformanceMode ? .zero : presentedFramebufferRegion?.origin ?? .zero
+    }
+
     var presentedFramebufferSize: CGSize {
         presentedFramebufferRegion?.size ?? CGSize(
             width: framebufferWidth,
