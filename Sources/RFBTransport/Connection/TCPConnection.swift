@@ -295,7 +295,10 @@ public actor TCPConnection: RFBConnection {
             receiveBuffer.removeAll(keepingCapacity: true)
             receiveOffset = 0
         } else if receiveOffset > Self.compactionThreshold {
-            receiveBuffer.removeFirst(receiveOffset)
+            // removeFirst slices Data, keeping every received byte and walking
+            // startIndex past Int32.max; removeSubrange compacts in place.
+            receiveBuffer.removeSubrange(
+                receiveBuffer.startIndex..<(receiveBuffer.startIndex + receiveOffset))
             receiveOffset = 0
         }
         return result
