@@ -146,6 +146,9 @@ public actor PosixUDPChannel {
     private let remotePort: UInt16?
     private let remoteAddressFamily: PosixUDPAddressFamily?
     private let enableReusePort: Bool
+    /// Set for a host-supplied connected socket; `start()` skips resolve,
+    /// bind and connect.
+    private let adoptedLabel: String?
 
     private var fd: Int32 = -1
     private var boundPort: UInt16?
@@ -199,6 +202,7 @@ public actor PosixUDPChannel {
         self.remotePort = remotePort
         self.remoteAddressFamily = nil
         self.enableReusePort = enableReusePort
+        self.adoptedLabel = nil
     }
 
     init(
@@ -213,11 +217,34 @@ public actor PosixUDPChannel {
         self.remotePort = remotePort
         self.remoteAddressFamily = remoteAddressFamily
         self.enableReusePort = enableReusePort
+        self.adoptedLabel = nil
+    }
+
+    /// Wrap a connected datagram socket of any family, such as one end of an
+    /// AF_UNIX socketpair. The channel owns `fd` and closes it.
+    public init(adoptingConnectedDescriptor fd: Int32, label: String) {
+        self.requestedLocalPort = nil
+        self.remoteHost = nil
+        self.remotePort = nil
+        self.remoteAddressFamily = nil
+        self.enableReusePort = false
+        self.adoptedLabel = label
+        self.fd = fd
     }
 
     // MARK: - Lifecycle
 
     public func start() async throws {
+        if let adoptedLabel {
+            guard fd >= 0, !closed else {
+                throw VNCProtocolError.ioError("UDP adopted descriptor for \(adoptedLabel) is closed")
+            }
+            setIntOption(SO_RCVBUF, value: 8 * 1024 * 1024)
+            _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK)
+            startReadSource()
+            log.info("POSIX UDP started on adopted descriptor for \(adoptedLabel)")
+            return
+        }
         // Resolve the remote first (when connecting) so socket, bind, and
         // connect all use the peer's address family.
         var remoteStorage: sockaddr_storage?

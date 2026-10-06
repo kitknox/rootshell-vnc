@@ -288,6 +288,42 @@ final class VNCConfigurationTransportTests: XCTestCase {
             VNCConfiguration.VideoQualityMode.allCases)
     }
 
+    private static let stubDatagramProvider: VNCDatagramProvider = { _, _, _ in -1 }
+
+    func testInitKeepsAdaptiveWithDatagramProvider() {
+        let configuration = VNCConfiguration(
+            videoQualityMode: .adaptive,
+            transportProvider: Self.stubProvider,
+            datagramProvider: Self.stubDatagramProvider)
+
+        XCTAssertEqual(configuration.videoQualityMode, .adaptive)
+        XCTAssertEqual(configuration.displaySizingMode, .matchClient)
+        XCTAssertEqual(
+            configuration.availableVideoQualityModes,
+            VNCConfiguration.VideoQualityMode.allCases)
+    }
+
+    func testDatagramProviderSetFirstKeepsAdaptive() {
+        var configuration = VNCConfiguration()
+        configuration.datagramProvider = Self.stubDatagramProvider
+        configuration.transportProvider = Self.stubProvider
+
+        XCTAssertEqual(configuration.videoQualityMode, .adaptive)
+    }
+
+    func testRemovingDatagramProviderClampsAdaptive() {
+        var configuration = VNCConfiguration(
+            transportProvider: Self.stubProvider,
+            datagramProvider: Self.stubDatagramProvider)
+
+        configuration.datagramProvider = nil
+
+        XCTAssertEqual(configuration.videoQualityMode, .standard)
+        XCTAssertEqual(
+            configuration.availableVideoQualityModes,
+            [.standard, .fullQuality])
+    }
+
     @MainActor
     func testSessionInvokesProviderWithCredentialsHostAndPort() async {
         let recorder = ProviderRecorder()

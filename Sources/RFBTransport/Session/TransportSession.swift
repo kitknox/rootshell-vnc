@@ -326,15 +326,22 @@ public enum ClientInputEvent: Sendable, Equatable {
 /// executing the resulting actions.
 ///
 /// Consumers observe the session through the `events` `AsyncStream`.
+/// Opens a connected datagram socket to `host:remotePort` from `localPort`.
+/// The returned descriptor is owned and closed by the media channel.
+public typealias AppleMediaDatagramProvider =
+    @Sendable (_ host: String, _ remotePort: UInt16, _ localPort: UInt16) async throws -> Int32
+
 public actor TransportSession {
 
     // MARK: - Properties
 
     private let tcp: any RFBConnection
     /// Whether the connection was injected by the host instead of the default
-    /// direct TCP path. Apple's High Performance media mode needs direct UDP
-    /// reachability and is refused over a custom transport.
+    /// direct TCP path. Apple's High Performance media mode needs UDP
+    /// reachability and is refused over a custom transport without a datagram path.
     private let usesCustomTransport: Bool
+    /// Host-supplied UDP media path for custom transports.
+    private let datagramProvider: AppleMediaDatagramProvider?
     private var stateMachine: ConnectionStateMachine
     /// Address used to establish direct TCP.
     private let dialHost: String
@@ -773,7 +780,8 @@ public actor TransportSession {
     ///   - connection: Optional host-provided transport (an SSH or tssh
     ///     tunnel). When `nil`, a direct `TCPConnection` to `host:port` is
     ///     used. Apple's High Performance (UDP media) mode is refused over a
-    ///     custom transport.
+    ///     custom transport unless `datagramProvider` is set.
+    ///   - datagramProvider: Optional host-provided UDP media path.
     public init(
         host: String,
         port: UInt16,
@@ -788,6 +796,7 @@ public actor TransportSession {
         appleMediaTilesPerFrameOverride: UInt64? = nil,
         serverRendersCursor: Bool = false,
         connection: (any RFBConnection)? = nil,
+        datagramProvider: AppleMediaDatagramProvider? = nil,
         securityPolicy: VNCSecurityPolicy = .automatic,
         certificateValidationHandler: VNCCertificateValidationHandler? = nil
     ) {
@@ -814,6 +823,7 @@ public actor TransportSession {
         self.rateControlEnabled = !preferFullQualityVideo
             && environment["ROOTSHELL_VNC_DISABLE_RATE_CONTROL"] != "1"
         self.usesCustomTransport = connection != nil
+        self.datagramProvider = datagramProvider
         self.tcp = connection ?? TCPConnection(host: host, port: port)
         // Suppress the cursor shape encodings once, here, before anything is
         // derived from the list. `preferredEncodings` is caller-supplied and
@@ -1549,7 +1559,7 @@ public actor TransportSession {
         log.info("Server version: \(serverVersion)")
 
         requestAppleMediaStream = requestedAppleMediaStream && serverVersion.isApple
-        if requestAppleMediaStream, usesCustomTransport {
+        if requestAppleMediaStream, usesCustomTransport, datagramProvider == nil {
             throw VNCProtocolError.protocolViolation(
                 "High Performance (UDP media) mode cannot run over a custom transport")
         }
@@ -5400,13 +5410,24 @@ public actor TransportSession {
         // machine). Network.framework does not reliably expose SO_REUSEPORT,
         // which is why the previous unconnected listener never received on
         // loopback.
-        let channel = PosixUDPChannel(
-            localPort: binding.localPort,
-            remoteHost: appleMediaRemoteHost,
-            remotePort: binding.remotePort,
-            remoteAddressFamily: appleMediaRemoteAddressFamily,
-            enableReusePort: true
-        )
+        let channel: PosixUDPChannel
+        if let datagramProvider {
+            let fd = try await datagramProvider(
+                appleMediaRemoteHost,
+                binding.remotePort,
+                binding.localPort ?? binding.remotePort)
+            channel = PosixUDPChannel(
+                adoptingConnectedDescriptor: fd,
+                label: "\(appleMediaRemoteHost):\(binding.remotePort)")
+        } else {
+            channel = PosixUDPChannel(
+                localPort: binding.localPort,
+                remoteHost: appleMediaRemoteHost,
+                remotePort: binding.remotePort,
+                remoteAddressFamily: appleMediaRemoteAddressFamily,
+                enableReusePort: true
+            )
+        }
         try await channel.start()
         udpChannels.append(channel)
         let actualPort = await channel.localPort ?? binding.localPort ?? 0

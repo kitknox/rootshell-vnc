@@ -1227,7 +1227,7 @@ public final class VNCSession {
 
         // Belt-and-braces: the configuration self-heals this combination in
         // its property observers, so reaching this guard means a bug upstream.
-        if configuration.transportProvider != nil,
+        if configuration.lacksDatagramPath,
            configuration.videoQualityMode == .adaptive {
             throw VNCError.unsupportedFeature(
                 String(localized: "High Performance mode requires a direct network connection and is unavailable over a tunneled transport.", bundle: .module))
@@ -3616,6 +3616,7 @@ public final class VNCSession {
                 appleMediaTilesPerFrameOverride,
             serverRendersCursor: cursorRendering == .server,
             connection: customConnection,
+            datagramProvider: configuration.datagramProvider,
             securityPolicy: configuration.securityPolicy,
             certificateValidationHandler: configuration.certificateValidationHandler)
         negotiatedCursorRendering = cursorRendering

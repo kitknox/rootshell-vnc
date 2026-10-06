@@ -1496,6 +1496,29 @@ final class TransportSessionScriptedTests: XCTestCase {
         XCTAssertTrue(sent.isEmpty)
     }
 
+    func testConnectAllowsAppleMediaModeOverCustomTransportWithDatagramPath() async throws {
+        let connection = ScriptedRFBConnection()
+        await connection.enqueueServerBytes(ProtocolVersion.apple.wireBytes())
+        await connection.finishServerStream()
+        let session = TransportSession(
+            host: "scripted.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.appleH264, .zlib, .raw],
+            connection: connection,
+            datagramProvider: { _, _, _ in -1 })
+
+        do {
+            try await session.connect()
+            XCTFail("Expected connect() to fail on server EOF")
+        } catch let error as VNCProtocolError {
+            // Gets past the media refusal and fails later on the closed stream.
+            XCTAssertEqual(error, .connectionClosed)
+        }
+        let sent = await connection.sentBytes()
+        XCTAssertFalse(sent.isEmpty)
+    }
+
     func testConnectSurfacesConnectionClosedOnTruncatedHandshake() async throws {
         let connection = ScriptedRFBConnection()
         await connection.enqueueServerBytes(Data("RFB 0".utf8))

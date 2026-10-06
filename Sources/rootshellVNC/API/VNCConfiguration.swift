@@ -9,6 +9,12 @@ import RFBTransport
 public typealias VNCTransportProvider =
     @Sendable (_ host: String, _ port: UInt16) async throws -> any RFBConnection
 
+/// Opens a connected datagram socket carrying UDP media to `host:remotePort`
+/// from `localPort`, for transports that bypass the OS network stack.
+/// The returned descriptor is owned and closed by the session.
+public typealias VNCDatagramProvider =
+    @Sendable (_ host: String, _ remotePort: UInt16, _ localPort: UInt16) async throws -> Int32
+
 /// Configuration options for a VNC session.
 ///
 /// Use this to customize the behavior of a ``VNCSession`` before connecting.
@@ -143,9 +149,9 @@ public struct VNCConfiguration: Sendable {
     /// The backing connection-mode and quality profile to offer the server.
     public var videoQualityMode: VideoQualityMode {
         didSet {
-            // High Performance needs direct UDP reachability; a tunneled
-            // transport self-heals to Standard like the other mode couplings.
-            if videoQualityMode == .adaptive, transportProvider != nil {
+            // High Performance needs UDP reachability; a tunneled transport
+            // without a datagram path self-heals to Standard.
+            if videoQualityMode == .adaptive, lacksDatagramPath {
                 videoQualityMode = .standard
             }
             if videoQualityMode != .adaptive,
@@ -164,22 +170,37 @@ public struct VNCConfiguration: Sendable {
     /// host must re-establish or verify its underlying tunnel (for example the
     /// SSH session) on each call rather than handing out one dead channel.
     ///
-    /// Apple's High Performance mode requires direct UDP reachability, so
-    /// installing a provider clamps ``videoQualityMode`` from `.adaptive` to
-    /// `.standard` and removes `.adaptive` from
-    /// ``availableVideoQualityModes``.
+    /// Apple's High Performance mode requires UDP reachability, so installing
+    /// a provider without a ``datagramProvider`` clamps ``videoQualityMode``
+    /// from `.adaptive` to `.standard` and removes `.adaptive` from
+    /// ``availableVideoQualityModes``. Set ``datagramProvider`` first.
     public var transportProvider: VNCTransportProvider? {
         didSet {
-            if transportProvider != nil, videoQualityMode == .adaptive {
+            if lacksDatagramPath, videoQualityMode == .adaptive {
                 videoQualityMode = .standard
             }
         }
     }
 
+    /// Host-supplied UDP media path paired with ``transportProvider``. With
+    /// both set, High Performance mode stays available over the tunnel.
+    public var datagramProvider: VNCDatagramProvider? {
+        didSet {
+            if lacksDatagramPath, videoQualityMode == .adaptive {
+                videoQualityMode = .standard
+            }
+        }
+    }
+
+    /// A custom byte-stream transport with no datagram path for UDP media.
+    var lacksDatagramPath: Bool {
+        transportProvider != nil && datagramProvider == nil
+    }
+
     /// The quality modes selectable for the current transport. `.adaptive`
-    /// is unavailable over a custom transport.
+    /// is unavailable over a custom transport without a datagram path.
     public var availableVideoQualityModes: [VideoQualityMode] {
-        transportProvider == nil
+        !lacksDatagramPath
             ? VideoQualityMode.allCases
             : [.standard, .fullQuality]
     }
@@ -316,7 +337,9 @@ public struct VNCConfiguration: Sendable {
     ///   - targetFrameRate: Desired frame rate for update requests.
     ///   - enableProtocolTrace: Whether to record protocol messages.
     ///   - transportProvider: Optional factory for a host-supplied tunnel
-    ///     transport; clamps `.adaptive` quality to `.standard`.
+    ///     transport; clamps `.adaptive` quality to `.standard` unless
+    ///     `datagramProvider` is also given.
+    ///   - datagramProvider: Optional UDP media path for the tunnel.
     public init(
         preferredPixelFormat: PixelFormat? = nil,
         preferredEncodings: [Encoding] = [.copyRect, .raw],
@@ -332,6 +355,7 @@ public struct VNCConfiguration: Sendable {
         enableProtocolTrace: Bool = false,
         reconnectionPolicy: VNCReconnectionPolicy = VNCReconnectionPolicy(),
         transportProvider: VNCTransportProvider? = nil,
+        datagramProvider: VNCDatagramProvider? = nil,
         securityPolicy: VNCSecurityPolicy = .automatic,
         certificateValidationHandler: VNCCertificateValidationHandler? = nil
     ) {
@@ -341,11 +365,13 @@ public struct VNCConfiguration: Sendable {
         // Property observers do not run during init; apply the custom-
         // transport clamp here so every later derivation sees the final mode.
         let videoQualityMode = transportProvider != nil
+            && datagramProvider == nil
             && videoQualityMode == .adaptive
             ? .standard
             : videoQualityMode
         self.videoQualityMode = videoQualityMode
         self.transportProvider = transportProvider
+        self.datagramProvider = datagramProvider
         let requestedDisplayMode = displayMode ?? (
             Self.clampedDisplayCount(displayCount) == 1
                 ? .oneDisplay
