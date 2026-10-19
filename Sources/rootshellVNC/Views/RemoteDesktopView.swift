@@ -228,7 +228,7 @@ public struct RemoteDesktopView: View {
         VStack(spacing: 0) {
             GeometryReader { geometry in
                 let framebufferSize = session.presentedFramebufferSize
-                let framebufferOrigin = session.presentedFramebufferRegion?.origin ?? .zero
+                let framebufferOrigin = session.presentedInputOrigin
 
                 ZStack {
                     Color.black
