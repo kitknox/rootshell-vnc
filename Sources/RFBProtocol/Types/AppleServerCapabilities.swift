@@ -18,6 +18,13 @@ public struct AppleServerCapabilities: Sendable, Equatable {
     public static let displayConfigurationCommand =
         AppleDisplayConfiguration.messageType
 
+    /// Viewer-info command. The server sends pasteboard notices only to
+    /// viewers that have described themselves with it.
+    public static let viewerInfoCommand: UInt8 = 0x21
+
+    /// Server flag announcing a session-selection exchange after ServerInit.
+    public static let sessionSelectionFlag: UInt32 = 0x04
+
     public let serverFlags: UInt32
     public let serverCommandBitmap: Data
 
@@ -44,6 +51,10 @@ public struct AppleServerCapabilities: Sendable, Equatable {
         let commandsStart = flagsOffset + 4
         let commandsEnd = commandsStart + Self.commandBitmapByteCount
         self.serverCommandBitmap = Data(data[commandsStart..<commandsEnd])
+    }
+
+    public var announcesSessionSelection: Bool {
+        serverFlags & Self.sessionSelectionFlag != 0
     }
 
     public func supportsServerCommand(_ command: UInt8) -> Bool {

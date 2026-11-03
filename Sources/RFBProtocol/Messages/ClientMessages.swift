@@ -47,6 +47,10 @@ public enum ClientMessage: Sendable, Equatable {
     /// Apple message type 33: request accelerated media-stream configuration.
     case appleMediaStreamConfiguration
 
+    /// Apple message type 33: describe the viewer and the server message
+    /// types it accepts.
+    case appleViewerInfo(acceptedServerMessages: [UInt8])
+
     /// Apple message type 18: request/open an accelerated media stream.
     case appleMediaStreamRequest
 
@@ -70,6 +74,7 @@ public enum ClientMessage: Sendable, Equatable {
         case .appleGestureEvent:           return AppleGestureEvent.messageType
         case .appleGestureScrollEvent:     return AppleGestureScrollEvent.messageType
         case .appleMediaStreamConfiguration: return 0x21
+        case .appleViewerInfo:             return 0x21
         case .appleMediaStreamRequest:     return 0x12
         case .appleDisplayConfiguration:   return AppleDisplayConfiguration.messageType
         }
@@ -108,6 +113,9 @@ public enum ClientMessage: Sendable, Equatable {
             return MessageWriter.writeAppleGestureScrollEvent(event)
         case .appleMediaStreamConfiguration:
             return MessageWriter.writeAppleMediaStreamConfiguration()
+        case .appleViewerInfo(let acceptedServerMessages):
+            return MessageWriter.writeAppleViewerInfo(
+                acceptedServerMessages: acceptedServerMessages)
         case .appleMediaStreamRequest:
             return MessageWriter.writeAppleMediaStreamRequest()
         case .appleDisplayConfiguration(let configuration):

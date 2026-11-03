@@ -86,6 +86,14 @@ final class AppleServerCapabilitiesTests: XCTestCase {
         XCTAssertTrue(capabilities.supportsServerCommand(127))
     }
 
+    func testSessionSelectionFlag() {
+        let bitmap = Data(repeating: 0, count: 16)
+        XCTAssertTrue(AppleServerCapabilities(
+            serverFlags: 0x54, serverCommandBitmap: bitmap).announcesSessionSelection)
+        XCTAssertFalse(AppleServerCapabilities(
+            serverFlags: 0x52, serverCommandBitmap: bitmap).announcesSessionSelection)
+    }
+
     func testRegularDesktopNameIsNotTreatedAsCapabilityPrefix() {
         let name = Data("Regular VNC server desktop".utf8)
         XCTAssertNil(AppleServerCapabilities(serverInitNameField: name))
@@ -2150,8 +2158,40 @@ final class AppleMessagesTests: XCTestCase {
 
     func testAppleMediaStreamConfigurationWireBytes() {
         let bytes = MessageWriter.writeAppleMediaStreamConfiguration()
+        XCTAssertEqual(bytes, Data([
+            0x21, 0x00, 0x00, 0x3e,
+            0x00, 0x01, 0x00, 0x00,
+            0x00, 0x02, 0x00, 0x00,
+            0x00, 0x06, 0x00, 0x00,
+            0x00, 0x02, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x1a, 0x00, 0x00,
+            0x00, 0x03, 0x00, 0x00,
+            0x00, 0x01, 0xb0, 0x00,
+            0x0c, 0x03, 0x90, 0x00,
+            0x00, 0x00, 0x00, 0x40,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ]))
+    }
+
+    func testAppleViewerInfoMapsAcceptedServerMessagesMSBFirst() {
+        let bytes = MessageWriter.writeAppleViewerInfo(
+            acceptedServerMessages: [0, 2, 3, 0x14, 0x1f])
         XCTAssertEqual(bytes.count, 66)
-        XCTAssertEqual(bytes.prefix(4), Data([0x21, 0x00, 0x00, 0x3e]))
+        // Same header and identity as the High Performance message.
+        XCTAssertEqual(
+            bytes.prefix(34),
+            MessageWriter.writeAppleMediaStreamConfiguration().prefix(34))
+        var map = Data(repeating: 0, count: 32)
+        map[0] = 0xb0
+        map[2] = 0x08
+        map[3] = 0x01
+        XCTAssertEqual(Data(bytes.suffix(32)), map)
     }
 
     func testAppleMediaStreamRequestWireBytes() {

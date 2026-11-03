@@ -285,34 +285,29 @@ public enum MessageWriter: Sendable {
     /// Serialize Apple's client media-stream configuration request.
     ///
     /// Send this `0x21` message after ServerInit and before accepting the
-    /// `RFBMediaStreamMessage1Encoding` offer. The payload selects the default
-    /// accelerated single-video-stream profile.
+    /// `RFBMediaStreamMessage1Encoding` offer. It is the viewer-info message
+    /// carrying the server messages a High Performance session accepts.
     public static func writeAppleMediaStreamConfiguration() -> Data {
-        let payload = Data([
-            0x00, 0x01, 0x00, 0x00,
-            0x00, 0x02, 0x00, 0x00,
-            0x00, 0x06, 0x00, 0x00,
-            0x00, 0x02, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x1a, 0x00, 0x00,
-            0x00, 0x03, 0x00, 0x00,
-            0x00, 0x01, 0xb0, 0x00,
-            0x0c, 0x03, 0x90, 0x00,
-            0x00, 0x00, 0x00, 0x40,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00,
+        writeAppleViewerInfo(acceptedServerMessages: [
+            0, 2, 3, 0x14, 0x15, 0x1e, 0x1f, 0x20, 0x23, 0x49,
         ])
+    }
 
-        var data = Data(capacity: 4 + payload.count)
-        data.append(0x21)
-        data.append(0x00)
-        data.append(UInt8((payload.count >> 8) & 0xFF))
-        data.append(UInt8(payload.count & 0xFF))
-        data.append(payload)
+    /// Serialize Apple's `0x21` viewer info: message version, app id, app and
+    /// OS versions, then a 256-bit MSB-first map of the server message types
+    /// the viewer accepts.
+    public static func writeAppleViewerInfo(acceptedServerMessages: [UInt8]) -> Data {
+        var data = Data(count: 66)
+        data[0] = 0x21
+        writeUInt16(62, into: &data, at: 2)
+        writeUInt16(1, into: &data, at: 4)
+        // App id 2, app version 6.2.0, OS version 26.3.1.
+        for (index, value) in [UInt32]([2, 6, 2, 0, 26, 3, 1]).enumerated() {
+            writeUInt32(value, into: &data, at: 6 + index * 4)
+        }
+        for type in acceptedServerMessages {
+            data[34 + Int(type >> 3)] |= 0x80 >> (type & 7)
+        }
         return data
     }
 

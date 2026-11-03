@@ -734,6 +734,123 @@ final class TransportSessionScriptedTests: XCTestCase {
         await session.disconnect()
     }
 
+    /// Standard sessions identify as an Apple viewer and send viewer info, or
+    /// the server neither accepts their text nor sends pasteboard notices.
+    func testAppleStandardSendsViewerInfoAndPackedClipboard() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.appleServerInitMessage(
+            width: 1920,
+            height: 1080,
+            name: "Standard Mac",
+            flags: 0x52,
+            serverCommands: [
+                AppleServerCapabilities.viewerInfoCommand,
+                AppleClipboardProtocol.packedScrapMessageType,
+            ]))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "standard.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.raw],
+            connection: connection)
+        try await session.connect()
+
+        var expected = Data([0x81])
+        expected.append(ClientMessage.appleViewerInfo(
+            acceptedServerMessages: [0, 2, 3, 0x14, 0x1f]).serialize())
+        expected.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
+        let handshakeBytes = ProtocolVersion.apple.wireBytes().count + 1
+        let sent = await connection.sentBytes()
+        XCTAssertEqual(
+            Data(sent.dropFirst(handshakeBytes).prefix(expected.count)),
+            expected)
+
+        try await session.sendClipboardText("hello")
+        let afterClipboard = await connection.sentBytes()
+        let packed = try AppleClipboardProtocol.packedTextMessage("hello")
+        XCTAssertEqual(Self.occurrenceCount(of: packed, in: afterClipboard), 1)
+        XCTAssertEqual(Self.occurrenceCount(
+            of: ClientMessage.clientCutText("hello").serialize(),
+            in: afterClipboard), 0)
+        await session.disconnect()
+    }
+
+    /// wayshare advertises viewer info only alongside High Performance.
+    func testAppleStandardSkipsUnadvertisedViewerInfo() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.appleServerInitMessage(
+            width: 1280,
+            height: 800,
+            name: "wayshare",
+            flags: 0x20))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "wayshare.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.raw],
+            connection: connection)
+        try await session.connect()
+
+        var expected = Data([0x81])
+        expected.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
+        let handshakeBytes = ProtocolVersion.apple.wireBytes().count + 1
+        let sent = await connection.sentBytes()
+        XCTAssertEqual(
+            Data(sent.dropFirst(handshakeBytes).prefix(expected.count)),
+            expected)
+        await session.disconnect()
+    }
+
+    func testAppleStandardRunsSessionSelectionWhenServerAnnouncesIt() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.appleServerInitMessage(
+            width: 1920,
+            height: 1080,
+            name: "Selecting Mac",
+            flags: 0x54))
+        script.append(Self.appleSessionActionAdvertisement(
+            allowedActions: 0x0000_000f,
+            machineName: "Selecting Mac"))
+        script.append(contentsOf: [
+            0x00, 0x50, // 80-byte result
+            0x00, 0x01, // protocol version
+            0x00, 0x00, // success
+        ])
+        script.append(Data(repeating: 0, count: 76))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "selecting.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.raw],
+            connection: connection)
+        try await session.connect()
+
+        var expected = Data([0x81])
+        expected.append(Self.appleConsoleSessionSelectionMessage())
+        expected.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
+        let handshakeBytes = ProtocolVersion.apple.wireBytes().count + 1
+        let sent = await connection.sentBytes()
+        XCTAssertEqual(
+            Data(sent.dropFirst(handshakeBytes).prefix(expected.count)),
+            expected)
+        await session.disconnect()
+    }
+
     func testDesktopSizeDoesNotSuppressAppleDisplayEventsInSameUpdate() async throws {
         let connection = ScriptedRFBConnection()
         var script = ProtocolVersion.apple.wireBytes()
@@ -1877,13 +1994,19 @@ final class TransportSessionScriptedTests: XCTestCase {
     private static func appleServerInitMessage(
         width: UInt16,
         height: UInt16,
-        name: String
+        name: String,
+        flags: UInt8 = 0x54,
+        serverCommands: [UInt8] = []
     ) -> Data {
         var field = Data([
-            0x00, 0x00,             // status/reserved
-            0x00, 0x00, 0x00, 0x54, // Apple server flags
+            0x00, 0x00,              // status/reserved
+            0x00, 0x00, 0x00, flags, // Apple server flags
         ])
-        field.append(Data(repeating: 0, count: 16)) // server-command bitmap
+        var bitmap = Data(repeating: 0, count: 16) // server-command bitmap
+        for command in serverCommands {
+            bitmap[Int(command >> 3)] |= 0x80 >> (command & 7)
+        }
+        field.append(bitmap)
         field.append(Data(name.utf8))
 
         var data = Data()

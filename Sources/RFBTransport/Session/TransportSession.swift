@@ -1468,6 +1468,14 @@ public actor TransportSession {
         try await requestFramebufferUpdate(incremental: true)
     }
 
+    /// Dynamic Resolution belongs to High Performance. Standard sessions keep
+    /// SetDesktopSize even when ServerInit advertises virtual displays.
+    private var usesAppleVirtualDisplays: Bool {
+        requestAppleMediaStream
+            && appleServerCapabilities?.supportsServerCommand(
+                AppleServerCapabilities.displayConfigurationCommand) == true
+    }
+
     /// Request one remote display matching the client viewport. Apple servers
     /// use the capability-gated virtual-display command behind Dynamic
     /// Resolution; regular servers use standard SetDesktopSize only after
@@ -1485,18 +1493,15 @@ public actor TransportSession {
             pointHeight: pointHeight)
         guard requested != lastSentRemoteDisplaySize else {
             emitAppleRemoteDisplayResizeSettled()
-            return appleServerCapabilities?.supportsServerCommand(
-                AppleServerCapabilities.displayConfigurationCommand) == true
+            return usesAppleVirtualDisplays
                 ? .appleVirtualDisplay
                 : .standardSetDesktopSize
         }
 
         pendingRemoteDisplaySize = requested
         emitAppleRemoteDisplayResizeSettled()
-        if appleServerCapabilities?.supportsServerCommand(
-            AppleServerCapabilities.displayConfigurationCommand) == true {
-            if requestAppleMediaStream,
-               !completedInitialAppleMediaNegotiation {
+        if usesAppleVirtualDisplays {
+            if !completedInitialAppleMediaNegotiation {
                 log.info(
                     "Deferring staged virtual display \(pixelWidth)x\(pixelHeight) "
                         + "until initial Apple media negotiation completes")
@@ -1815,11 +1820,17 @@ public actor TransportSession {
     }
 
     private func sendClientInit() async throws {
-        // ClientInit mode 0xc1 is required for media connections.
-        // Password-only VNC auth receives an additional length-framed session
-        // action advertisement after ServerInit; `readServerInit` consumes it
-        // before ordinary RFB negotiation.
-        let flags: UInt8 = requestAppleMediaStream ? 0xc1 : 0x01
+        // 0x80 marks an Apple viewer so ServerInit carries the capability
+        // prefix. 0x40 (media) adds session selection, which `readServerInit`
+        // consumes before ordinary RFB negotiation.
+        let flags: UInt8
+        if requestAppleMediaStream {
+            flags = 0xc1
+        } else if stateMachine.negotiatedVersion?.isApple == true {
+            flags = 0x81
+        } else {
+            flags = 0x01
+        }
         try await sendControlChannel(Data([flags]))
         log.debug("Sent ClientInit flags=0x\(String(flags, radix: 16))")
     }
@@ -1879,22 +1890,21 @@ public actor TransportSession {
 
         log.info("ServerInit: \(width)x\(height) '\(name)'")
 
-        if requestAppleMediaStream,
-           stateMachine.selectedSecurityType == .vncAuthentication {
-            try await selectPasswordOnlyAppleSession()
-        }
-
-        // A client-sized request may have been staged before connecting. Send
-        // Apple's virtual-display description as soon as ServerInit confirms
-        // support and, critically, before SetEncodings starts media setup. This
-        // prevents a constrained remote viewer from first receiving a physical
-        // 5K reference frame and only resizing after the video path is already
-        // congested.
-        if !requestAppleMediaStream,
-           let pendingRemoteDisplaySize,
-           appleServerCapabilities?.supportsServerCommand(
-               AppleServerCapabilities.displayConfigurationCommand) == true {
-            try await sendAppleVirtualDisplaySize(pendingRemoteDisplaySize)
+        if requestAppleMediaStream {
+            if stateMachine.selectedSecurityType == .vncAuthentication {
+                try await selectPasswordOnlyAppleSession()
+            }
+        } else if let appleServerCapabilities {
+            if appleServerCapabilities.announcesSessionSelection {
+                try await selectPasswordOnlyAppleSession()
+            }
+            // Without viewer info the server never sends pasteboard notices.
+            if appleServerCapabilities.supportsServerCommand(
+                AppleServerCapabilities.viewerInfoCommand) {
+                try await sendControlChannel(ClientMessage.appleViewerInfo(
+                    acceptedServerMessages: Self.standardAcceptedServerMessages
+                ).serialize())
+            }
         }
 
         let actions = stateMachine.handle(event: .receivedServerInit(serverInit))
@@ -1912,6 +1922,7 @@ public actor TransportSession {
 
     /// ClientInit mode `0xc1` adds a session-selection
     /// exchange when authentication type 2 supplied no Apple session key.
+    /// Standard sessions run it only when ServerInit flags announce it.
     /// The server advertises the allowed session actions and its machine name,
     /// then expects a 74-byte selection command before SetEncodings/media setup.
     private func selectPasswordOnlyAppleSession() async throws {
@@ -1947,7 +1958,7 @@ public actor TransportSession {
             selection = 0
         } else {
             throw VNCProtocolError.protocolViolation(
-                "Apple server offered no supported console action for password-only High Performance")
+                "Apple server offered no supported console session action")
         }
         let machineNameField = payload.dropFirst(10).prefix(64)
         let machineNameBytes = machineNameField.prefix { $0 != 0 }
@@ -2003,6 +2014,12 @@ public actor TransportSession {
     }
 
     // MARK: - Message read loop
+
+    /// Server messages `readLoop` parses. Advertising any other type in viewer
+    /// info would let the server send one that ends the session.
+    static let standardAcceptedServerMessages: [UInt8] = [
+        0, 2, 3, 0x14, AppleClipboardProtocol.packedScrapMessageType,
+    ]
 
     private func readLoop() async {
         while !Task.isCancelled {
@@ -3036,8 +3053,7 @@ public actor TransportSession {
               appleDisplayReconfigurationGeneration == nil,
               let pendingRemoteDisplaySize,
               pendingRemoteDisplaySize != lastSentRemoteDisplaySize,
-              appleServerCapabilities?.supportsServerCommand(
-                AppleServerCapabilities.displayConfigurationCommand) == true else { return }
+              usesAppleVirtualDisplays else { return }
         do {
             log.info(
                 "Initial Apple video source live; applying coalesced staged virtual display "
@@ -3599,8 +3615,7 @@ public actor TransportSession {
     ) async throws {
         standardDesktopLayout = layout
         guard let pendingRemoteDisplaySize,
-              appleServerCapabilities?.supportsServerCommand(
-                AppleServerCapabilities.displayConfigurationCommand) != true else { return }
+              !usesAppleVirtualDisplays else { return }
         try await sendStandardDesktopSize(pendingRemoteDisplaySize)
     }
 
