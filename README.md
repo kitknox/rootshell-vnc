@@ -50,6 +50,8 @@ small standalone viewer used to develop it.
 - `VNCSession`, an observable high-level API for connection lifecycle, display
   state, input, clipboard, resizing, reconnection, and statistics
 - Reusable `ConnectionView` and `RemoteDesktopView` SwiftUI components
+- `RemoteScreenView`, which gives another protocol's video the same input,
+  zoom, and HUD as `RemoteDesktopView`, with optional physical-key forwarding
 - Touch, mouse, trackpad, and Apple Pencil input for pointer movement, clicking,
   dragging, scrolling, hover, and gestures
 - Software and hardware keyboard capture with host-reserved shortcut routing

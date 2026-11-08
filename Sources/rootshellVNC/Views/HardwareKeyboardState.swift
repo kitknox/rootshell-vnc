@@ -37,9 +37,13 @@ struct HardwareKeyboardState: Sendable {
     }
 
     mutating func releaseAll() -> [HardwareKeyboardTransition] {
+        releaseAllWithUsages().map(\.transition)
+    }
+
+    mutating func releaseAllWithUsages() -> [(usage: UInt32, transition: HardwareKeyboardTransition)] {
         let transitions = pressOrder.reversed().compactMap { usage in
             pressedKeysyms[usage].map {
-                HardwareKeyboardTransition(downFlag: false, keysym: $0)
+                (usage, HardwareKeyboardTransition(downFlag: false, keysym: $0))
             }
         }
         pressedKeysyms.removeAll(keepingCapacity: true)
@@ -298,8 +302,9 @@ final class HardwareKeyboardController {
             // controller owns repeat timing, so duplicate begins are consumed.
             return state.contains(usage)
         }
-        send(transition)
-        if Self.isRepeatable(usage) {
+        send(transition, usage: usage)
+        // A physical-key host is a USB keyboard; the remote OS repeats held keys.
+        if Self.isRepeatable(usage), !keyboardHandler.forwardsPhysicalKeys {
             startRepeat(for: usage)
         }
         return true
@@ -313,13 +318,13 @@ final class HardwareKeyboardController {
         }
         guard let transition = state.release(usage: usage) else { return false }
         if repeatingUsage == usage { stopRepeat() }
-        send(transition)
+        send(transition, usage: usage)
         return true
     }
 
     func releaseAll() {
         stopRepeat()
-        state.releaseAll().forEach(send)
+        state.releaseAllWithUsages().forEach { send($0.transition, usage: $0.usage) }
         commandModifiers.releaseAll().forEach(send)
     }
 
@@ -378,6 +383,13 @@ final class HardwareKeyboardController {
     private func send(_ transition: HardwareKeyboardTransition) {
         keyboardHandler.handleKeysym(
             downFlag: transition.downFlag,
+            keysym: transition.keysym)
+    }
+
+    private func send(_ transition: HardwareKeyboardTransition, usage: UInt32) {
+        keyboardHandler.handlePhysicalKey(
+            downFlag: transition.downFlag,
+            usage: usage,
             keysym: transition.keysym)
     }
 

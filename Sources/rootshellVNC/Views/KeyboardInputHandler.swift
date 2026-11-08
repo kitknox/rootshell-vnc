@@ -23,6 +23,10 @@ public struct KeyboardInputHandler {
     ///   - keysym: The X11 keysym value for the key.
     public typealias KeyEventHandler = @MainActor (Bool, UInt32) -> Void
 
+    /// Hardware key transitions with their HID usage, for hosts that type by
+    /// physical key position: (downFlag, usage, keysym chosen at key-down).
+    public typealias PhysicalKeyEventHandler = @MainActor (Bool, UInt32, UInt32) -> Void
+
     // MARK: - X11 Keysym Constants
 
     // Special keys
@@ -98,12 +102,29 @@ public struct KeyboardInputHandler {
     ///     `true`, Option is emitted as `Meta_L`/`Meta_R` so Apple's Screen
     ///     Sharing server types Option rather than Command. Defaults to the
     ///     standard X11 convention for standalone and non-Apple use.
+    ///   - sendPhysicalKeyEvent: When set, hardware keys with a known HID
+    ///     usage go here instead of `sendKeyEvent`, and are not auto-repeated.
     public init(
         sendKeyEvent: @escaping KeyEventHandler,
-        usesAppleModifierConvention: @escaping @MainActor () -> Bool = { false }
+        usesAppleModifierConvention: @escaping @MainActor () -> Bool = { false },
+        sendPhysicalKeyEvent: PhysicalKeyEventHandler? = nil
     ) {
         self.sendKeyEvent = sendKeyEvent
         self.usesAppleModifierConvention = usesAppleModifierConvention
+        self.sendPhysicalKeyEvent = sendPhysicalKeyEvent
+    }
+
+    private let sendPhysicalKeyEvent: PhysicalKeyEventHandler?
+
+    var forwardsPhysicalKeys: Bool { sendPhysicalKeyEvent != nil }
+
+    /// A hardware key transition whose HID usage is known.
+    func handlePhysicalKey(downFlag: Bool, usage: UInt32, keysym: UInt32) {
+        if let sendPhysicalKeyEvent {
+            sendPhysicalKeyEvent(downFlag, usage, keysym)
+        } else {
+            handleKeysym(downFlag: downFlag, keysym: keysym)
+        }
     }
 
     // MARK: - Key Event Handlers

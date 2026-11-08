@@ -1014,7 +1014,7 @@ private struct VNCClipboardMenu: View {
 #if canImport(UIKit)
 /// Reports only the space occupied by a keyboard docked to the bottom edge.
 /// UIKit collapses this guide for floating, split, and detached keyboards.
-private struct DockedKeyboardInsetReader: UIViewRepresentable {
+struct DockedKeyboardInsetReader: UIViewRepresentable {
     @Binding var metrics: DockedKeyboardViewportMetrics
 
     func makeUIView(context: Context) -> DockedKeyboardInsetView {
@@ -1053,7 +1053,7 @@ private struct DockedKeyboardInsetReader: UIViewRepresentable {
 }
 
 @MainActor
-private final class DockedKeyboardInsetView: UIView {
+final class DockedKeyboardInsetView: UIView {
     var onMetricsChange: ((DockedKeyboardViewportMetrics) -> Void)?
     private var lastReportedMetrics: DockedKeyboardViewportMetrics?
     private let keyboardTopProbe = UIView(frame: .zero)
@@ -1164,7 +1164,7 @@ private final class DockedKeyboardInsetView: UIView {
 /// releases and a material fallback where the glass API is unavailable.
 /// Deliberately not host-tinted — the button floats over live desktop
 /// content, where adaptive glass fits better than theme colors.
-private struct HUDButtonChromeModifier: ViewModifier {
+struct HUDButtonChromeModifier: ViewModifier {
     func body(content: Content) -> some View {
         #if os(visionOS)
         content.background(.ultraThinMaterial, in: Circle())
