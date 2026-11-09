@@ -171,6 +171,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private var previousScrollTranslation = CGPoint.zero
     private var directScrollPhaseActive = false
     private var momentumScrollPhaseActive = false
+    /// Where the pointer rested when a fling began; moving off it ends the fling.
+    private var momentumPointerAnchor: CGPoint?
+    private var lastPointerViewLocation: CGPoint?
     private weak var activeScrollRecognizer: UIGestureRecognizer?
     private var activeScrollUsesDirectTouch = false
     private var releaseVelocityEstimator = ScrollReleaseVelocityEstimator()
@@ -2172,6 +2175,24 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         momentumScrollPhaseActive = false
     }
 
+    /// Pointer motion is ignored while a fling runs, and a fling lasts
+    /// seconds, so moving the pointer ends it instead of freezing the cursor.
+    private func catchMomentumForPointerMove(to location: CGPoint) {
+        defer { lastPointerViewLocation = location }
+        guard momentumScrollPhaseActive else {
+            momentumPointerAnchor = nil
+            return
+        }
+        guard let anchor = momentumPointerAnchor ?? lastPointerViewLocation else {
+            momentumPointerAnchor = location
+            return
+        }
+        momentumPointerAnchor = anchor
+        if hypot(location.x - anchor.x, location.y - anchor.y) > 4 {
+            catchMomentumFlingIfActive()
+        }
+    }
+
     /// Stop an active synthetic fling because new input arrived, the way a
     /// native scroll view halts deceleration on contact. Returns true when a
     /// fling was actually caught.
@@ -3032,6 +3053,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         }
         #endif
 
+        if recognizer.state == .began || recognizer.state == .changed {
+            catchMomentumForPointerMove(to: recognizer.location(in: self))
+        }
+
         if !directScrollPhaseActive,
            !momentumScrollPhaseActive,
            !pointerDragActive,
@@ -3430,6 +3455,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         regionFor request: UIPointerRegionRequest,
         defaultRegion: UIPointerRegion
     ) -> UIPointerRegion? {
+        catchMomentumForPointerMove(to: request.location)
         guard !directScrollPhaseActive,
               !momentumScrollPhaseActive,
               !pointerDragActive,
