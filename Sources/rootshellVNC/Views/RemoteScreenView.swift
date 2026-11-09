@@ -41,6 +41,7 @@ public struct RemoteScreenView: View {
     private let pointerSpeed: Double
     private let cursorHeight: CGFloat
     private let serverRendersCursor: Bool
+    private let showsLocalCursorDot: Bool
     private let brightnessGain: Double
     private let disconnect: () -> Void
     private let hudMenuExtras: AnyView?
@@ -55,6 +56,9 @@ public struct RemoteScreenView: View {
     @State private var keyboardCapture: VNCKeyboardCapture
     @State private var keyboardViewportMetrics = DockedKeyboardViewportMetrics()
 
+    /// `showsLocalCursorDot` marks where local pointer input lands over a
+    /// picture that already carries the pointer; it has no effect unless
+    /// `serverRendersCursor` is set.
     public init<MenuExtras: View>(
         renderer: VideoBandLayerRenderer,
         framebufferSize: CGSize,
@@ -69,6 +73,7 @@ public struct RemoteScreenView: View {
         pointerSpeed: Double = 1.0,
         cursorHeight: CGFloat = 17,
         serverRendersCursor: Bool = true,
+        showsLocalCursorDot: Bool = false,
         brightnessGain: Double = 1.0,
         disconnect: @escaping () -> Void,
         @ViewBuilder hudMenuExtras: () -> MenuExtras
@@ -82,6 +87,7 @@ public struct RemoteScreenView: View {
         self.pointerSpeed = pointerSpeed
         self.cursorHeight = cursorHeight
         self.serverRendersCursor = serverRendersCursor
+        self.showsLocalCursorDot = showsLocalCursorDot
         self.brightnessGain = brightnessGain
         self.disconnect = disconnect
         self.hudMenuExtras = AnyView(hudMenuExtras())
@@ -125,6 +131,7 @@ public struct RemoteScreenView: View {
                             pointerSpeed: pointerSpeed,
                             cursorHeight: cursorHeight,
                             serverRendersCursor: serverRendersCursor,
+                            showsLocalCursorDot: showsLocalCursorDot,
                             keyboardActive: $keyboardActive,
                             hardwareKeyboardAttached: $hardwareKeyboardAttached,
                             framebufferSize: framebufferSize,

@@ -40,6 +40,27 @@ final class TrackpadCursorSizingTests: XCTestCase {
         }
     }
 
+    func testLocalDotOnlyMarksVirtualCursorOverServerDrawnPointer() {
+        for presence in RemoteCursorPresence.allCases {
+            XCTAssertEqual(TrackpadCursorStyle.resolve(
+                hasServerCursor: false, presence: presence, allowingFallback: true,
+                serverRendersCursor: true, showsLocalDot: true), .localDot)
+            // A real pointer on the glass draws the dot as a system shape.
+            XCTAssertEqual(TrackpadCursorStyle.resolve(
+                hasServerCursor: false, presence: presence, allowingFallback: false,
+                serverRendersCursor: true, showsLocalDot: true), .hidden)
+        }
+        // Without a server-drawn pointer the dot never replaces the fallback.
+        XCTAssertEqual(TrackpadCursorStyle.resolve(
+            hasServerCursor: false, presence: .undescribed, allowingFallback: true,
+            serverRendersCursor: false, showsLocalDot: true), .fallbackArrow)
+    }
+
+    func testLocalDotScalesWithCursorSize() {
+        XCTAssertEqual(TrackpadCursorStyle.localDotDiameter(cursorHeight: 17), 10)
+        XCTAssertEqual(TrackpadCursorStyle.localDotDiameter(cursorHeight: 34), 20)
+    }
+
     func testUniformBitmapScalePreservesServerSizesAndHotspots() {
         XCTAssertEqual(TrackpadCursorStyle.bitmapScale(cursorHeight: 17), 1)
         let scale = TrackpadCursorStyle.bitmapScale(cursorHeight: 34)

@@ -5,17 +5,22 @@ import Foundation
 /// These paths were drawn for this project, without extracting or tracing OS assets.
 /// The app uses the arrow only before the server supplies a cursor. The caret is
 /// available for local UI; received remote shapes are always rendered unchanged.
+/// The dot marks local input over a picture that already carries the pointer.
 enum TrackpadCursorArtwork {
     enum Shape: String, CaseIterable, Sendable {
         case arrow
         case caret
+        case dot
 
-        var canvasSize: CGSize { CGSize(width: 28, height: 32) }
+        var canvasSize: CGSize {
+            self == .dot ? CGSize(width: 18, height: 18) : CGSize(width: 28, height: 32)
+        }
         /// Coordinates use a top-left origin.
         var hotspot: CGPoint {
             switch self {
             case .arrow: return CGPoint(x: 4, y: 3)
             case .caret: return CGPoint(x: 14, y: 16)
+            case .dot: return CGPoint(x: 9, y: 9)
             }
         }
 
@@ -41,15 +46,19 @@ enum TrackpadCursorArtwork {
                 path.move(to: CGPoint(x: 9, y: 27))
                 path.addQuadCurve(to: CGPoint(x: 14, y: 25), control: CGPoint(x: 14, y: 27))
                 path.addQuadCurve(to: CGPoint(x: 19, y: 27), control: CGPoint(x: 14, y: 27))
+            case .dot:
+                path.addEllipse(in: CGRect(x: 4.5, y: 4.5, width: 9, height: 9))
             }
             return path
         }
 
-        var outlineWidth: CGFloat { self == .arrow ? 1.5 : 4.2 }
+        var outlineWidth: CGFloat { self == .caret ? 4.2 : 1.5 }
         var visibleHeight: CGFloat { path.boundingBoxOfPath.height + outlineWidth }
     }
 
     static let ink = CGColor(srgbRed: 24 / 255, green: 33 / 255, blue: 43 / 255, alpha: 1)
+    /// Translucent so the remote pointer's tip stays visible under the dot.
+    static let dotFill = CGColor(srgbRed: 64 / 255, green: 140 / 255, blue: 230 / 255, alpha: 0.55)
 
     /// Renders the vector directly at the destination pixel density. No fixed
     /// resolution asset is enlarged, and all zoom levels share the same geometry.
@@ -74,10 +83,11 @@ enum TrackpadCursorArtwork {
         context.setStrokeColor(CGColor(gray: 1, alpha: 1))
         context.setLineWidth(shape.outlineWidth)
         context.addPath(shape.path)
-        if shape == .arrow {
-            context.setFillColor(ink)
+        switch shape {
+        case .arrow, .dot:
+            context.setFillColor(shape == .dot ? dotFill : ink)
             context.drawPath(using: .fillStroke)
-        } else {
+        case .caret:
             context.strokePath()
             context.addPath(shape.path)
             context.setStrokeColor(ink)

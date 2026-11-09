@@ -90,23 +90,36 @@ enum TrackpadPointerWire {
 
 /// Server cursor pixels are authoritative. An original arrow is used only
 /// while relative input is waiting for its first server cursor description.
+/// A picture with the pointer painted in gets at most a dot marking where
+/// local input lands, ahead of the video.
 enum TrackpadCursorStyle: Equatable, Sendable {
     case serverBitmap
     case fallbackArrow
+    case localDot
     case hidden
 
     static func resolve(
         hasServerCursor: Bool,
         presence: RemoteCursorPresence,
         allowingFallback: Bool,
-        serverRendersCursor: Bool
+        serverRendersCursor: Bool,
+        showsLocalDot: Bool = false
     ) -> Self {
-        guard !serverRendersCursor, presence != .hidden else { return .hidden }
+        if serverRendersCursor {
+            return allowingFallback && showsLocalDot ? .localDot : .hidden
+        }
+        guard presence != .hidden else { return .hidden }
         if hasServerCursor { return .serverBitmap }
         return allowingFallback && presence == .undescribed ? .fallbackArrow : .hidden
     }
 
     static let defaultCursorHeight: CGFloat = 17
+    /// Local dot diameter at the default cursor height.
+    static let defaultLocalDotDiameter: CGFloat = 10
+
+    static func localDotDiameter(cursorHeight: CGFloat) -> CGFloat {
+        defaultLocalDotDiameter * bitmapScale(cursorHeight: cursorHeight)
+    }
     static let minimumCursorHeight: CGFloat = 8
     static let maximumCursorHeight: CGFloat = 64
 

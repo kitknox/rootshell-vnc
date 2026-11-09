@@ -411,6 +411,7 @@ public struct RemoteDesktopView: View {
             pointerSpeed: pointerSpeed,
             cursorHeight: cursorHeight,
             serverRendersCursor: session.activeCursorRendering == .server,
+            showsLocalCursorDot: false,
             keyboardActive: $keyboardActive,
             hardwareKeyboardAttached: $hardwareKeyboardAttached,
             framebufferSize: framebufferSize,

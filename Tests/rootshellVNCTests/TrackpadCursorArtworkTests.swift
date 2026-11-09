@@ -35,8 +35,10 @@ final class TrackpadCursorArtworkTests: XCTestCase {
         for shape in TrackpadCursorArtwork.Shape.allCases {
             let image = try XCTUnwrap(TrackpadCursorArtwork.image(for: shape, pixelHeight: 320))
             let pixels = try rgba(image)
-            let x = Int(shape.hotspot.x * 10), y = Int(shape.hotspot.y * 10)
-            XCTAssertGreaterThan(pixels[(y * image.width + x) * 4 + 3], 200)
+            let scale = 320 / shape.canvasSize.height
+            let x = Int(shape.hotspot.x * scale), y = Int(shape.hotspot.y * scale)
+            // The dot's fill is translucent so the remote pointer shows through.
+            XCTAssertGreaterThan(pixels[(y * image.width + x) * 4 + 3], shape == .dot ? 100 : 200)
         }
     }
 

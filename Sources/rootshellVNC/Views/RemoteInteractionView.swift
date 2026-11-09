@@ -18,6 +18,8 @@ struct RemoteInteractionView: UIViewRepresentable {
     let pointerSpeed: Double
     let cursorHeight: CGFloat
     let serverRendersCursor: Bool
+    /// Dot over a server-drawn pointer; see `RemoteScreenView`.
+    let showsLocalCursorDot: Bool
     @Binding var keyboardActive: Bool
     @Binding var hardwareKeyboardAttached: Bool
 
@@ -81,6 +83,7 @@ struct RemoteInteractionView: UIViewRepresentable {
             pointerSpeed: pointerSpeed,
             cursorHeight: cursorHeight,
             serverRendersCursor: serverRendersCursor,
+            showsLocalCursorDot: showsLocalCursorDot,
             keyboardActive: keyboardActive,
             keyboardCaptured: keyboardCapture.isCaptured
                 && !suspendsKeyboardCapture,
@@ -130,8 +133,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     /// On-screen height for the locally drawn pointer, in view points.
     private(set) var cursorHeight = TrackpadCursorStyle.defaultCursorHeight
     /// Whether the server composites the pointer into the framebuffer it
-    /// sends. When it does, this view draws no cursor of its own.
+    /// sends. When it does, this view draws no cursor of its own, except
+    /// the local dot when `showsLocalCursorDot` asks for one.
     private(set) var serverRendersCursor = false
+    private(set) var showsLocalCursorDot = false
     /// Virtual cursor driven by relative finger motion. Non-nil exactly while
     /// `.trackpad` is active, so its absence is also what keeps every relative
     /// path inert in `.direct`.
@@ -291,6 +296,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private lazy var secondaryClickInteraction = UIContextMenuInteraction(delegate: self)
     private var catalystCursor: NSCursor?
     private var catalystCursorDisplayScale: CGFloat = 0
+    private var catalystDotCursor: (diameter: CGFloat, displayScale: CGFloat, cursor: NSCursor)?
     #else
     /// UIPointerShape outlines every scanline in a bitmap silhouette, which
     /// makes detailed macOS cursors look striped or duplicated on iPad. Keep
@@ -845,6 +851,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         pointerSpeed: Double,
         cursorHeight: CGFloat,
         serverRendersCursor: Bool,
+        showsLocalCursorDot: Bool,
         keyboardActive: Bool,
         keyboardCaptured: Bool,
         inputViewsGeneration: UInt64,
@@ -872,8 +879,22 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             self.viewportPanningMode = viewportPanningMode
         }
         self.pointerSpeed = pointerSpeed
-        self.cursorHeight = TrackpadCursorStyle.resolvedCursorHeight(cursorHeight)
+        let resolvedCursorHeight = TrackpadCursorStyle.resolvedCursorHeight(cursorHeight)
+        let localDotChanged = showsLocalCursorDot != self.showsLocalCursorDot
+            || (showsLocalCursorDot && resolvedCursorHeight != self.cursorHeight)
+        self.cursorHeight = resolvedCursorHeight
         self.serverRendersCursor = serverRendersCursor
+        self.showsLocalCursorDot = showsLocalCursorDot
+        if localDotChanged {
+            // The virtual cursor redraws in the trackpad refresh below.
+            #if targetEnvironment(macCatalyst)
+            if hoverRecognizer.state == .began || hoverRecognizer.state == .changed {
+                applyCatalystCursor()
+            }
+            #else
+            pointerInteraction.invalidate()
+            #endif
+        }
         if self.pointerMode != pointerMode {
             let previousPointerMode = self.pointerMode
             self.pointerMode = pointerMode
@@ -3193,7 +3214,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             // A server that paints the pointer into the picture has already
             // drawn it; the Mac's own arrow on top would be a second one.
             if serverRendersCursor {
-                Self.invisibleCatalystCursor.set()
+                let dot = showsLocalCursorDot ? catalystLocalDotCursor() : nil
+                (dot ?? Self.invisibleCatalystCursor).set()
             } else {
                 NSCursor.arrow.set()
             }
@@ -3219,6 +3241,21 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             catalystCursorDisplayScale = displayScale
         }
         catalystCursor?.set()
+    }
+
+    private func catalystLocalDotCursor() -> NSCursor? {
+        let diameter = TrackpadCursorStyle.localDotDiameter(cursorHeight: cursorHeight)
+        let displayScale = fallbackCursorDisplayScale
+        if let cached = catalystDotCursor,
+           cached.diameter == diameter, cached.displayScale == displayScale {
+            return cached.cursor
+        }
+        guard let dot = Self.renderFallbackCursorImage(
+            .dot, height: diameter, displayScale: displayScale)
+        else { return nil }
+        let cursor = NSCursor(image: dot.image, hotSpot: dot.hotspot)
+        catalystDotCursor = (diameter, displayScale, cursor)
+        return cursor
     }
     #endif
 
@@ -3273,9 +3310,21 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             hasServerCursor: remoteCursor != nil,
             presence: remoteCursorPresence,
             allowingFallback: allowingFallback,
-            serverRendersCursor: serverRendersCursor)
+            serverRendersCursor: serverRendersCursor,
+            showsLocalDot: showsLocalCursorDot)
         guard style != .hidden else {
             hideRemoteCursorImage()
+            return
+        }
+        if style == .localDot {
+            guard let dot = fallbackCursorImage(
+                .dot, height: TrackpadCursorStyle.localDotDiameter(cursorHeight: cursorHeight))
+            else {
+                hideRemoteCursorImage()
+                return
+            }
+            drawRemoteCursorImage(
+                dot.image, hotspot: dot.hotspot, size: dot.image.size, at: location)
             return
         }
         if let remoteCursor {
@@ -3337,8 +3386,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         // own — every context shape, at the right size for the content,
         // scaling with the desktop as it zooms instead of floating above it at
         // a fixed size. A local overlay on top of it would simply be a second
-        // pointer chasing the first.
-        guard !serverRendersCursor else {
+        // pointer chasing the first. The opt-in dot is the exception: it
+        // marks where input lands before the video shows it.
+        guard !serverRendersCursor || showsLocalCursorDot else {
             if remoteCursorHoverLocation != nil
                 || !remoteCursorImageView.isHidden {
                 trackpadCursorPresentation = nil
@@ -3352,6 +3402,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             pointerMode: pointerMode,
             shapeRevision: remoteCursorShapeRevision,
             presence: remoteCursorPresence,
+            localDot: serverRendersCursor && showsLocalCursorDot,
             height: cursorHeight,
             displayScale: fallbackCursorDisplayScale,
             hotspot: remoteCursor.map {
@@ -3376,10 +3427,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         /// not move; without the presence here the hide would be skipped as
         /// "nothing changed" and the fallback arrow would stay on screen.
         var presence: RemoteCursorPresence
+        var localDot: Bool
         var height: CGFloat
         var displayScale: CGFloat
         var hotspot: CGPoint
     }
+    #endif
 
     /// Rasterisation scale for the original fallback. Before the view reaches a
     /// window its trait collection reports no scale, and the renderer's own
@@ -3389,18 +3442,19 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         return scale > 0 ? scale : UIGraphicsImageRendererFormat.preferred().scale
     }
 
-    private struct FallbackCursorKey: Hashable {
-        var shape: TrackpadCursorArtwork.Shape
-        var height: CGFloat
-        var displayScale: CGFloat
-    }
-
     /// A rendered cursor and the point inside it the pointer aims with. The
     /// hotspot is not the image corner: the canvas holds the white outline and
     /// the drop shadow around the shape, so the arrow's tip sits well inside.
     private struct FallbackCursorImage {
         var image: UIImage
         var hotspot: CGPoint
+    }
+
+    #if !targetEnvironment(macCatalyst)
+    private struct FallbackCursorKey: Hashable {
+        var shape: TrackpadCursorArtwork.Shape
+        var height: CGFloat
+        var displayScale: CGFloat
     }
 
     /// Heights are quantized to this many points before rendering, so a
@@ -3427,6 +3481,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         fallbackCursorImages[key] = rendered
         return rendered
     }
+    #endif
 
     /// Rasterises our vector fallback at the destination display density.
     private static func renderFallbackCursorImage(
@@ -3447,8 +3502,6 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
                 x: shape.hotspot.x * scale,
                 y: shape.hotspot.y * scale))
     }
-
-    #endif
 
     func pointerInteraction(
         _ interaction: UIPointerInteraction,
@@ -3477,12 +3530,21 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     /// pointer while the local image overlay above displays the exact remote
     /// cursor, and whenever the server paints the pointer into the picture,
     /// which would otherwise show two of them; nil retains the ordinary
-    /// system pointer.
+    /// system pointer. The local dot is a system shape, so it moves with no
+    /// more lag than the pointer itself.
     func pointerInteraction(
         _ interaction: UIPointerInteraction,
         styleFor region: UIPointerRegion
     ) -> UIPointerStyle? {
-        remoteCursor == nil && !serverRendersCursor ? nil : .hidden()
+        if serverRendersCursor {
+            guard showsLocalCursorDot else { return .hidden() }
+            let diameter = TrackpadCursorStyle.localDotDiameter(cursorHeight: cursorHeight)
+            // Path coordinates put the pointer location at the origin.
+            let dot = UIBezierPath(ovalIn: CGRect(
+                x: -diameter / 2, y: -diameter / 2, width: diameter, height: diameter))
+            return UIPointerStyle(shape: .path(dot), constrainedAxes: [])
+        }
+        return remoteCursor == nil ? nil : .hidden()
     }
 
     func gestureRecognizer(
