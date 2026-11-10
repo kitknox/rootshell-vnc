@@ -491,7 +491,11 @@ final class AppleMediaPlaybackSynchronizer: @unchecked Sendable {
     /// point, leaving VideoToolbox and the main-thread renderer their measured
     /// decode/presentation lead.
     static let videoPipelineLeadNanos: UInt64 = 8_000_000
-    private static let maximumSynchronizedDelayNanos: UInt64 = 500_000_000
+    /// Covers Bluetooth output latency. Audio further behind is a stall the
+    /// audio player recovers from, not a lead for video to follow.
+    static let maximumSynchronizedDelayNanos: UInt64 = 250_000_000
+    /// Audio that last played this long ago has stopped; video stops waiting.
+    private static let staleAudioTimingNanos: UInt64 = 1_000_000_000
     private static let ntpFractionScale = 4_294_967_296.0
 
     func reset() {
@@ -513,12 +517,13 @@ final class AppleMediaPlaybackSynchronizer: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Zero until both sender clocks and audio playback are known: video
+    /// never waits for audio that is not playing yet.
     func videoDelayNanos(
         for packet: Data,
-        fallbackNanos: UInt64,
         nowNanos: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) -> UInt64 {
-        guard let header = Self.rtpHeader(packet) else { return fallbackNanos }
+        guard let header = Self.rtpHeader(packet) else { return 0 }
 
         lock.lock()
         let videoClock = senderClocks[header.ssrc]
@@ -526,8 +531,9 @@ final class AppleMediaPlaybackSynchronizer: @unchecked Sendable {
         let audioClock = timing.flatMap { senderClocks[$0.ssrc] }
         lock.unlock()
 
-        guard let videoClock, let timing, let audioClock else {
-            return fallbackNanos
+        guard let videoClock, let timing, let audioClock,
+              nowNanos <= timing.hostTimeNanos &+ Self.staleAudioTimingNanos else {
+            return 0
         }
         let audioMediaTime = Self.mediaTimeSeconds(
             rtpTimestamp: timing.rtpTimestamp,
@@ -541,7 +547,7 @@ final class AppleMediaPlaybackSynchronizer: @unchecked Sendable {
         guard mediaDeltaNanos.isFinite,
               mediaDeltaNanos >= Double(Int64.min),
               mediaDeltaNanos <= Double(Int64.max) else {
-            return fallbackNanos
+            return 0
         }
 
         let target = Int64(clamping: timing.hostTimeNanos)
@@ -549,11 +555,7 @@ final class AppleMediaPlaybackSynchronizer: @unchecked Sendable {
             - Int64(Self.videoPipelineLeadNanos)
         let now = Int64(clamping: nowNanos)
         guard target > now else { return 0 }
-        let delay = UInt64(target - now)
-        guard delay <= Self.maximumSynchronizedDelayNanos else {
-            return fallbackNanos
-        }
-        return delay
+        return min(UInt64(target - now), Self.maximumSynchronizedDelayNanos)
     }
 
     private static func mediaTimeSeconds(
@@ -778,6 +780,10 @@ public final class VNCSession {
 
     /// Whether the server is using high-performance (HEVC/H.264) mode.
     public var isHighPerformanceMode: Bool = false
+
+    /// Why this session left High Performance for Standard, if it did. The
+    /// saved connection keeps High Performance; the next connect tries it again.
+    public private(set) var highPerformanceFallbackReason: String?
 
     /// Native Apple clipboard controls negotiated for this connection.
     public private(set) var supportsRemoteClipboardRequest = false
@@ -1282,6 +1288,7 @@ public final class VNCSession {
         consecutiveMediaBootstrapReconnects = 0
         consecutiveMediaStreamRestarts = 0
         automaticRecoveryDeclined = false
+        highPerformanceFallbackReason = nil
         connectionState = .connecting
         connectionPhaseDescription = String(localized: "Opening connection…", bundle: .module)
         activeCredentials = credentials
@@ -2078,6 +2085,9 @@ public final class VNCSession {
 
         case .appleMediaUDPStarted(let localPort):
             logger.info("Apple media UDP started on local port \(localPort)")
+
+        case .appleMediaUnavailable(let reason):
+            fallBackToStandard(reason: reason)
 
         case .appleMediaControlRecord:
             break
@@ -3618,9 +3628,37 @@ public final class VNCSession {
         // repeated "Connection interrupted".
         guard consecutiveMediaBootstrapReconnects
                 < Self.maximumConsecutiveMediaBootstrapReconnects else {
-            failAfterMediaBootstrapExhausted(reason: reason)
+            if !fallBackToStandard(reason: "video could not start (\(reason))") {
+                failAfterMediaBootstrapExhausted(reason: reason)
+            }
             return
         }
+        let transport = transportSession
+        Task { [weak self] in
+            // Retrying High Performance cannot help a path below its floor.
+            if let transport,
+               await transport.appleMediaPathBelowHighPerformanceFloor,
+               let self,
+               self.transportSession === transport,
+               self.fallBackToStandard(
+                   reason: "network below High Performance's bandwidth floor") {
+                return
+            }
+            self?.retryMediaBootstrap(
+                reason: reason,
+                retryTilesPerFrame: retryTilesPerFrame,
+                transport: transport)
+        }
+    }
+
+    private func retryMediaBootstrap(
+        reason: String,
+        retryTilesPerFrame: UInt64?,
+        transport: TransportSession?
+    ) {
+        guard transportSession === transport,
+              connectionState.isConnected,
+              reconnectTask == nil else { return }
         consecutiveMediaBootstrapReconnects += 1
         if let retryTilesPerFrame {
             appleMediaTilesPerFrameOverride = retryTilesPerFrame
@@ -3628,9 +3666,38 @@ public final class VNCSession {
                 "Retrying Apple media with tilesPerFrame=\(retryTilesPerFrame)")
         }
         logger.error("Video bootstrap failed (\(reason)); reconnecting")
-        let transport = transportSession
         Task { await transport?.disconnect() }
         scheduleReconnect(immediate: true)
+    }
+
+    /// Room for the server's long-term-reference repair to arrive after a loss.
+    nonisolated private static let lossKeyframeGrace: Duration = .milliseconds(400)
+    /// Decoder output this soon after the loss may be a frame already in flight.
+    nonisolated private static let inFlightDecodeNanos: UInt64 = 50_000_000
+
+    /// Whether a loss still needs a keyframe after the repair grace period.
+    nonisolated private static func needsLossKeyframe(
+        manager: VideoStreamManager?,
+        lossNanos: UInt64
+    ) async -> Bool {
+        try? await Task.sleep(for: lossKeyframeGrace)
+        guard let manager else { return false }
+        return manager.decodeProgress.lastDecoderOutputNanos
+            <= lossNanos &+ inFlightDecodeNanos
+    }
+
+    /// Leave High Performance for this session and reconnect in Standard,
+    /// keeping the display sizing. Returns whether the fallback started.
+    @discardableResult
+    private func fallBackToStandard(reason: String) -> Bool {
+        guard configuration.videoQualityMode == .adaptive,
+              highPerformanceFallbackReason == nil else { return false }
+        var standard = configuration
+        standard.videoQualityMode = .standard
+        guard reconnect(with: standard) else { return false }
+        highPerformanceFallbackReason = reason
+        logger.warning("Continuing in Standard: \(reason)")
+        return true
     }
 
     private func establishTransport(credentials: VNCCredentials) async throws {
@@ -4133,15 +4200,21 @@ public final class VNCSession {
         secondaryVideoBandRenderer.reset()
 
         if configuration.effectiveRemoteAudioPlaybackEnabled {
-            let synchronizationClock =
-                appleMediaPlaybackSynchronizer ?? AppleMediaPlaybackSynchronizer()
-            appleMediaPlaybackSynchronizer = synchronizationClock
+            // Video follows audio playback only when the user asked for sync.
+            if configuration.synchronizesVideoToRemoteAudio {
+                appleMediaPlaybackSynchronizer =
+                    appleMediaPlaybackSynchronizer ?? AppleMediaPlaybackSynchronizer()
+            }
             if remoteAudioPlayer == nil {
-                do {
-                    remoteAudioPlayer = try AppleRemoteAudioPlayer {
-                        [weak synchronizationClock] timing in
-                        synchronizationClock?.noteAudioPlayback(timing)
+                var timingSink: (@Sendable (AppleRemoteAudioPlaybackTiming) -> Void)?
+                if let clock = appleMediaPlaybackSynchronizer {
+                    timingSink = { [weak clock] timing in
+                        clock?.noteAudioPlayback(timing)
                     }
+                }
+                do {
+                    remoteAudioPlayer = try AppleRemoteAudioPlayer(
+                        playbackTimingSink: timingSink)
                 } catch {
                         logger.error("Could not initialize remote audio: \(error.localizedDescription)")
                 }
@@ -4323,6 +4396,14 @@ public final class VNCSession {
                             retryTilesPerFrame: 4)
                         return
                     }
+                    // Not one video packet: the UDP media path does not work
+                    // here, and only Standard can show anything.
+                    if decoded == 0, tick >= 5,
+                       await transport.videoSourceCount == 0,
+                       self?.fallBackToStandard(
+                           reason: "no video reached this device") == true {
+                        return
+                    }
                     guard firAttempts < 3,
                           await transport.isReadyForVideoKeyframeRecovery() || tick >= 6,
                           await recoveryCoordinator.begin() else {
@@ -4449,16 +4530,19 @@ public final class VNCSession {
             let log = logger
             let recoveryQueue = mediaQueue
             let latestLossSSRC = LatestLossSSRC()
-            manager.onLossDetected = { [weak transport, latestLossSSRC] ssrc in
+            manager.onLossDetected = {
+                [weak transport, weak recoveryManager, latestLossSSRC] ssrc in
                 latestLossSSRC.record(ssrc)
                 guard let transport else { return }
+                let lossNanos = DispatchTime.now().uptimeNanoseconds
                 Task { [transport] in
                     // By the time the demuxer sees a sequence gap, transport
-                    // retransmission has already failed. The server answers a
-                    // keyframe request with a recovery IDR_N_LP + parameter
-                    // sets (verified live 2026-07-12), which the surviving
-                    // decoder session picks up directly — no rebuild needed.
-                    // The transport rate-limits repeated requests.
+                    // retransmission has already failed. Frame-loss feedback
+                    // lets the server repair from a long-term reference; a
+                    // keyframe (a full IDR) follows only if nothing decodes.
+                    guard await Self.needsLossKeyframe(
+                        manager: recoveryManager,
+                        lossNanos: lossNanos) else { return }
                     await transport.requestVideoKeyframe(ssrc: ssrc)
                     if !(await transport.hasObservedVideoLossFeedback(ssrc: ssrc)) {
                         log.warning("Compressed stream gated without a matching "
@@ -4600,10 +4684,7 @@ public final class VNCSession {
             let generationCoalescer = coalescer
             let generationLog = logger
             let videoDelay: @Sendable (Data) -> UInt64 = { packet in
-                let fallback = sinkAudioPlayer?.recommendedVideoDelayNanos ?? 0
-                return playbackSynchronizer?.videoDelayNanos(
-                    for: packet,
-                    fallbackNanos: fallback) ?? fallback
+                playbackSynchronizer?.videoDelayNanos(for: packet) ?? 0
             }
             let videoPacketCoalescer = OrderedMediaPacketCoalescer(
                 queue: queue,
@@ -4631,9 +4712,15 @@ public final class VNCSession {
                     }
                 }
             }
-            secondaryManager?.onLossDetected = { [weak transport] ssrc in
+            secondaryManager?.onLossDetected = { [weak transport, weak secondaryManager] ssrc in
                 guard let transport else { return }
-                Task { await transport.requestVideoKeyframe(ssrc: ssrc) }
+                let lossNanos = DispatchTime.now().uptimeNanoseconds
+                Task {
+                    guard await Self.needsLossKeyframe(
+                        manager: secondaryManager,
+                        lossNanos: lossNanos) else { return }
+                    await transport.requestVideoKeyframe(ssrc: ssrc)
+                }
             }
             secondaryManager?.onDecoderFailure = { [weak transport, weak secondaryManager] failure in
                 guard let transport, let secondaryManager else { return }
@@ -4649,9 +4736,13 @@ public final class VNCSession {
                     session?.noteAppleMediaGenerationTransitionForLoginSend()
                 }
             }
-            await transport.setAppleMediaSenderClockSink {
-                [weak playbackSynchronizer] mapping in
-                playbackSynchronizer?.noteSenderClock(mapping)
+            if let playbackSynchronizer {
+                await transport.setAppleMediaSenderClockSink {
+                    [weak playbackSynchronizer] mapping in
+                    playbackSynchronizer?.noteSenderClock(mapping)
+                }
+            } else {
+                await transport.setAppleMediaSenderClockSink(nil)
             }
             await transport.setAppleMediaGenerationSink { generation, numberOfTiles in
                 generationTransitionKick()

@@ -58,6 +58,11 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
     private let log = VNCLogger(category: "Audio")
     private let playbackTimingSink:
         (@Sendable (AppleRemoteAudioPlaybackTiming) -> Void)?
+    private var leadController = AppleRemoteAudioLeadController(
+        rendererLeadNanos: AppleRemoteAudioPlayer.defaultRendererLeadNanos)
+    private var playbackRate: Float = 1
+    private var rateAdjustmentGeneration: UInt64 = 0
+    private var rateAdjustmentCount: UInt64 = 0
 
     private var reorderBuffer = AppleRemoteAudioRTPReorderBuffer()
     private var activeSSRC: UInt32?
@@ -67,14 +72,11 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
     private var enqueuedAccessUnitCount = 0
     private var prerollAccessUnitTarget =
         AppleRemoteAudioPlayer.basePrerollAccessUnitTarget
-    private let videoDelayLock = NSLock()
-    private var _recommendedVideoDelayNanos = UInt64(
-        AppleRemoteAudioPlayer.basePrerollAccessUnitTarget) * 10_000_000
     private var playbackStartHostTime: CMTime?
     /// Preroll cushion bounds, in 10 ms access units. Underruns grow the
     /// cushion for resilience; sustained clean playback decays it back so one
-    /// bad Wi-Fi patch does not leave audio a quarter second behind the video
-    /// for the rest of the connection.
+    /// bad Wi-Fi patch does not leave audio a quarter second late for the rest
+    /// of the connection.
     static let basePrerollAccessUnitTarget = 10
     static let maximumPrerollAccessUnitTarget = 24
     private static let prerollGrowthStep = 4
@@ -99,6 +101,9 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
     private var audioSessionFailureCount: UInt64 = 0
     private static let audioSessionRetryFloorNanos: UInt64 = 250_000_000
     private static let audioSessionRetryCeilingNanos: UInt64 = 5_000_000_000
+    private var backlogDropCount: UInt64 = 0
+    /// Output lead when the platform cannot report one.
+    static let defaultRendererLeadNanos: Int64 = 20_000_000
 
     private var hasLoggedFirstPacket = false
     private var hasLoggedRendererFailure = false
@@ -107,18 +112,6 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
 
     public static func canHandleRTPPacket(_ data: Data) -> Bool {
         AppleRemoteAudioRTPDepacketizer.canHandle(data)
-    }
-
-    /// Initial delay to apply to the corresponding live video path while RTCP
-    /// Sender Reports have not yet mapped audio and video onto a shared clock.
-    ///
-    /// Once both sender clocks are available, callers should use actual audio
-    /// playback timing for exact synchronization. This adaptive preroll remains
-    /// the safe fallback after a generation change or sender-clock gap.
-    public var recommendedVideoDelayNanos: UInt64 {
-        videoDelayLock.lock()
-        defer { videoDelayLock.unlock() }
-        return _recommendedVideoDelayNanos
     }
 
     public init(
@@ -152,6 +145,7 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
         }
         formatDescription = description
 
+        renderer.audioTimePitchAlgorithm = .timeDomain
         synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
         synchronizer.addRenderer(renderer)
         automaticFlushObserver = NotificationCenter.default.addObserver(
@@ -205,6 +199,8 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
         let isRunning: Bool
         let rendererFailed: Bool
         let prerollAccessUnitTarget: Int
+        let rateAdjustmentCount: UInt64
+        let backlogDropCount: UInt64
     }
 
     func diagnosticsSnapshot() -> DiagnosticsSnapshot {
@@ -213,7 +209,9 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
                 underrunCount: underrunCount,
                 isRunning: isRunning,
                 rendererFailed: renderer.status == .failed,
-                prerollAccessUnitTarget: prerollAccessUnitTarget)
+                prerollAccessUnitTarget: prerollAccessUnitTarget,
+                rateAdjustmentCount: rateAdjustmentCount,
+                backlogDropCount: backlogDropCount)
         }
     }
 
@@ -230,7 +228,6 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
             if let decayIntervalNanos {
                 cushionDecayIntervalNanos = decayIntervalNanos
             }
-            updateRecommendedVideoDelay()
             lastCushionAdjustmentNanos = DispatchTime.now().uptimeNanoseconds
         }
     }
@@ -289,6 +286,14 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
         if baseRTPTimestamp == nil { baseRTPTimestamp = base }
         var packetOffset = packet.timestamp &- base
         var firstPresentationTime: CMTime?
+        noteArrivalSlack(
+            presentationFrames: Int64(packetOffset),
+            hasLeadingAccessUnit: !(packet.accessUnits.first?.isEmpty ?? true))
+        if baseRTPTimestamp == nil {
+            // A backlog skip restarted the timeline at this packet.
+            baseRTPTimestamp = packet.timestamp
+            packetOffset = 0
+        }
 
         for (index, accessUnit) in packet.accessUnits.enumerated() {
             guard !accessUnit.isEmpty else { continue }
@@ -317,8 +322,10 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
                 prerollAccessUnitTarget = min(
                     prerollAccessUnitTarget + Self.prerollGrowthStep,
                     Self.maximumPrerollAccessUnitTarget)
-                updateRecommendedVideoDelay()
                 lastCushionAdjustmentNanos = DispatchTime.now().uptimeNanoseconds
+                leadController.noteUnderrun(
+                    nowNanos: DispatchTime.now().uptimeNanoseconds)
+                setPlaybackRate(1)
                 let lateMilliseconds = Int(
                     (CMTimeSubtract(renderTime, presentationTime).seconds * 1000)
                         .rounded())
@@ -380,7 +387,12 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
             playbackStartHostTime = CMClockGetTime(CMClockGetHostTimeClock())
             synchronizer.setRate(1, time: .zero)
             isRunning = true
-            lastCushionAdjustmentNanos = DispatchTime.now().uptimeNanoseconds
+            lastCushionAdjustmentNanos = hostTimeNanos
+            let rendererLeadNanos = measuredRendererLeadNanos()
+            leadController.restartTimeline(
+                rendererLeadNanos: rendererLeadNanos,
+                startLeadNanos: Int64(prerollAccessUnitTarget) * 10_000_000,
+                nowNanos: hostTimeNanos)
             if let activeSSRC, let baseRTPTimestamp {
                 playbackTimingSink?(AppleRemoteAudioPlaybackTiming(
                     ssrc: activeSSRC,
@@ -389,21 +401,23 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
             }
             log.info(
                 "Remote audio playback started with "
-                    + "\(prerollAccessUnitTarget * 10) ms preroll")
+                    + "\(prerollAccessUnitTarget * 10) ms preroll, "
+                    + "\(rendererLeadNanos / 1_000_000) ms output lead")
         }
 
         if isRunning,
+           let playbackTimingSink,
            let activeSSRC,
            let firstPresentationTime,
            let renderTime = trustedRenderTime() {
             let nowNanos = DispatchTime.now().uptimeNanoseconds
             let untilPresentation = CMTimeSubtract(
                 firstPresentationTime,
-                renderTime).seconds
+                renderTime).seconds / Double(playbackRate)
             let targetNanos = untilPresentation > 0
                 ? nowNanos &+ UInt64((untilPresentation * 1_000_000_000).rounded())
                 : nowNanos
-            playbackTimingSink?(AppleRemoteAudioPlaybackTiming(
+            playbackTimingSink(AppleRemoteAudioPlaybackTiming(
                 ssrc: activeSSRC,
                 rtpTimestamp: packet.timestamp,
                 hostTimeNanos: targetNanos))
@@ -434,6 +448,84 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
         log.info(
             "Remote audio cushion decayed to "
                 + "\(prerollAccessUnitTarget * 10) ms after clean playback")
+    }
+
+    /// Feed the lead controller this packet's slack and apply any rate change
+    /// it asks for. Fully late packets are left to the re-anchor below.
+    private func noteArrivalSlack(
+        presentationFrames: Int64,
+        hasLeadingAccessUnit: Bool
+    ) {
+        guard isRunning, hasLeadingAccessUnit,
+              let renderTime = trustedRenderTime() else { return }
+        let presentation = CMTime(
+            value: presentationFrames,
+            timescale: AppleRemoteAudioRTPDepacketizer.sampleRate)
+        let slackNanos = Int64(
+            (CMTimeSubtract(presentation, renderTime).seconds * 1_000_000_000)
+                .rounded())
+        let accessUnitNanos = Int64(
+            AppleRemoteAudioRTPDepacketizer.framesPerAccessUnit)
+            * 1_000_000_000 / Int64(AppleRemoteAudioRTPDepacketizer.sampleRate)
+        guard slackNanos > -accessUnitNanos else { return }
+        let nowNanos = DispatchTime.now().uptimeNanoseconds
+        guard let adjustment = leadController.noteArrival(
+            slackNanos: slackNanos,
+            nowNanos: nowNanos) else { return }
+        if adjustment.skipsBacklog {
+            // The server opens with buffered audio, and a stalled network
+            // delivers some too; playing it out keeps audio that far behind.
+            backlogDropCount &+= 1
+            log.info(
+                "Remote audio \(-adjustment.leadChangeNanos / 1_000_000) ms "
+                    + "ahead of what playback needs; restarting at the live edge")
+            resetRendererTimeline(flushRenderer: true)
+            return
+        }
+        rateAdjustmentCount &+= 1
+        if adjustment.leadChangeNanos < 0, let start = playbackStartHostTime {
+            // The render clock will run ahead of wall time by this much.
+            playbackStartHostTime = CMTimeSubtract(
+                start,
+                CMTime(value: -adjustment.leadChangeNanos, timescale: 1_000_000_000))
+        }
+        setPlaybackRate(adjustment.rate)
+        let generation = rateAdjustmentGeneration
+        queue.asyncAfter(
+            deadline: .now() + .nanoseconds(Int(adjustment.durationNanos))
+        ) { [weak self] in
+            guard let self, generation == rateAdjustmentGeneration else { return }
+            setPlaybackRate(1)
+            leadController.finishAdjustment(
+                nowNanos: DispatchTime.now().uptimeNanoseconds)
+        }
+        log.debug(
+            "Remote audio lead \(adjustment.leadChangeNanos > 0 ? "+" : "")"
+                + "\(adjustment.leadChangeNanos / 1_000_000) ms at rate \(adjustment.rate)")
+    }
+
+    /// A new rate also retires any pending return to normal speed.
+    private func setPlaybackRate(_ rate: Float) {
+        rateAdjustmentGeneration &+= 1
+        guard rate != playbackRate else { return }
+        playbackRate = rate
+        if isRunning {
+            synchronizer.setRate(rate, time: .invalid)
+        }
+    }
+
+    /// How far ahead of the render clock the output path consumes audio.
+    private func measuredRendererLeadNanos() -> Int64 {
+        #if os(iOS)
+        let session = AVAudioSession.sharedInstance()
+        let seconds = session.outputLatency + session.ioBufferDuration
+        guard seconds.isFinite, seconds > 0 else {
+            return Self.defaultRendererLeadNanos
+        }
+        return min(max(Int64(seconds * 1_000_000_000), 5_000_000), 300_000_000)
+        #else
+        return Self.defaultRendererLeadNanos
+        #endif
     }
 
     /// The synchronizer's render position, or nil while the reading is
@@ -563,19 +655,13 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
     private func resetRendererTimeline(flushRenderer: Bool) {
         synchronizer.setRate(0, time: .invalid)
         if flushRenderer { renderer.flush() }
-        updateRecommendedVideoDelay()
         baseRTPTimestamp = nil
         playbackStartHostTime = nil
         enqueuedAccessUnitCount = 0
         isRunning = false
+        playbackRate = 1
+        rateAdjustmentGeneration &+= 1
         hasLoggedRendererFailure = false
-    }
-
-    private func updateRecommendedVideoDelay() {
-        let delay = UInt64(prerollAccessUnitTarget) * 10_000_000
-        videoDelayLock.lock()
-        _recommendedVideoDelayNanos = delay
-        videoDelayLock.unlock()
     }
 
     private func activateAudioSessionIfNeeded() {

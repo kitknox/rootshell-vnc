@@ -99,7 +99,7 @@ final class AppleRemoteAudioPlayerTests: XCTestCase {
 
     /// An underrun-inflated cushion must decay back to the 100 ms base after
     /// clean playback, so a transient Wi-Fi glitch cannot permanently leave
-    /// audio a quarter second behind the video on every later restart.
+    /// audio a quarter second late on every later restart.
     func testInflatedCushionDecaysAfterCleanPlayback() throws {
         let player = try AppleRemoteAudioPlayer()
         defer { player.stop() }
@@ -117,25 +117,56 @@ final class AppleRemoteAudioPlayerTests: XCTestCase {
             diagnostics.prerollAccessUnitTarget,
             AppleRemoteAudioPlayer.basePrerollAccessUnitTarget,
             "clean playback must decay the cushion back to its base")
-        XCTAssertEqual(
-            player.recommendedVideoDelayNanos,
-            240_000_000,
-            "steady playback retains its established cushion until the next timeline")
-
-        player.reset()
-        _ = player.diagnosticsSnapshot()
-        XCTAssertEqual(player.recommendedVideoDelayNanos, 100_000_000)
     }
 
-    func testRecommendedVideoDelayTracksAdaptiveAudioPreroll() throws {
+    /// A lead far above what arrivals need drains by playing slightly fast,
+    /// on the real synchronizer, without an underrun or a stopped renderer.
+    func testExcessLeadDrainsThroughRateWithoutUnderruns() throws {
         let player = try AppleRemoteAudioPlayer()
         defer { player.stop() }
-
-        XCTAssertEqual(player.recommendedVideoDelayNanos, 100_000_000)
 
         player.setPrerollTargetForTesting(
             AppleRemoteAudioPlayer.maximumPrerollAccessUnitTarget)
 
-        XCTAssertEqual(player.recommendedVideoDelayNanos, 240_000_000)
+        streamRealTime(seconds: 6.5, to: player) // four 1 s slack windows, then a drain
+
+        let diagnostics = player.diagnosticsSnapshot()
+        XCTAssertGreaterThanOrEqual(diagnostics.rateAdjustmentCount, 1)
+        XCTAssertEqual(diagnostics.underrunCount, 0)
+        XCTAssertEqual(diagnostics.backlogDropCount, 0)
+        XCTAssertTrue(diagnostics.isRunning)
+        XCTAssertFalse(diagnostics.rendererFailed)
+    }
+
+    /// Buffered audio that stays far ahead of playback for a full second is
+    /// skipped, and playback resumes from the packets that follow it.
+    func testBacklogBurstRestartsAtTheLiveEdge() throws {
+        let player = try AppleRemoteAudioPlayer()
+        defer { player.stop() }
+
+        streamRealTime(seconds: 1, to: player)
+        sendBurst(80, to: player) // 800 ms of audio at once
+        streamRealTime(seconds: 3, to: player)
+
+        let diagnostics = player.diagnosticsSnapshot()
+        XCTAssertGreaterThanOrEqual(diagnostics.backlogDropCount, 1)
+        XCTAssertTrue(diagnostics.isRunning)
+        XCTAssertFalse(diagnostics.rendererFailed)
+    }
+
+    /// Sends 10 ms packets paced by the wall clock, so the lead neither
+    /// grows nor shrinks on its own.
+    private func streamRealTime(seconds: Double, to player: AppleRemoteAudioPlayer) {
+        let start = DispatchTime.now().uptimeNanoseconds
+        var sent: UInt64 = 0
+        while true {
+            let elapsed = DispatchTime.now().uptimeNanoseconds - start
+            if Double(elapsed) >= seconds * 1_000_000_000 { return }
+            while sent * 10_000_000 <= elapsed {
+                player.enqueueRTPPacket(makeAudioPacket())
+                sent += 1
+            }
+            usleep(2_000)
+        }
     }
 }

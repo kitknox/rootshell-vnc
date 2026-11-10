@@ -31,23 +31,22 @@ final class AppleMediaPlaybackSynchronizerTests: XCTestCase {
             ssrc: videoSSRC)
 
         XCTAssertEqual(
-            synchronizer.videoDelayNanos(
-                for: videoPacket,
-                fallbackNanos: 100_000_000,
-                nowNanos: 900_000_000),
+            synchronizer.videoDelayNanos(for: videoPacket, nowNanos: 900_000_000),
             92_000_000)
+        // Far-behind audio caps the wait; audio gone for over a second ends it.
+        XCTAssertEqual(
+            synchronizer.videoDelayNanos(for: videoPacket, nowNanos: 1),
+            AppleMediaPlaybackSynchronizer.maximumSynchronizedDelayNanos)
+        XCTAssertEqual(
+            synchronizer.videoDelayNanos(for: videoPacket, nowNanos: 2_100_000_000),
+            0)
     }
 
-    func testFallsBackUntilBothSenderClocksAndAudioTimingExist() {
+    func testVideoDoesNotWaitUntilBothSenderClocksAndAudioTimingExist() {
         let synchronizer = AppleMediaPlaybackSynchronizer()
         let packet = makeRTPPacket(timestamp: 1, ssrc: 2)
 
-        XCTAssertEqual(
-            synchronizer.videoDelayNanos(
-                for: packet,
-                fallbackNanos: 100_000_000,
-                nowNanos: 1),
-            100_000_000)
+        XCTAssertEqual(synchronizer.videoDelayNanos(for: packet, nowNanos: 1), 0)
     }
 
     private func makeRTPPacket(timestamp: UInt32, ssrc: UInt32) -> Data {

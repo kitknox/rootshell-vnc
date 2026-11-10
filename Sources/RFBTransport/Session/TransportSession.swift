@@ -238,6 +238,10 @@ public enum SessionEvent: Sendable {
     /// The Apple media UDP receive socket was opened.
     case appleMediaUDPStarted(localPort: UInt16)
 
+    /// High Performance media cannot work on this path; the control channel
+    /// is still healthy, so the session can continue in Standard.
+    case appleMediaUnavailable(reason: String)
+
     /// A TCP control stream chunk observed after accepting Apple's media stream.
     case appleMediaControlRecord(encryptedLength: Int, encryptedPrefix: Data, plaintextPrefix: Data?, decryptError: String?)
 
@@ -617,10 +621,19 @@ public actor TransportSession {
     /// This is unrelated to the RTP media-control extension and RTCP LSR.
     private var appleMediaLastRTPEchoTimestampQ10: UInt16 = 0
     private var appleRCTLPreviousRTPTimestamp: UInt32?
+    /// Arrival time of the echoed frame's first packet and the packets received
+    /// before it. Native reports hold time and count from these.
+    private var appleRCTLEchoArrivalNanos: UInt64 = 0
+    private var appleRCTLEchoPacketCount: UInt32 = 0
+    private var appleMediaReceiveBandwidthEstimator = AppleMediaReceiveBandwidthEstimator()
+    private var appleMediaQualityWindowStartNanos: UInt64 = 0
+    private var appleMediaQualityWindowReceived = 0
+    private var appleMediaQualityWindowLost = 0
+    private var appleMediaConsecutiveLossyWindows = 0
+    private var reportedAppleMediaUnavailable = false
     private var appleRCTLTotalPacketsReceived: UInt32 = 0
     private var appleRCTLAudioPacketsReceived: UInt32 = 0
     private var appleRCTLTotalBytesReceived: UInt64 = 0
-    private var appleRCTLMaximumQueueDelayNanos: UInt64 = 0
     /// RTCP APP "RCTL" rate-control feedback (drives the server's adaptive
     /// encoder bitrate). This profile sends it at approximately 20 Hz; without
     /// it the server encodes at a constant maximum bitrate. The burst-loss
@@ -4929,7 +4942,7 @@ public actor TransportSession {
 
     private func configureAppleMediaUDP(for offer: AppleMediaStreamOffer) async throws {
         if let overridePort = configuredAppleMediaUDPPort() {
-            try await startAppleMediaStreamUDPIfNeeded(bindings: [
+            await openAppleMediaUDPOrReportUnavailable(bindings: [
                 AppleMediaUDPBinding(localPort: overridePort, remotePort: overridePort)
             ])
             return
@@ -4953,7 +4966,7 @@ public actor TransportSession {
         } else {
             log.debug("Binding Apple media UDP on offered ports \(remotePorts)")
         }
-        try await startAppleMediaStreamUDPIfNeeded(bindings: bindings)
+        await openAppleMediaUDPOrReportUnavailable(bindings: bindings)
     }
 
     private nonisolated func uniqueNonZeroPorts(_ values: UInt16?...) -> [UInt16] {
@@ -5294,7 +5307,7 @@ public actor TransportSession {
 
         let bindings = ports.map { AppleMediaUDPBinding(localPort: $0, remotePort: $0) }
         log.debug("Server AVC media type-1 offered UDP ports \(ports); opening symmetric sockets")
-        try await startAppleMediaStreamUDPIfNeeded(bindings: bindings)
+        await openAppleMediaUDPOrReportUnavailable(bindings: bindings)
 
         if entersThroughMessageOne {
             // Keyed Apple authentication publishes an earlier encoding-1103
@@ -5381,10 +5394,16 @@ public actor TransportSession {
         appleMediaSenderReports.removeAll(keepingCapacity: true)
         appleMediaLastRTPEchoTimestampQ10 = 0
         appleRCTLPreviousRTPTimestamp = nil
+        appleRCTLEchoArrivalNanos = 0
+        appleRCTLEchoPacketCount = 0
+        appleMediaReceiveBandwidthEstimator = AppleMediaReceiveBandwidthEstimator()
+        appleMediaQualityWindowStartNanos = 0
+        appleMediaQualityWindowReceived = 0
+        appleMediaQualityWindowLost = 0
+        appleMediaConsecutiveLossyWindows = 0
         appleRCTLTotalPacketsReceived = 0
         appleRCTLAudioPacketsReceived = 0
         appleRCTLTotalBytesReceived = 0
-        appleRCTLMaximumQueueDelayNanos = 0
         appleRCTLPacketsInterval = 0
         appleRCTLLostInterval = 0
         appleRCTLBurstLostInterval = 0
@@ -5446,52 +5465,79 @@ public actor TransportSession {
         return ports
     }
 
+    /// Media sockets only accumulate until teardown: the 1103 offer and the
+    /// type-1 port message announce ports in either order, and closing a socket
+    /// the server still targets leaves video sent to an unreachable port.
     private func startAppleMediaStreamUDPIfNeeded(bindings: [AppleMediaUDPBinding]) async throws {
-        var requestedBindings: [AppleMediaUDPBinding] = []
-        for binding in bindings where !requestedBindings.contains(binding) {
-            requestedBindings.append(binding)
-        }
-
-        if appleMediaUDPBindings == requestedBindings {
-            return
-        }
-
-        // Incremental update: KEEP channels whose binding is unchanged and only
-        // add/remove the difference. The old full stop-and-restart (media setup
-        // grows the binding set from [5900] to [5900, 5901] mid-handshake)
-        // closed the video channel while the server's first media burst was in
-        // flight and dropped whatever sat in its receive buffer. When a band's
-        // startup IRAP was in that window — a timing race, so it struck
-        // intermittently — that band stayed black or corrupt for the entire
-        // session, because this stream NEVER sends another IRAP.
-        var keptBindings: [AppleMediaUDPBinding] = []
-        var keptChannels: [PosixUDPChannel] = []
-        var keptTasks: [Task<Void, Never>] = []
-        for (index, binding) in appleMediaUDPBindings.enumerated() {
-            if requestedBindings.contains(binding) {
-                keptBindings.append(binding)
-                if index < udpChannels.count { keptChannels.append(udpChannels[index]) }
-                if index < udpReadTasks.count { keptTasks.append(udpReadTasks[index]) }
-            } else {
-                if index < udpReadTasks.count { udpReadTasks[index].cancel() }
-                if index < udpChannels.count {
-                    let closing = udpChannels[index]
-                    // Unbind any SSRC routed to the channel being closed.
-                    for (ssrc, channel) in appleMediaVideoSSRCChannels where channel === closing {
-                        appleMediaVideoSSRCChannels.removeValue(forKey: ssrc)
-                    }
-                    await closing.close()
-                }
+        for binding in bindings where !appleMediaUDPBindings.contains(binding) {
+            // Claim before suspending so a reentrant call cannot open it twice.
+            appleMediaUDPBindings.append(binding)
+            do {
+                try await startAppleMediaUDPChannel(binding: binding)
+            } catch {
+                appleMediaUDPBindings.removeAll { $0 == binding }
+                throw error
             }
         }
-        udpChannels = keptChannels
-        udpReadTasks = keptTasks
-        appleMediaUDPBindings = keptBindings
+    }
 
-        for binding in requestedBindings where !keptBindings.contains(binding) {
-            appleMediaUDPBindings.append(binding)
-            try await startAppleMediaUDPChannel(binding: binding)
+    /// A media socket that cannot open (for example, a tunnel port still held)
+    /// leaves the control channel healthy; report it instead of dropping it.
+    private func openAppleMediaUDPOrReportUnavailable(
+        bindings: [AppleMediaUDPBinding]
+    ) async {
+        do {
+            try await startAppleMediaStreamUDPIfNeeded(bindings: bindings)
+        } catch {
+            reportAppleMediaUnavailable(
+                "media socket failed: \(error.localizedDescription)")
         }
+    }
+
+    private func reportAppleMediaUnavailable(_ reason: String) {
+        guard !reportedAppleMediaUnavailable else { return }
+        reportedAppleMediaUnavailable = true
+        log.error("High Performance media unavailable: \(reason)")
+        continuation?.yield(.appleMediaUnavailable(reason: reason))
+    }
+
+    /// The Mac's High Performance encoder does not target below about 20 Mbps.
+    private static let appleMediaHighPerformanceFloorBps: Double = 20_000_000
+
+    /// Whether this path likely cannot carry the High Performance floor: a
+    /// cellular bearer, or a measured packet-train rate under it.
+    public var appleMediaPathBelowHighPerformanceFloor: Bool {
+        if appleMediaNetworkProfile.radioClass != .none { return true }
+        let estimate = appleMediaReceiveBandwidthEstimator.estimateBps
+        return estimate > 0 && estimate < Self.appleMediaHighPerformanceFloorBps
+    }
+
+    /// Unrepaired-loss windows: two consecutive 5 s windows of at least 200
+    /// packets with 20% or more lost mean High Performance is unusable.
+    private func noteAppleMediaQualityWindow(
+        received: Int,
+        lost: Int,
+        nowNanos: UInt64
+    ) {
+        appleMediaQualityWindowReceived += received
+        appleMediaQualityWindowLost += lost
+        if appleMediaQualityWindowStartNanos == 0 {
+            appleMediaQualityWindowStartNanos = nowNanos
+            return
+        }
+        guard nowNanos &- appleMediaQualityWindowStartNanos >= 5_000_000_000 else {
+            return
+        }
+        let expected = appleMediaQualityWindowReceived + appleMediaQualityWindowLost
+        let lossy = expected >= 200 && appleMediaQualityWindowLost * 5 >= expected
+        appleMediaConsecutiveLossyWindows = lossy ? appleMediaConsecutiveLossyWindows + 1 : 0
+        if appleMediaConsecutiveLossyWindows >= 2 {
+            reportAppleMediaUnavailable(
+                "sustained loss \(appleMediaQualityWindowLost)/\(expected) packets")
+        }
+        appleMediaQualityWindowStartNanos = nowNanos
+        appleMediaQualityWindowReceived = 0
+        appleMediaQualityWindowLost = 0
     }
 
     private func startAppleMediaUDPChannel(binding: AppleMediaUDPBinding) async throws {
@@ -5597,10 +5643,16 @@ public actor TransportSession {
         appleMediaRateController = nil
         appleMediaLastRTPEchoTimestampQ10 = 0
         appleRCTLPreviousRTPTimestamp = nil
+        appleRCTLEchoArrivalNanos = 0
+        appleRCTLEchoPacketCount = 0
+        appleMediaReceiveBandwidthEstimator = AppleMediaReceiveBandwidthEstimator()
+        appleMediaQualityWindowStartNanos = 0
+        appleMediaQualityWindowReceived = 0
+        appleMediaQualityWindowLost = 0
+        appleMediaConsecutiveLossyWindows = 0
         appleRCTLTotalPacketsReceived = 0
         appleRCTLAudioPacketsReceived = 0
         appleRCTLTotalBytesReceived = 0
-        appleRCTLMaximumQueueDelayNanos = 0
         appleMediaVideoSSRCChannels.removeAll()
         appleMediaSentBootstrapVideoReceiverReport = false
         appleMediaLTRFrameCompletionTracker.reset()
@@ -6066,11 +6118,19 @@ public actor TransportSession {
         if unique {
             appleRCTLTotalPacketsReceived &+= 1
             appleRCTLTotalBytesReceived &+= UInt64(max(0, wireByteCount))
-            appleRCTLMaximumQueueDelayNanos = max(
-                appleRCTLMaximumQueueDelayNanos,
-                ingressQueueDelayNanos)
             appleRCTLPacketsInterval += 1
-            updateAppleRCTLEchoTimestamp(header.timestamp)
+            updateAppleRCTLEchoTimestamp(
+                header.timestamp,
+                arrivalNanos: arrivalNanos)
+            appleMediaReceiveBandwidthEstimator.notePacket(
+                arrivalSeconds: Double(arrivalNanos) / 1_000_000_000,
+                rtpTimestamp: header.timestamp,
+                sizeBytes: packet.count,
+                marker: header.marker,
+                startsProbe: AppleMediaReceiveBandwidthEstimator
+                    .rtpPayloadFirstByte(packet)
+                    .map(AppleMediaReceiveBandwidthEstimator.startsProbe) ?? false)
+            noteAppleMediaQualityWindow(received: 1, lost: 0, nowNanos: arrivalNanos)
             startAppleTestFIRLoopIfRequested()
             startAppleRCTLFeedbackLoop()
 
@@ -6147,6 +6207,10 @@ public actor TransportSession {
 
         for gap in result.gaps {
             appleRCTLLostInterval += gap.missingPacketCount
+            noteAppleMediaQualityWindow(
+                received: 0,
+                lost: gap.missingPacketCount,
+                nowNanos: DispatchTime.now().uptimeNanoseconds)
             appleRCTLBurstLostInterval = max(
                 appleRCTLBurstLostInterval,
                 gap.missingPacketCount)
@@ -6573,19 +6637,22 @@ public actor TransportSession {
         appleMediaLastVideoReleaseNanos = now
     }
 
-    /// Apply the feedback-only RTP receive-accounting rules. Update the echo
-    /// only when a forward-moving RTP timestamp begins, then send the
-    /// low-precision form selected by Apple's video-stream configuration.
-    private func updateAppleRCTLEchoTimestamp(_ timestamp: UInt32) {
-        guard let previous = appleRCTLPreviousRTPTimestamp else {
-            appleRCTLPreviousRTPTimestamp = timestamp
-            return
+    /// Feedback-only receive accounting: each forward-moving RTP timestamp
+    /// latches the echo, its first packet's arrival, and the count before it.
+    private func updateAppleRCTLEchoTimestamp(
+        _ timestamp: UInt32,
+        arrivalNanos: UInt64
+    ) {
+        if let previous = appleRCTLPreviousRTPTimestamp {
+            let distance = timestamp &- previous
+            guard distance != 0, distance < 0x8000_0000 else { return }
         }
-        let distance = timestamp &- previous
-        guard distance != 0, distance < 0x8000_0000 else { return }
         appleRCTLPreviousRTPTimestamp = timestamp
         appleMediaLastRTPEchoTimestampQ10 =
             appleMediaRCTLLowPrecisionEchoTimestamp(timestamp)
+        appleRCTLEchoArrivalNanos = arrivalNanos
+        // The caller has already counted this packet; the peer expects it excluded.
+        appleRCTLEchoPacketCount = appleRCTLTotalPacketsReceived &- 1
     }
 
     /// Build and send one RTCP APP "RCTL" rate-control feedback packet:
@@ -6629,21 +6696,11 @@ public actor TransportSession {
             controller.update(now: nowSeconds)
         }
 
-        // RCTL carries estimated receive capacity. It is the feedback input to
-        // the peer's encoder controller, not an observed activity bitrate.
-        // Start a healthy LAN at the native 60 Mbps ceiling, but continue to
-        // advertise the controller's loss-backed estimate. Pinning LAN RCTL at
-        // 60 Mbps after confirmed loss let a Retina intra-refresh burst exceed
-        // 150 Mbps while the receiver was already dropping packets. Apple's
-        // clean 60 Mbps sessions stay at the ceiling because they remain
-        // lossless; the ceiling is a prior, not an override of measured loss.
-        let estimatedKbps: Double
-        if !rateControlEnabled {
-            estimatedKbps = 65_535
-        } else {
-            estimatedKbps = Double(appleMediaRateController?.bandwidthEstimateBps
-                ?? UInt32(appleMediaRateControllerMaxBps)) / 1_000
-        }
+        // Native reports its packet-train estimate (zero until the first
+        // probe); the peer's own controller reacts to OWRD, RTT, and loss.
+        let estimatedKbps: Double = rateControlEnabled
+            ? Double(appleMediaReceiveBandwidthEstimator.rctlKbps)
+            : 65_535
         let bweKbps = runtimeEnvironment["ROOTSHELL_VNC_RCTL_BWE_KBPS"]
             .flatMap(Double.init) ?? estimatedKbps
         let bwe = UInt16(min(65_535, max(0, bweKbps.rounded())))
@@ -6654,29 +6711,30 @@ public actor TransportSession {
             ? 0
             : UInt8(min(100, Int((Double(max(0, intervalLost)) * 100
                 / Double(expectedPackets)).rounded())))
-        // These counts are sampled at serialization time. Latching a count at
-        // the first packet of an RTP timestamp leaves the rest of a large HEVC
-        // access unit unreported and makes VCRC infer loss that never occurred.
+        // Native latches the count at the echoed frame's first packet; the peer
+        // pairs it with the echo, so counting later packets hides real loss.
         let cumulativeVideoReceivedPacketCount = UInt16(
-            truncatingIfNeeded: appleRCTLTotalPacketsReceived)
-        let cumulativeAudioReceivedPacketCount = UInt16(
-            truncatingIfNeeded: appleRCTLAudioPacketsReceived)
-        let totalReceivedKBytes = UInt16(
-            truncatingIfNeeded: appleRCTLTotalBytesReceived / 1_024)
+            truncatingIfNeeded: appleRCTLEchoPacketCount)
         let owrdSeconds = appleMediaRateController?.owrdSeconds ?? 0
         let owrd = UInt16(min(65535, (owrdSeconds * 8192).rounded()))
         let ts = UInt16(truncatingIfNeeded: Int(nowSeconds * 1024))          // Q10 s
         let echo = appleMediaLastRTPEchoTimestampQ10
+        // Hold time since the echoed packet arrived; the peer subtracts it
+        // when deriving RTT from the echo.
+        let holdNanos = appleRCTLEchoArrivalNanos != 0 && now > appleRCTLEchoArrivalNanos
+            ? now - appleRCTLEchoArrivalNanos
+            : 0
         let queuingDelayMilliseconds = UInt16(min(
             UInt64(UInt16.max),
-            appleRCTLMaximumQueueDelayNanos / 1_000_000))
-        appleRCTLMaximumQueueDelayNanos = 0
+            holdNanos / 1_000_000))
+        // Native's feedback-only collector leaves the queue target, byte
+        // count, and audio statistics zero.
         let feedback = AppleMediaRCTLFeedback(
-            receiveQueueTargetMilliseconds: 100,
+            receiveQueueTargetMilliseconds: 0,
             echoTimestamp: echo,
-            totalReceivedKBytes: totalReceivedKBytes,
+            totalReceivedKBytes: 0,
             audioBurstyLoss: 0,
-            cumulativeAudioReceivedPacketCount: cumulativeAudioReceivedPacketCount,
+            cumulativeAudioReceivedPacketCount: 0,
             queuingDelayMilliseconds: queuingDelayMilliseconds,
             sendTimestampQ10: ts,
             owrdQ13: owrd,

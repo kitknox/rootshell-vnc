@@ -266,6 +266,10 @@ public struct VNCConfiguration: Sendable {
     /// instead of creating an audio player.
     public var enableRemoteAudio: Bool
 
+    /// Hold video back to stay in sync with remote audio, for watching video.
+    /// Off, video shows as soon as it decodes and audio trails slightly.
+    public var syncVideoToRemoteAudio: Bool
+
     /// Whether an Apple Login Window or visually detected lock screen should
     /// offer to type the saved connection password. The user must still
     /// confirm the existing password-send dialog before any input is sent.
@@ -317,6 +321,11 @@ public struct VNCConfiguration: Sendable {
     /// Whether this session should create a remote-audio playback sink.
     var effectiveRemoteAudioPlaybackEnabled: Bool {
         supportsRemoteAudio && enableRemoteAudio
+    }
+
+    /// Whether video presentation waits for the matching remote audio.
+    var synchronizesVideoToRemoteAudio: Bool {
+        effectiveRemoteAudioPlaybackEnabled && syncVideoToRemoteAudio
     }
 
     /// Preferred pixel format to request from the server.
@@ -374,6 +383,7 @@ public struct VNCConfiguration: Sendable {
         displayCount: Int = 1,
         displayMode: DisplayMode? = nil,
         enableRemoteAudio: Bool = true,
+        syncVideoToRemoteAudio: Bool = false,
         promptForLoginPasswordAtLoginWindow: Bool = false,
         cursorRendering: VNCCursorRendering = .client,
         remoteSystem: RemoteSystem = .automatic,
@@ -416,6 +426,7 @@ public struct VNCConfiguration: Sendable {
         }
         self.displayMode = resolvedDisplayMode
         self.enableRemoteAudio = enableRemoteAudio
+        self.syncVideoToRemoteAudio = syncVideoToRemoteAudio
         self.promptForLoginPasswordAtLoginWindow =
             promptForLoginPasswordAtLoginWindow
         self.cursorRendering = cursorRendering
