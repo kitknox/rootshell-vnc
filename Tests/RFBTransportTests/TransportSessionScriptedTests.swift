@@ -152,12 +152,16 @@ final class TransportSessionScriptedTests: XCTestCase {
         try fixture.sendServerBytes(reply)
         try await connectTask.value
 
-        let mediaRequest = ClientMessage.appleMediaStreamRequest.serialize()
+        // The initial update request is a separate write after the media
+        // request; snapshotting before it lands misreads it as message 28.
+        let burstTail = ClientMessage.appleMediaStreamRequest.serialize()
+            + ClientMessage.framebufferUpdateRequest(
+                incremental: false, x: 0, y: 0, width: 1280, height: 800).serialize()
         let sentRequest = await Self.waitUntil {
             guard let sent = await fixture.waitForClientBytes(atLeast: afterStepThree) else {
                 return false
             }
-            return sent.range(of: mediaRequest) != nil
+            return sent.range(of: burstTail) != nil
         }
         XCTAssertTrue(sentRequest)
         let beforeMessageOneBytes = await fixture.waitForClientBytes(atLeast: afterStepThree)
