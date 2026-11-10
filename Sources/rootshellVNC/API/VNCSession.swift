@@ -785,9 +785,12 @@ public final class VNCSession {
     /// saved connection keeps High Performance; the next connect tries it again.
     public private(set) var highPerformanceFallbackReason: String?
 
-    /// Native Apple clipboard controls negotiated for this connection.
+    /// Clipboard controls negotiated for this connection: Apple's native
+    /// pasteboard commands, or ExtendedClipboard request and notify.
     public private(set) var supportsRemoteClipboardRequest = false
     public private(set) var supportsRemoteSharedClipboardControl = false
+    /// The clipboard representations the server can receive.
+    public private(set) var clipboardContentSupport: VNCClipboardContentSupport = .plainText
 
     /// Whether the server offers curtain mode, in which the remote Mac's own
     /// display shows a lock screen while this viewer keeps control. Apple
@@ -894,13 +897,20 @@ public final class VNCSession {
     @ObservationIgnored
     public var onServerClipboardText: ((String) -> Void)?
 
-    /// Internal multicast used by package features such as shared clipboard.
-    /// The public single callback above remains source-compatible for hosts
-    /// that already consume raw ServerCutText events themselves.
+    /// Invoked on the main actor with every representation of each remote
+    /// clipboard change, including images and rich text.
     @ObservationIgnored
-    private var serverClipboardObservers: [UUID: (String) -> Void] = [:]
+    public var onServerClipboardContent: ((VNCClipboardContent) -> Void)?
+
+    /// Internal multicast used by package features such as shared clipboard.
+    /// The public single callbacks above remain for hosts that consume raw
+    /// clipboard events themselves.
+    @ObservationIgnored
+    private var serverClipboardObservers: [UUID: (VNCClipboardContent) -> Void] = [:]
     @ObservationIgnored
     private var connectionStateObservers: [UUID: (VNCConnectionState) -> Void] = [:]
+    @ObservationIgnored
+    private var clipboardCapabilityObservers: [UUID: () -> Void] = [:]
 
     /// While `true`, Match Client display-size requests are deferred instead
     /// of sent. Container apps set this when the hosting view is occluded
@@ -1309,6 +1319,7 @@ public final class VNCSession {
         isHighPerformanceMode = false
         supportsRemoteClipboardRequest = false
         supportsRemoteSharedClipboardControl = false
+        clipboardContentSupport = .plainText
         resetCurtainState()
         negotiatedContentEncryption = nil
         serverCapabilities = nil
@@ -1401,6 +1412,7 @@ public final class VNCSession {
         isHighPerformanceMode = false
         supportsRemoteClipboardRequest = false
         supportsRemoteSharedClipboardControl = false
+        clipboardContentSupport = .plainText
         resetCurtainState()
         negotiatedContentEncryption = nil
         serverCapabilities = nil
@@ -1700,20 +1712,26 @@ public final class VNCSession {
     ///
     /// - Parameter text: The text to place on the server's clipboard.
     public func sendClipboardText(_ text: String) {
+        sendClipboard(.text(text))
+    }
+
+    /// Send clipboard content to the VNC server. Representations the server
+    /// cannot receive are dropped; see ``clipboardContentSupport``.
+    public func sendClipboard(_ content: VNCClipboardContent) {
         guard connectionState.isConnected, transportSession != nil else { return }
 
         if isTraceEnabled {
             diagnostics.protocolTrace.recordSent(
-                type: "ClientCutText",
-                data: ClientMessage.clientCutText(text).serialize(),
-                details: "length=\(text.utf8.count)"
+                type: "Clipboard",
+                data: Data((content.plainText ?? "").utf8),
+                details: content.summary
             )
         }
 
-        enqueueInput(.clipboard(text))
+        enqueueInput(.clipboard(content))
     }
 
-    /// Request the current remote clipboard from a capable Apple server.
+    /// Request the current remote clipboard from a capable server.
     public func requestRemoteClipboard() {
         guard connectionState.isConnected,
               transportSession != nil,
@@ -1784,7 +1802,7 @@ public final class VNCSession {
     }
 
     func addServerClipboardObserver(
-        _ observer: @escaping (String) -> Void
+        _ observer: @escaping (VNCClipboardContent) -> Void
     ) -> UUID {
         let id = UUID()
         serverClipboardObservers[id] = observer
@@ -1793,6 +1811,16 @@ public final class VNCSession {
 
     func removeServerClipboardObserver(_ id: UUID) {
         serverClipboardObservers.removeValue(forKey: id)
+    }
+
+    func addClipboardCapabilityObserver(_ observer: @escaping () -> Void) -> UUID {
+        let id = UUID()
+        clipboardCapabilityObservers[id] = observer
+        return id
+    }
+
+    func removeClipboardCapabilityObserver(_ id: UUID) {
+        clipboardCapabilityObservers.removeValue(forKey: id)
     }
 
     func addConnectionStateObserver(
@@ -1932,6 +1960,19 @@ public final class VNCSession {
             capturedAt: Date())
     }
 
+    /// ExtendedClipboard caps arrive after ServerInit, so this runs again
+    /// when the transport reports them.
+    private func refreshClipboardCapabilities(from transport: TransportSession) async {
+        supportsRemoteClipboardRequest =
+            await transport.supportsRemoteClipboardRequest
+        supportsRemoteSharedClipboardControl =
+            await transport.supportsRemoteSharedClipboardControl
+        clipboardContentSupport = await transport.clipboardContentSupport
+        for observer in Array(clipboardCapabilityObservers.values) {
+            observer()
+        }
+    }
+
     /// Populate handshake-derived diagnostics from the transport. Called on
     /// ServerInit and again when encryption facts upgrade (EncryptionInfo,
     /// media-stream start).
@@ -1983,10 +2024,7 @@ public final class VNCSession {
             handleStateChanged(protocolState)
 
         case .serverInit(let serverInit):
-            supportsRemoteClipboardRequest =
-                await transport.supportsRemoteClipboardRequest
-            supportsRemoteSharedClipboardControl =
-                await transport.supportsRemoteSharedClipboardControl
+            await refreshClipboardCapabilities(from: transport)
             await refreshHandshakeDiagnostics(from: transport)
             await handleServerInit(serverInit)
 
@@ -2013,20 +2051,26 @@ public final class VNCSession {
                         + error.localizedDescription)
             }
 
-        case .clipboardText(let text):
+        case .clipboardContent(let content):
             if isTraceEnabled {
                 diagnostics.protocolTrace.recordReceived(
-                    type: "ServerCutText",
-                    data: Data(text.utf8),
-                    details: "length=\(text.utf8.count)"
+                    type: "ServerClipboard",
+                    data: Data((content.plainText ?? "").utf8),
+                    details: content.summary
                 )
             }
-            onServerClipboardText?(text)
+            if let text = content.plainText {
+                onServerClipboardText?(text)
+            }
+            onServerClipboardContent?(content)
             // Snapshot the callbacks so observers may invalidate themselves
             // safely while handling an event.
             for observer in Array(serverClipboardObservers.values) {
-                observer(text)
+                observer(content)
             }
+
+        case .clipboardCapabilitiesChanged:
+            await refreshClipboardCapabilities(from: transport)
 
         case .bell:
             logger.debug("Server bell")
@@ -2802,6 +2846,7 @@ public final class VNCSession {
         isHighPerformanceMode = false
         supportsRemoteClipboardRequest = false
         supportsRemoteSharedClipboardControl = false
+        clipboardContentSupport = .plainText
         resetCurtainState()
         negotiatedContentEncryption = nil
         serverCapabilities = nil
@@ -3917,9 +3962,9 @@ public final class VNCSession {
                     try? await transport.sendScrollEvent(event)
                 case .gesture(let event):
                     try? await transport.sendGestureEvent(event)
-                case .clipboard(let text):
+                case .clipboard(let content):
                     do {
-                        try await transport.sendClipboardText(text)
+                        try await transport.sendClipboard(content)
                     } catch {
                         self.logger.warning(
                             "Failed to send clipboard: "

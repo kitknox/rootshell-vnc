@@ -19,6 +19,8 @@ small standalone viewer used to develop it.
 - Raw, CopyRect, Zlib, ZRLE, Tight, Apple Adaptive DCT, and Apple HEVC display
   paths, selected according to the configured quality mode and server support
 - Standard cursor, desktop-size, and extended-desktop-size extensions
+- Extended clipboard with UTF-8 text, RTF, HTML, and images, falling back to
+  plain text on servers without it
 - Configurable pixel format, encoding preference, and frame-request rate
 - One display, combined physical displays, or two client-sized virtual displays
   on capable Apple servers
@@ -30,8 +32,9 @@ small standalone viewer used to develop it.
 - Remote system audio with synchronized audio/video playback
 - Match Client sizing and live display reconfiguration
 - Apple precise scrolling and native gesture events, with portable RFB fallbacks
-- Remote curtain control, shared clipboard integration, and Apple login-window
-  detection with an explicit user-confirmed password-send flow
+- Shared and manual clipboard transfers that keep images and rich text
+- Remote curtain control and Apple login-window detection with an explicit
+  user-confirmed password-send flow
 
 ### Security and transport
 

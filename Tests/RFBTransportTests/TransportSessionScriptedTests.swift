@@ -348,7 +348,7 @@ final class TransportSessionScriptedTests: XCTestCase {
         expected.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
         expected.append(ClientMessage.setEncodings([
             .copyRect, .raw, .zrle, .zlib,
-            .desktopSize, .extendedDesktopSize,
+            .desktopSize, .extendedDesktopSize, .extendedClipboard,
         ]).serialize())
         expected.append(ClientMessage.framebufferUpdateRequest(
             incremental: false,
@@ -417,7 +417,7 @@ final class TransportSessionScriptedTests: XCTestCase {
         expected.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
         expected.append(ClientMessage.setEncodings([
             .copyRect, .raw, .zrle, .zlib, .cursor, .xCursor,
-            .desktopSize, .extendedDesktopSize,
+            .desktopSize, .extendedDesktopSize, .extendedClipboard,
         ]).serialize())
         expected.append(ClientMessage.framebufferUpdateRequest(
             incremental: false,
@@ -497,7 +497,7 @@ final class TransportSessionScriptedTests: XCTestCase {
         expected.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
         expected.append(ClientMessage.setEncodings([
             .copyRect, .raw, .zrle, .zlib, .cursor, .xCursor,
-            .desktopSize, .extendedDesktopSize,
+            .desktopSize, .extendedDesktopSize, .extendedClipboard,
         ]).serialize())
         expected.append(ClientMessage.framebufferUpdateRequest(
             incremental: false,
@@ -543,7 +543,7 @@ final class TransportSessionScriptedTests: XCTestCase {
         expected.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
         expected.append(ClientMessage.setEncodings([
             .copyRect, .raw, .zrle, .zlib, .cursor, .xCursor,
-            .desktopSize, .extendedDesktopSize,
+            .desktopSize, .extendedDesktopSize, .extendedClipboard,
         ]).serialize())
         expected.append(ClientMessage.framebufferUpdateRequest(
             incremental: false,
@@ -582,7 +582,7 @@ final class TransportSessionScriptedTests: XCTestCase {
             ClientMessage.setPixelFormat(.bgra8888).serialize())
         expectedClientBytes.append(ClientMessage.setEncodings([
             .copyRect, .raw, .zrle, .zlib, .cursor, .xCursor,
-            .desktopSize, .extendedDesktopSize,
+            .desktopSize, .extendedDesktopSize, .extendedClipboard,
         ]).serialize())
         expectedClientBytes.append(ClientMessage.framebufferUpdateRequest(
             incremental: false, x: 0, y: 0, width: 1024, height: 768
@@ -1093,9 +1093,10 @@ final class TransportSessionScriptedTests: XCTestCase {
             connection: connection)
         try await session.connect()
 
-        // ServerCutText declaring a ~4 GB clipboard payload.
+        // ServerCutText declaring a ~2 GB clipboard payload. Negative S32
+        // lengths are ExtendedClipboard messages.
         var cutText = Data([3, 0, 0, 0]) // type + padding(3)
-        cutText.append(contentsOf: [0xff, 0xff, 0xff, 0xfe])
+        cutText.append(contentsOf: [0x7f, 0xff, 0xff, 0xfe])
         await connection.enqueueServerBytes(cutText)
 
         let observedError = await Self.withTimeout(seconds: 2) {

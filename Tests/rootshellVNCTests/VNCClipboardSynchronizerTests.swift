@@ -1,3 +1,5 @@
+import ImageIO
+import RFBProtocol
 import XCTest
 @testable import rootshellVNC
 
@@ -5,19 +7,31 @@ import XCTest
 final class VNCClipboardSynchronizerTests: XCTestCase {
     private final class FakeClipboard: VNCClipboardProviding {
         var changeCount = 0
-        var text: String?
+        var content: VNCClipboardContent?
 
-        var hasTransferableContent: Bool { text != nil }
+        var text: String? { content?.plainText }
 
-        func readTransferableText() -> String? { text }
+        func hasTransferableContent(for support: VNCClipboardContentSupport) -> Bool {
+            readContent(for: support) != nil
+        }
 
-        func writeText(_ text: String) {
-            self.text = text
+        func readContent(for support: VNCClipboardContentSupport) -> VNCClipboardContent? {
+            guard let content else { return nil }
+            let accepted = content.filtered { support.accepts($0.type) }
+            return accepted.isEmpty ? nil : accepted
+        }
+
+        func write(_ content: VNCClipboardContent) {
+            self.content = content
             changeCount += 1
         }
 
         func copyOnDevice(_ text: String?) {
-            self.text = text
+            copyOnDevice(text.map(VNCClipboardContent.text))
+        }
+
+        func copyOnDevice(_ content: VNCClipboardContent?) {
+            self.content = content
             changeCount += 1
         }
     }
@@ -25,6 +39,7 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
     private func makeSynchronizer(
         clipboard: FakeClipboard,
         connected: @escaping () -> Bool = { true },
+        contentSupport: @escaping () -> VNCClipboardContentSupport = { .all },
         automaticallyMonitors: Bool = false,
         canRequestRemoteClipboard: @escaping () -> Bool = { false },
         requestRemoteClipboard: @escaping () -> Void = {},
@@ -32,12 +47,17 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         setRemoteSharedClipboard: @escaping (Bool) -> Void = { _ in },
         notificationCenter: NotificationCenter = NotificationCenter(),
         clipboardChangeNotification: Notification.Name? = nil,
+        sendContent: ((VNCClipboardContent) -> Void)? = nil,
         send: @escaping (String) -> Void
     ) -> VNCClipboardSynchronizer {
         VNCClipboardSynchronizer(
             clipboard: clipboard,
             canSend: connected,
-            send: send,
+            send: { content in
+                sendContent?(content)
+                if let text = content.plainText { send(text) }
+            },
+            contentSupport: contentSupport,
             canRequestRemoteClipboard: canRequestRemoteClipboard,
             requestRemoteClipboard: requestRemoteClipboard,
             canControlRemoteSharedClipboard: canControlRemoteSharedClipboard,
@@ -396,5 +416,351 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         XCTAssertEqual(transfers.count, 2)
         XCTAssertEqual(transfers[0].1, "cached")
         XCTAssertEqual(transfers[1].1, "sent")
+    }
+
+    // MARK: - Rich content
+
+    private static let png = VNCClipboardContent.Representation(
+        type: ClipboardType.png, data: Data([0x89, 0x50, 0x4E, 0x47]))
+    private static let rtf = VNCClipboardContent.Representation(
+        type: ClipboardType.rtf, data: Data("{\\rtf1 hi}".utf8))
+    private static let text = VNCClipboardContent.Representation(
+        type: ClipboardType.utf8PlainText, data: Data("hi".utf8))
+
+    func testImageOnlyClipboardCannotBeSentToPlainTextServer() {
+        let clipboard = FakeClipboard()
+        clipboard.copyOnDevice(VNCClipboardContent(items: [[Self.png]]))
+        var sent: [VNCClipboardContent] = []
+        let synchronizer = makeSynchronizer(
+            clipboard: clipboard,
+            contentSupport: { .plainText },
+            sendContent: { sent.append($0) }
+        ) { _ in }
+
+        XCTAssertFalse(synchronizer.canSendClipboard)
+        synchronizer.sendClipboard()
+        XCTAssertTrue(sent.isEmpty)
+    }
+
+    func testManualSendKeepsRepresentationsTheServerAccepts() {
+        let clipboard = FakeClipboard()
+        clipboard.copyOnDevice(VNCClipboardContent(items: [[Self.rtf, Self.png, Self.text]]))
+        var support: VNCClipboardContentSupport = .all
+        var sent: [VNCClipboardContent] = []
+        let synchronizer = makeSynchronizer(
+            clipboard: clipboard,
+            contentSupport: { support },
+            sendContent: { sent.append($0) }
+        ) { _ in }
+        var transfers: [String] = []
+        synchronizer.onTransfer = { transfers.append($1) }
+
+        synchronizer.sendClipboard()
+        support = .formats([ClipboardType.rtf])
+        synchronizer.sendClipboard()
+
+        XCTAssertEqual(sent, [
+            VNCClipboardContent(items: [[Self.rtf, Self.png, Self.text]]),
+            VNCClipboardContent(items: [[Self.rtf, Self.text]]),
+        ])
+        XCTAssertEqual(transfers, ["hi", "hi"])
+    }
+
+    func testImageOnlyTransfersAreAppliedWithoutTransferCallback() {
+        let clipboard = FakeClipboard()
+        let synchronizer = makeSynchronizer(clipboard: clipboard) { _ in }
+        var transfers: [String] = []
+        synchronizer.onTransfer = { transfers.append($1) }
+
+        synchronizer.receiveRemoteClipboardContent(VNCClipboardContent(items: [[Self.png]]))
+        synchronizer.getClipboard()
+
+        XCTAssertEqual(clipboard.content, VNCClipboardContent(items: [[Self.png]]))
+        XCTAssertTrue(transfers.isEmpty)
+    }
+
+    func testRemoteFormattingOfTextWeSentIsApplied() {
+        let clipboard = FakeClipboard()
+        var sent: [String] = []
+        let synchronizer = makeSynchronizer(clipboard: clipboard) { sent.append($0) }
+        synchronizer.sharedClipboardEnabled = true
+
+        clipboard.copyOnDevice("hi")
+        synchronizer.localClipboardDidChange()
+        XCTAssertEqual(sent, ["hi"])
+
+        let formatted = VNCClipboardContent(items: [[Self.rtf, Self.text]])
+        synchronizer.receiveRemoteClipboardContent(formatted)
+        XCTAssertEqual(clipboard.content, formatted)
+        synchronizer.localClipboardDidChange()
+        XCTAssertEqual(sent, ["hi"], "Applying remote content must not send it back")
+    }
+
+    func testPendingSharedImageApplyIsDroppedWhenThePaneStopsSharing() async throws {
+        let tiff = VNCClipboardContent.Representation(
+            type: ClipboardType.tiff, data: try Self.imageData(type: "public.tiff"))
+        let interruptions: [(String, (VNCClipboardSynchronizer) -> Void)] = [
+            ("focus", { $0.setHostFocused(false) }),
+            ("window", { $0.setHostWindowActive(false) }),
+            ("background", { $0.applicationWillResignActive() }),
+            ("sharing", { $0.sharedClipboardEnabled = false }),
+        ]
+        for (name, interrupt) in interruptions {
+            let clipboard = FakeClipboard()
+            let synchronizer = makeSynchronizer(clipboard: clipboard) { _ in }
+            synchronizer.sharedClipboardEnabled = true
+
+            synchronizer.receiveRemoteClipboardContent(VNCClipboardContent(items: [[tiff]]))
+            interrupt(synchronizer)
+
+            try await Task.sleep(for: .milliseconds(300))
+            XCTAssertNil(clipboard.content, "\(name) must cancel the pending write")
+        }
+    }
+
+    func testManualImageGetCompletesAfterThePaneLosesFocus() async throws {
+        let clipboard = FakeClipboard()
+        let synchronizer = makeSynchronizer(clipboard: clipboard) { _ in }
+        let tiff = VNCClipboardContent.Representation(
+            type: ClipboardType.tiff, data: try Self.imageData(type: "public.tiff"))
+
+        synchronizer.receiveRemoteClipboardContent(VNCClipboardContent(items: [[tiff]]))
+        synchronizer.getClipboard()
+        synchronizer.setHostFocused(false)
+
+        let applied = await Self.waitUntil { clipboard.content != nil }
+        XCTAssertTrue(applied)
+    }
+
+    func testLocalImageCopiedDuringReconnectIsSentOnceCapsArrive() {
+        let clipboard = FakeClipboard()
+        var connected = true
+        var support: VNCClipboardContentSupport = .plainText
+        var sent: [VNCClipboardContent] = []
+        let synchronizer = makeSynchronizer(
+            clipboard: clipboard,
+            connected: { connected },
+            contentSupport: { support },
+            sendContent: { sent.append($0) }
+        ) { _ in }
+        synchronizer.sharedClipboardEnabled = true
+
+        connected = false
+        synchronizer.connectionStateDidChange(.reconnecting(attempt: 1, delay: 0))
+        let image = VNCClipboardContent(items: [[Self.png]])
+        clipboard.copyOnDevice(image)
+        synchronizer.localClipboardDidChange()
+
+        // Connected before ExtendedClipboard caps: nothing is sendable yet.
+        connected = true
+        synchronizer.connectionStateDidChange(.connected)
+        XCTAssertTrue(sent.isEmpty)
+
+        support = .formats([ClipboardType.png])
+        synchronizer.clipboardCapabilitiesDidChange()
+        XCTAssertEqual(sent, [image])
+
+        // The same support again, or a later local copy, is not a retry.
+        synchronizer.clipboardCapabilitiesDidChange()
+        XCTAssertEqual(sent, [image])
+    }
+
+    func testRichPartOfAChangeFlushedAsTextFollowsOnceCapsArrive() {
+        let clipboard = FakeClipboard()
+        var support: VNCClipboardContentSupport = .plainText
+        var sent: [VNCClipboardContent] = []
+        let synchronizer = makeSynchronizer(
+            clipboard: clipboard,
+            contentSupport: { support },
+            sendContent: { sent.append($0) }
+        ) { _ in }
+        synchronizer.sharedClipboardEnabled = true
+
+        let rich = VNCClipboardContent(items: [[Self.rtf, Self.text]])
+        clipboard.copyOnDevice(rich)
+        synchronizer.localClipboardDidChange()
+        XCTAssertEqual(sent, [.text("hi")])
+
+        support = .all
+        synchronizer.clipboardCapabilitiesDidChange()
+        XCTAssertEqual(sent, [.text("hi"), rich])
+    }
+
+    func testRichCopyReconciledOnForegroundFollowsOnceCapsArrive() {
+        let clipboard = FakeClipboard()
+        var support: VNCClipboardContentSupport = .plainText
+        var sent: [VNCClipboardContent] = []
+        let synchronizer = makeSynchronizer(
+            clipboard: clipboard,
+            contentSupport: { support },
+            sendContent: { sent.append($0) }
+        ) { _ in }
+        synchronizer.sharedClipboardEnabled = true
+
+        synchronizer.applicationWillResignActive()
+        let rich = VNCClipboardContent(items: [[Self.rtf, Self.text]])
+        clipboard.copyOnDevice(rich)
+        synchronizer.applicationDidBecomeActive()
+        XCTAssertEqual(sent, [.text("hi")])
+
+        support = .all
+        synchronizer.clipboardCapabilitiesDidChange()
+        XCTAssertEqual(sent, [.text("hi"), rich])
+    }
+
+    func testCapsArrivingWhileBackgroundedAreRetriedOnForeground() {
+        let clipboard = FakeClipboard()
+        var support: VNCClipboardContentSupport = .plainText
+        var sent: [VNCClipboardContent] = []
+        let synchronizer = makeSynchronizer(
+            clipboard: clipboard,
+            contentSupport: { support },
+            sendContent: { sent.append($0) }
+        ) { _ in }
+        synchronizer.sharedClipboardEnabled = true
+
+        let image = VNCClipboardContent(items: [[Self.png]])
+        clipboard.copyOnDevice(image)
+        synchronizer.localClipboardDidChange()
+        synchronizer.applicationWillResignActive()
+        support = .all
+        synchronizer.clipboardCapabilitiesDidChange()
+        XCTAssertTrue(sent.isEmpty)
+
+        synchronizer.applicationDidBecomeActive()
+        XCTAssertEqual(sent, [image])
+    }
+
+    func testDeferredFlushSurvivesAForegroundBeforeCapsArrive() {
+        let clipboard = FakeClipboard()
+        var support: VNCClipboardContentSupport = .plainText
+        var sent: [VNCClipboardContent] = []
+        let synchronizer = makeSynchronizer(
+            clipboard: clipboard,
+            contentSupport: { support },
+            sendContent: { sent.append($0) }
+        ) { _ in }
+        synchronizer.sharedClipboardEnabled = true
+
+        let image = VNCClipboardContent(items: [[Self.png]])
+        clipboard.copyOnDevice(image)
+        synchronizer.localClipboardDidChange()
+        synchronizer.applicationWillResignActive()
+        synchronizer.applicationDidBecomeActive()
+        XCTAssertTrue(sent.isEmpty)
+
+        support = .all
+        synchronizer.clipboardCapabilitiesDidChange()
+        XCTAssertEqual(sent, [image])
+    }
+
+    func testCapsRetryNeverResendsAStaleOrPlainChange() {
+        let clipboard = FakeClipboard()
+        var support: VNCClipboardContentSupport = .plainText
+        var sent: [VNCClipboardContent] = []
+        let synchronizer = makeSynchronizer(
+            clipboard: clipboard,
+            contentSupport: { support },
+            sendContent: { sent.append($0) }
+        ) { _ in }
+        synchronizer.sharedClipboardEnabled = true
+
+        clipboard.copyOnDevice(VNCClipboardContent(items: [[Self.rtf, Self.text]]))
+        synchronizer.localClipboardDidChange()
+        clipboard.copyOnDevice("newer") // not flushed yet
+        support = .all
+        synchronizer.clipboardCapabilitiesDidChange()
+        XCTAssertEqual(sent, [.text("hi")])
+
+        support = .plainText
+        synchronizer.localClipboardDidChange()
+        support = .all
+        synchronizer.clipboardCapabilitiesDidChange()
+        XCTAssertEqual(sent, [.text("hi"), .text("newer")])
+    }
+
+    func testImageNormalizationRefusesImagesOverTheDecodeBudget() throws {
+        let tiff = try Self.imageData(type: "public.tiff")
+        XCTAssertNotNil(VNCClipboardImageNormalizer.pngData(from: tiff))
+        // A 1x1 image decodes to 4 bytes; the header alone must reject it.
+        XCTAssertNil(VNCClipboardImageNormalizer.pngData(from: tiff, maximumDecodedBytes: 3))
+    }
+
+    func testTIFFOnlyRemoteImageGainsPNGBeforeItIsApplied() async throws {
+        let clipboard = FakeClipboard()
+        let synchronizer = makeSynchronizer(clipboard: clipboard) { _ in }
+        let tiff = VNCClipboardContent.Representation(
+            type: ClipboardType.tiff, data: try Self.imageData(type: "public.tiff"))
+
+        synchronizer.receiveRemoteClipboardContent(VNCClipboardContent(items: [[tiff, Self.text]]))
+        synchronizer.getClipboard()
+
+        let applied = await Self.waitUntil { clipboard.content != nil }
+        XCTAssertTrue(applied)
+        let types = clipboard.content?.items.flatMap { $0.map(\.type) }
+        XCTAssertEqual(types, [ClipboardType.png, ClipboardType.tiff, ClipboardType.utf8PlainText])
+    }
+
+    func testNewerApplyWinsOverPendingImageConversion() async throws {
+        let clipboard = FakeClipboard()
+        let synchronizer = makeSynchronizer(clipboard: clipboard) { _ in }
+        let tiff = VNCClipboardContent.Representation(
+            type: ClipboardType.tiff, data: try Self.imageData(type: "public.tiff"))
+
+        synchronizer.receiveRemoteClipboardContent(VNCClipboardContent(items: [[tiff]]))
+        synchronizer.getClipboard()
+        synchronizer.receiveRemoteClipboardText("newer")
+        synchronizer.getClipboard()
+
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(clipboard.content, .text("newer"))
+    }
+
+    func testCapabilityChangeTurnsOnRemoteSharedClipboard() {
+        let clipboard = FakeClipboard()
+        var controllable = false
+        var remoteStates: [Bool] = []
+        let synchronizer = makeSynchronizer(
+            clipboard: clipboard,
+            canControlRemoteSharedClipboard: { controllable },
+            setRemoteSharedClipboard: { remoteStates.append($0) }
+        ) { _ in }
+
+        synchronizer.sharedClipboardEnabled = true
+        XCTAssertTrue(remoteStates.isEmpty)
+
+        controllable = true
+        synchronizer.clipboardCapabilitiesDidChange()
+        XCTAssertEqual(remoteStates, [true])
+    }
+
+    private static func imageData(type: String) throws -> Data {
+        var pixels: [UInt8] = [0xFF, 0x00, 0x00, 0xFF]
+        let image = try XCTUnwrap(pixels.withUnsafeMutableBytes { buffer in
+            CGContext(
+                data: buffer.baseAddress, width: 1, height: 1,
+                bitsPerComponent: 8, bytesPerRow: 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)?.makeImage()
+        })
+        let output = NSMutableData()
+        let destination = try XCTUnwrap(
+            CGImageDestinationCreateWithData(output, type as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, image, nil)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        return output as Data
+    }
+
+    private static func waitUntil(
+        timeout: Duration = .seconds(2),
+        condition: () -> Bool
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if condition() { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return condition()
     }
 }

@@ -201,8 +201,12 @@ public enum SessionEvent: Sendable {
     /// The server rang the bell.
     case bell
 
-    /// The server's clipboard text changed.
-    case clipboardText(String)
+    /// The server's clipboard changed.
+    case clipboardContent(ClipboardContent)
+
+    /// ExtendedClipboard caps arrived, changing ``TransportSession/clipboardContentSupport``
+    /// and the remote-clipboard request flags.
+    case clipboardCapabilitiesChanged
 
     /// The handshake completed and the server sent its init message.
     case serverInit(ServerInit)
@@ -752,7 +756,25 @@ public actor TransportSession {
     /// wheel-button input.
     private var appleServerCapabilities: AppleServerCapabilities?
     private var appleClipboardRequestID: UInt32 = 0
-    private var appleSharedClipboardEnabled = false
+    private var sharedClipboardEnabled = false
+    /// A negative cut-text length means ExtendedClipboard only after a
+    /// SetEncodings carrying the pseudo-encoding.
+    private var advertisedExtendedClipboard = false
+    /// Set once the server's ExtendedClipboard caps arrive.
+    private var extendedClipboard: ExtendedClipboardState?
+
+    private struct ExtendedClipboardState {
+        var serverFormats: ExtendedClipboardProtocol.Formats
+        var serverActions: ExtendedClipboardProtocol.Actions
+        var serverMaximumSizes: [UInt32: UInt32]
+        var announcedFormats: ExtendedClipboardProtocol.Formats?
+        /// Our latest clipboard, kept to answer the server's request or peek.
+        var outgoing: [UInt32: Data] = [:]
+
+        var acceptedFormats: ExtendedClipboardProtocol.Formats {
+            serverFormats.intersection(ExtendedClipboardProtocol.clientFormats)
+        }
+    }
     /// A regular RFB server may receive SetDesktopSize only after it sends an
     /// ExtendedDesktopSize rectangle. Retain that screen identity and any
     /// early client-size request until the announcement arrives.
@@ -1137,16 +1159,38 @@ public actor TransportSession {
             AppleClipboardProtocol.packedScrapMessageType) == true
     }
 
-    /// Send clipboard text to the server.
-    public func sendClipboardText(_ text: String) async throws {
-        let payload: Data
+    /// Send clipboard content as richly as the server's clipboard protocol
+    /// allows; legacy servers get the plain text, or nothing for images.
+    public func sendClipboard(_ content: ClipboardContent) async throws {
         if Self.shouldUseApplePackedClipboard(
             capabilities: appleServerCapabilities) {
-            payload = try AppleClipboardProtocol.packedTextMessage(text)
-        } else {
-            payload = ClientMessage.clientCutText(text).serialize()
+            // Compressing a large image must not hold the actor's read loop.
+            let payload = try await Task.detached(priority: .userInitiated) {
+                try AppleClipboardProtocol.packedMessage(content)
+            }.value
+            try await sendClientPayload(payload)
+        } else if extendedClipboard != nil {
+            try await sendExtendedClipboard(content)
+        } else if let text = content.plainText {
+            try await sendClientPayload(ClientMessage.clientCutText(text).serialize())
         }
-        try await sendClientPayload(payload)
+    }
+
+    public func sendClipboardText(_ text: String) async throws {
+        try await sendClipboard(.text(text))
+    }
+
+    /// The representations this server can receive.
+    public var clipboardContentSupport: ClipboardContentSupport {
+        if Self.shouldUseApplePackedClipboard(
+            capabilities: appleServerCapabilities) {
+            return .all
+        }
+        if let extendedClipboard {
+            return ExtendedClipboardProtocol.support(
+                for: extendedClipboard.acceptedFormats)
+        }
+        return .plainText
     }
 
     public var supportsRemoteClipboardRequest: Bool {
@@ -1154,30 +1198,47 @@ public actor TransportSession {
         // dialect in both Standard and High Performance sessions. The newer
         // command bitmap is not authoritative for them and may omit them.
         stateMachine.negotiatedVersion?.isApple == true
+            || extendedClipboard?.serverActions.contains(.request) == true
     }
 
     public var supportsRemoteSharedClipboardControl: Bool {
         stateMachine.negotiatedVersion?.isApple == true
+            || extendedClipboard != nil
     }
 
-    /// Ask a capable Apple Screen Sharing server for its current pasteboard.
+    /// Ask the server for its current clipboard.
     public func requestRemoteClipboard() async throws {
         guard supportsRemoteClipboardRequest else { return }
+        if let extendedClipboard {
+            let announced = extendedClipboard.announcedFormats ?? []
+            let wanted = announced.isEmpty
+                ? ExtendedClipboardProtocol.clientFormats
+                : announced.intersection(ExtendedClipboardProtocol.clientFormats)
+            guard !wanted.isEmpty else { return }
+            try await sendClientPayload(
+                ExtendedClipboardProtocol.clientMessage(.request(wanted)))
+            return
+        }
         appleClipboardRequestID &+= 1
         try await sendClientPayload(AppleClipboardProtocol.requestMessage(
             requestID: appleClipboardRequestID))
     }
 
-    /// Enable or disable Apple's automatic remote-pasteboard notifications.
+    /// Enable or disable automatic remote-clipboard updates: Apple's server
+    /// notices, or requesting each ExtendedClipboard notify.
     public func setSharedClipboardEnabled(_ enabled: Bool) async throws {
         guard supportsRemoteSharedClipboardControl else { return }
-        let previousValue = appleSharedClipboardEnabled
-        appleSharedClipboardEnabled = enabled
+        if extendedClipboard != nil {
+            sharedClipboardEnabled = enabled
+            return
+        }
+        let previousValue = sharedClipboardEnabled
+        sharedClipboardEnabled = enabled
         do {
             try await sendClientPayload(
                 AppleClipboardProtocol.autoPasteboardMessage(enabled: enabled))
         } catch {
-            appleSharedClipboardEnabled = previousValue
+            sharedClipboardEnabled = previousValue
             throw error
         }
     }
@@ -1752,6 +1813,7 @@ public actor TransportSession {
         append(.xCursor)
         append(.desktopSize)
         append(.extendedDesktopSize)
+        append(.extendedClipboard)
         // This list is a rewrite, not an addition, so the cursor fallbacks
         // have to be withheld here as well or a conventional server would
         // start sending shapes the configured list already declined.
@@ -2764,6 +2826,20 @@ public actor TransportSession {
                    | UInt32(headerData[headerData.startIndex + 5]) << 8
                    | UInt32(headerData[headerData.startIndex + 6])
 
+        let signedLength = Int32(bitPattern: length)
+        if signedLength < 0, advertisedExtendedClipboard {
+            let payloadLength = Int(signedLength.magnitude)
+            guard payloadLength <= ExtendedClipboardProtocol.maximumPayloadSize else {
+                throw oversizedPayloadError(
+                    payloadLength,
+                    limit: ExtendedClipboardProtocol.maximumPayloadSize,
+                    context: "Extended ServerCutText")
+            }
+            let payload = try await readControlChannel(exactly: payloadLength)
+            await handleExtendedClipboard(payload)
+            return
+        }
+
         guard Int(length) <= Self.maxAuxiliaryPayloadBytes else {
             throw oversizedPayloadError(
                 Int(length), limit: Self.maxAuxiliaryPayloadBytes,
@@ -2805,7 +2881,7 @@ public actor TransportSession {
         // enabled automatic pasteboard updates. It announces a change; the
         // viewer must still issue command 11 to fetch the packed scrap.
         _ = try await readControlChannel(exactly: 7)
-        guard appleSharedClipboardEnabled else { return }
+        guard sharedClipboardEnabled else { return }
         do {
             try await requestRemoteClipboard()
         } catch {
@@ -2825,18 +2901,105 @@ public actor TransportSession {
         uncompressedLength: Int
     ) {
         do {
-            if let text = try AppleClipboardProtocol.unpackText(
+            let content = try AppleClipboardProtocol.unpackContent(
                 compressed: compressed,
-                uncompressedSize: uncompressedLength) {
-                continuation?.yield(.clipboardText(text))
+                uncompressedSize: uncompressedLength)
+            if content.isEmpty {
+                log.debug("Apple clipboard contained no supported flavor")
             } else {
-                log.debug("Apple clipboard contained no supported text flavor")
+                continuation?.yield(.clipboardContent(content))
             }
         } catch {
             log.warning(
                 "Ignoring unsupported Apple clipboard payload: "
                     + error.localizedDescription)
         }
+    }
+
+    private func noteAdvertisedEncodings(_ encodings: [Encoding]) {
+        if encodings.contains(.extendedClipboard) {
+            advertisedExtendedClipboard = true
+        }
+    }
+
+    /// Once framed, a malformed or unsupported ExtendedClipboard message is
+    /// dropped rather than ending the session.
+    private func handleExtendedClipboard(_ payload: Data) async {
+        typealias Extended = ExtendedClipboardProtocol
+        do {
+            switch try Extended.parse(payload) {
+            case .caps(let formats, let actions, let sizes):
+                extendedClipboard = ExtendedClipboardState(
+                    serverFormats: formats,
+                    serverActions: actions,
+                    serverMaximumSizes: sizes,
+                    announcedFormats: extendedClipboard?.announcedFormats,
+                    outgoing: extendedClipboard?.outgoing ?? [:])
+                try await sendClientPayload(Extended.clientMessage(Extended.clientCaps))
+                continuation?.yield(.clipboardCapabilitiesChanged)
+
+            case .notify(let formats):
+                extendedClipboard?.announcedFormats = formats
+                let wanted = formats.intersection(Extended.clientFormats)
+                if sharedClipboardEnabled, !wanted.isEmpty,
+                   extendedClipboard?.serverActions.contains(.request) == true {
+                    try await sendClientPayload(Extended.clientMessage(.request(wanted)))
+                }
+
+            case .provide(let provided):
+                let content = Extended.decode(provided)
+                if !content.isEmpty {
+                    continuation?.yield(.clipboardContent(content))
+                }
+
+            case .request(let formats):
+                let reply = (extendedClipboard?.outgoing ?? [:])
+                    .filter { formats.rawValue & $0.key != 0 }
+                let message = try await Task.detached(priority: .userInitiated) {
+                    try Extended.clientMessage(.provide(reply))
+                }.value
+                try await sendClientPayload(message)
+
+            case .peek:
+                let formats = Extended.Formats(
+                    bits: (extendedClipboard?.outgoing ?? [:]).keys)
+                try await sendClientPayload(Extended.clientMessage(.notify(formats)))
+            }
+        } catch {
+            log.warning(
+                "Ignoring extended clipboard message: " + error.localizedDescription)
+        }
+    }
+
+    /// Provide small data directly when the server allows it; otherwise
+    /// announce the formats and answer the server's request later.
+    private func sendExtendedClipboard(_ content: ClipboardContent) async throws {
+        guard let accepted = extendedClipboard?.acceptedFormats else { return }
+        let outgoing = await Task.detached(priority: .userInitiated) {
+            ExtendedClipboardProtocol.encode(content, accepting: accepted)
+        }.value
+        guard let state = extendedClipboard else { return }
+        extendedClipboard?.outgoing = outgoing
+
+        let fitsUnsolicited = outgoing.allSatisfy {
+            $0.value.count <= Int(state.serverMaximumSizes[$0.key] ?? 0)
+        }
+        let message: ExtendedClipboardProtocol.Message
+        if !outgoing.isEmpty, state.serverActions.contains(.provide), fitsUnsolicited {
+            message = .provide(outgoing)
+        } else if !outgoing.isEmpty, state.serverActions.contains(.notify) {
+            message = .notify(ExtendedClipboardProtocol.Formats(bits: outgoing.keys))
+        } else {
+            // None of our formats or actions are accepted: legacy text only.
+            if let text = content.plainText {
+                try await sendClientPayload(ClientMessage.clientCutText(text).serialize())
+            }
+            return
+        }
+        let payload = try await Task.detached(priority: .userInitiated) {
+            try ExtendedClipboardProtocol.clientMessage(message)
+        }.value
+        try await sendClientPayload(payload)
     }
 
     // MARK: - Action execution
@@ -2871,6 +3034,7 @@ public actor TransportSession {
                         sentAppleMediaInitialSetDisplay = true
                     }
                     pending.append(ClientMessage.setEncodings(encodings).serialize())
+                    noteAdvertisedEncodings(encodings)
                     log.debug("Queued SetEncodings (\(encodings.count) encodings)")
                     if !pending.isEmpty {
                         try await sendClientPayload(pending)
@@ -2879,6 +3043,7 @@ public actor TransportSession {
                     try await sendAppleMediaStreamSetupIfNeeded()
                 } else {
                     pending.append(ClientMessage.setEncodings(encodings).serialize())
+                    noteAdvertisedEncodings(encodings)
                     log.debug("Queued SetEncodings (\(encodings.count) encodings)")
                     if requestedDisplayCount > 1,
                        (appleServerCapabilities != nil
@@ -2955,6 +3120,7 @@ public actor TransportSession {
 
         case .sendSetEncodings(let encodings):
             let msg = ClientMessage.setEncodings(encodings)
+            noteAdvertisedEncodings(encodings)
             try await sendControlChannel(msg.serialize())
             log.debug("Sent SetEncodings (\(encodings.count) encodings)")
             if requestAppleMediaStream && !sentAppleMediaStreamConfiguration {
@@ -2979,7 +3145,7 @@ public actor TransportSession {
             continuation?.yield(.bell)
 
         case .notifyClipboard(let text):
-            continuation?.yield(.clipboardText(text))
+            continuation?.yield(.clipboardContent(.text(text)))
 
         case .reportError(let error):
             continuation?.yield(.error(error))
@@ -4010,7 +4176,7 @@ public actor TransportSession {
                     return
                 }
                 appleDecryptedRFBBuffer.removeSubrange(base..<base + 8)
-                if appleSharedClipboardEnabled {
+                if sharedClipboardEnabled {
                     do {
                         try await requestRemoteClipboard()
                     } catch {
@@ -4250,7 +4416,7 @@ public actor TransportSession {
             ?? String(data: textData, encoding: .isoLatin1)
             ?? ""
         appleDecryptedRFBBuffer.removeSubrange(base..<base + 8 + length)
-        continuation?.yield(.clipboardText(text))
+        continuation?.yield(.clipboardContent(.text(text)))
         return true
     }
 

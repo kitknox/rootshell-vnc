@@ -1,4 +1,5 @@
 import Foundation
+import RFBProtocol
 import SwiftUI
 
 #if canImport(UIKit)
@@ -6,6 +7,11 @@ import UIKit
 #elseif canImport(AppKit)
 import AppKit
 #endif
+
+/// Clipboard data: pasteboard items with representations in fidelity order.
+public typealias VNCClipboardContent = ClipboardContent
+/// Which clipboard representations a connected server can receive.
+public typealias VNCClipboardContentSupport = ClipboardContentSupport
 
 /// The direction of a completed clipboard transfer.
 public enum VNCClipboardTransferDirection: Sendable {
@@ -16,10 +22,36 @@ public enum VNCClipboardTransferDirection: Sendable {
 @MainActor
 protocol VNCClipboardProviding: AnyObject {
     var changeCount: Int { get }
-    var hasTransferableContent: Bool { get }
 
-    func readTransferableText() -> String?
-    func writeText(_ text: String)
+    func hasTransferableContent(for support: VNCClipboardContentSupport) -> Bool
+    func readContent(for support: VNCClipboardContentSupport) -> VNCClipboardContent?
+    func write(_ content: VNCClipboardContent)
+}
+
+/// Rich representations come from each pasteboard item; plain text keeps
+/// its URL-first derivation and rides on the first item.
+private func clipboardContent(
+    richItems: [VNCClipboardContent.Item],
+    text: String?
+) -> VNCClipboardContent? {
+    var items = richItems
+    if let text {
+        let representation = VNCClipboardContent.Representation(
+            type: ClipboardType.utf8PlainText, data: Data(text.utf8))
+        if items.isEmpty {
+            items = [[representation]]
+        } else {
+            items[0].append(representation)
+        }
+    }
+    let content = VNCClipboardContent(items: items)
+    return content.isEmpty ? nil : content
+}
+
+private func outboundRichTypes(for support: VNCClipboardContentSupport) -> Set<String> {
+    ClipboardType.outbound
+        .subtracting([ClipboardType.utf8PlainText])
+        .filter(support.accepts)
 }
 
 #if canImport(UIKit)
@@ -29,20 +61,50 @@ private final class VNCSystemClipboard: VNCClipboardProviding {
 
     var changeCount: Int { pasteboard.changeCount }
 
-    var hasTransferableContent: Bool {
-        pasteboard.hasStrings || pasteboard.hasURLs
+    // Type and has* queries do not trigger the paste permission prompt.
+    func hasTransferableContent(for support: VNCClipboardContentSupport) -> Bool {
+        if pasteboard.hasStrings || pasteboard.hasURLs { return true }
+        let richTypes = outboundRichTypes(for: support)
+        return !richTypes.isEmpty && pasteboard.contains(pasteboardTypes: Array(richTypes))
     }
 
-    func readTransferableText() -> String? {
+    func readContent(for support: VNCClipboardContentSupport) -> VNCClipboardContent? {
+        let richTypes = outboundRichTypes(for: support)
+        var richItems: [VNCClipboardContent.Item] = []
+        if !richTypes.isEmpty {
+            for (index, types) in (pasteboard.types(forItemSet: nil) ?? []).enumerated() {
+                let itemSet = IndexSet(integer: index)
+                var item: VNCClipboardContent.Item = []
+                for type in types
+                where richTypes.contains(type) && !item.contains(where: { $0.type == type }) {
+                    guard let data = pasteboard.data(
+                        forPasteboardType: type, inItemSet: itemSet)?.first else { continue }
+                    item.append(.init(type: type, data: data))
+                }
+                richItems.append(item)
+            }
+        }
+        return clipboardContent(richItems: richItems, text: transferableText())
+    }
+
+    func write(_ content: VNCClipboardContent) {
+        pasteboard.setItems(content.items.map { item in
+            var values: [String: Any] = [:]
+            for representation in item where values[representation.type] == nil {
+                values[representation.type] = representation.type == ClipboardType.utf8PlainText
+                    ? String(decoding: representation.data, as: UTF8.self)
+                    : representation.data
+            }
+            return values
+        })
+    }
+
+    private func transferableText() -> String? {
         if let urls = pasteboard.urls, !urls.isEmpty {
             return urls.map { $0.isFileURL ? $0.path : $0.absoluteString }
                 .joined(separator: " ")
         }
         return pasteboard.string
-    }
-
-    func writeText(_ text: String) {
-        pasteboard.string = text
     }
 }
 #elseif canImport(AppKit)
@@ -52,13 +114,53 @@ private final class VNCSystemClipboard: VNCClipboardProviding {
 
     var changeCount: Int { pasteboard.changeCount }
 
-    var hasTransferableContent: Bool {
-        pasteboard.canReadObject(
-            forClasses: [NSString.self, NSURL.self],
-            options: nil)
+    func hasTransferableContent(for support: VNCClipboardContentSupport) -> Bool {
+        if pasteboard.canReadObject(forClasses: [NSString.self, NSURL.self], options: nil) {
+            return true
+        }
+        let richTypes = outboundRichTypes(for: support)
+            .map(NSPasteboard.PasteboardType.init(rawValue:))
+        return !richTypes.isEmpty && pasteboard.availableType(from: richTypes) != nil
     }
 
-    func readTransferableText() -> String? {
+    func readContent(for support: VNCClipboardContentSupport) -> VNCClipboardContent? {
+        let richTypes = outboundRichTypes(for: support)
+        var richItems: [VNCClipboardContent.Item] = []
+        if !richTypes.isEmpty {
+            for pasteboardItem in pasteboard.pasteboardItems ?? [] {
+                var item: VNCClipboardContent.Item = []
+                for type in pasteboardItem.types
+                where richTypes.contains(type.rawValue)
+                    && !item.contains(where: { $0.type == type.rawValue }) {
+                    guard let data = pasteboardItem.data(forType: type) else { continue }
+                    item.append(.init(type: type.rawValue, data: data))
+                }
+                richItems.append(item)
+            }
+        }
+        return clipboardContent(richItems: richItems, text: transferableText())
+    }
+
+    func write(_ content: VNCClipboardContent) {
+        pasteboard.clearContents()
+        pasteboard.writeObjects(content.items.map { item in
+            let pasteboardItem = NSPasteboardItem()
+            for representation in item {
+                if representation.type == ClipboardType.utf8PlainText {
+                    pasteboardItem.setString(
+                        String(decoding: representation.data, as: UTF8.self),
+                        forType: .string)
+                } else {
+                    pasteboardItem.setData(
+                        representation.data,
+                        forType: NSPasteboard.PasteboardType(representation.type))
+                }
+            }
+            return pasteboardItem
+        })
+    }
+
+    private func transferableText() -> String? {
         if let urls = pasteboard.readObjects(
             forClasses: [NSURL.self],
             options: nil) as? [URL],
@@ -67,11 +169,6 @@ private final class VNCSystemClipboard: VNCClipboardProviding {
                 .joined(separator: " ")
         }
         return pasteboard.string(forType: .string)
-    }
-
-    func writeText(_ text: String) {
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
     }
 }
 #endif
@@ -89,6 +186,7 @@ public final class VNCClipboardSynchronizer {
         didSet {
             guard oldValue != sharedClipboardEnabled else { return }
             needsForegroundReconciliation = false
+            cancelAutomaticApply()
             establishBaseline()
             if sharedClipboardEnabled, automaticallyMonitors {
                 startMonitoring()
@@ -104,22 +202,23 @@ public final class VNCClipboardSynchronizer {
         }
     }
 
-    /// Invoked after a transfer is applied locally or queued for the remote.
-    /// Hosts can use this for clipboard history without observing clipboard
-    /// contents that were merely cached while sharing was inactive.
+    /// Invoked with the plain text of a transfer once it is applied locally or
+    /// queued for the remote. Transfers without plain text, such as a lone
+    /// image, are not reported. Hosts can use this for clipboard history
+    /// without observing contents merely cached while sharing was inactive.
     @ObservationIgnored
     public var onTransfer: ((VNCClipboardTransferDirection, String) -> Void)?
 
-    public var hasRemoteClipboard: Bool { latestRemoteText != nil }
+    public var hasRemoteClipboard: Bool { latestRemoteContent != nil }
 
-    /// Whether Get Clipboard can either request the current value from an
-    /// Apple server or apply a value already published by a standard server.
+    /// Whether Get Clipboard can either request the current value from the
+    /// server or apply a value the server already published.
     public var canGetClipboard: Bool {
-        latestRemoteText != nil || (canSend() && canRequestRemoteClipboard())
+        latestRemoteContent != nil || (canSend() && canRequestRemoteClipboard())
     }
 
     public var canSendClipboard: Bool {
-        canSend() && clipboard.hasTransferableContent
+        canSend() && clipboard.hasTransferableContent(for: contentSupport())
     }
 
     /// Internal visibility for deterministic observer lifecycle tests.
@@ -132,7 +231,9 @@ public final class VNCClipboardSynchronizer {
     @ObservationIgnored
     private let canSend: () -> Bool
     @ObservationIgnored
-    private let send: (String) -> Void
+    private let send: (VNCClipboardContent) -> Void
+    @ObservationIgnored
+    private let contentSupport: () -> VNCClipboardContentSupport
     @ObservationIgnored
     private let canRequestRemoteClipboard: () -> Bool
     @ObservationIgnored
@@ -157,17 +258,29 @@ public final class VNCClipboardSynchronizer {
     @ObservationIgnored
     private var connectionStateObserverID: UUID?
     @ObservationIgnored
+    private var capabilityObserverID: UUID?
+    @ObservationIgnored
     private var lifecycleObservers: [NSObjectProtocol] = []
     @ObservationIgnored
     private var clipboardChangeObserver: NSObjectProtocol?
     @ObservationIgnored
     private var monitoringTask: Task<Void, Never>?
 
-    private var latestRemoteText: String?
+    private var latestRemoteContent: VNCClipboardContent?
     @ObservationIgnored
     private var pendingManualGet = false
     @ObservationIgnored
     private var remoteGeneration: UInt64 = 0
+    @ObservationIgnored
+    private var applyGeneration: UInt64 = 0
+    @ObservationIgnored
+    private var normalizationTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var pendingApplyIsAutomatic = false
+    /// The last automatic flush and the support it was read under. Support
+    /// that grows later (ExtendedClipboard caps) resends it.
+    @ObservationIgnored
+    private var automaticFlush: (changeCount: Int, support: VNCClipboardContentSupport)?
     @ObservationIgnored
     private var observedLocalChangeCount: Int
     @ObservationIgnored
@@ -175,7 +288,7 @@ public final class VNCClipboardSynchronizer {
     @ObservationIgnored
     private var backgroundRemoteGeneration: UInt64 = 0
     @ObservationIgnored
-    private var isApplyingRemoteText = false
+    private var isApplyingRemoteContent = false
     @ObservationIgnored
     private var hostIsFocused = true
     @ObservationIgnored
@@ -204,8 +317,11 @@ public final class VNCClipboardSynchronizer {
             canSend: { [weak session] in
                 session?.connectionState.isConnected == true
             },
-            send: { [weak session] text in
-                session?.sendClipboardText(text)
+            send: { [weak session] content in
+                session?.sendClipboard(content)
+            },
+            contentSupport: { [weak session] in
+                session?.clipboardContentSupport ?? .plainText
             },
             canRequestRemoteClipboard: { [weak session] in
                 session?.connectionState.isConnected == true
@@ -228,11 +344,14 @@ public final class VNCClipboardSynchronizer {
             clipboardChangeObject: clipboardChangeObject
         )
         self.session = session
-        self.sessionObserverID = session.addServerClipboardObserver { [weak self] text in
-            self?.receiveRemoteClipboardText(text)
+        self.sessionObserverID = session.addServerClipboardObserver { [weak self] content in
+            self?.receiveRemoteClipboardContent(content)
         }
         self.connectionStateObserverID = session.addConnectionStateObserver { [weak self] state in
             self?.connectionStateDidChange(state)
+        }
+        self.capabilityObserverID = session.addClipboardCapabilityObserver { [weak self] in
+            self?.clipboardCapabilitiesDidChange()
         }
         connectionStateDidChange(session.connectionState)
     }
@@ -240,7 +359,8 @@ public final class VNCClipboardSynchronizer {
     init(
         clipboard: any VNCClipboardProviding,
         canSend: @escaping () -> Bool,
-        send: @escaping (String) -> Void,
+        send: @escaping (VNCClipboardContent) -> Void,
+        contentSupport: @escaping () -> VNCClipboardContentSupport = { .all },
         canRequestRemoteClipboard: @escaping () -> Bool = { false },
         requestRemoteClipboard: @escaping () -> Void = {},
         canControlRemoteSharedClipboard: @escaping () -> Bool = { false },
@@ -254,6 +374,7 @@ public final class VNCClipboardSynchronizer {
         self.clipboard = clipboard
         self.canSend = canSend
         self.send = send
+        self.contentSupport = contentSupport
         self.canRequestRemoteClipboard = canRequestRemoteClipboard
         self.requestRemoteClipboard = requestRemoteClipboard
         self.canControlRemoteSharedClipboard = canControlRemoteSharedClipboard
@@ -272,6 +393,7 @@ public final class VNCClipboardSynchronizer {
 
     isolated deinit {
         monitoringTask?.cancel()
+        normalizationTask?.cancel()
         if let clipboardChangeObserver {
             notificationCenter.removeObserver(clipboardChangeObserver)
         }
@@ -285,26 +407,29 @@ public final class VNCClipboardSynchronizer {
         if let connectionStateObserverID {
             session?.removeConnectionStateObserver(connectionStateObserverID)
         }
+        if let capabilityObserverID {
+            session?.removeClipboardCapabilityObserver(capabilityObserverID)
+        }
     }
 
-    /// Send the device's current text or URL clipboard to the remote server.
+    /// Send the device's clipboard to the remote server, keeping every
+    /// representation the server can receive.
     public func sendClipboard() {
         guard !invalidated, canSend(),
-              let text = clipboard.readTransferableText() else { return }
+              let content = clipboard.readContent(for: contentSupport()) else { return }
         observedLocalChangeCount = clipboard.changeCount
-        send(text)
-        onTransfer?(.deviceToRemote, text)
+        transmit(content)
     }
 
-    /// Request the current clipboard from an Apple server, or put the most
-    /// recently published value from a standard VNC server on the device.
+    /// Request the current clipboard from a server that supports requests, or
+    /// put the most recently published value on the device.
     public func getClipboard() {
         guard !invalidated else { return }
         if canSend(), canRequestRemoteClipboard() {
             pendingManualGet = true
             requestRemoteClipboard()
-        } else if let latestRemoteText {
-            applyRemoteText(latestRemoteText)
+        } else if let latestRemoteContent {
+            applyRemoteContent(latestRemoteContent, automatic: false)
         }
     }
 
@@ -313,6 +438,7 @@ public final class VNCClipboardSynchronizer {
     public func setHostFocused(_ focused: Bool) {
         guard hostIsFocused != focused else { return }
         hostIsFocused = focused
+        cancelAutomaticApply()
         if !focused {
             needsForegroundReconciliation = false
         }
@@ -324,6 +450,7 @@ public final class VNCClipboardSynchronizer {
     public func setHostWindowActive(_ active: Bool) {
         guard hostWindowIsActive != active else { return }
         hostWindowIsActive = active
+        cancelAutomaticApply()
 
         if active, needsForegroundReconciliation {
             reconcileAfterForegroundIfPossible()
@@ -341,6 +468,8 @@ public final class VNCClipboardSynchronizer {
         invalidated = true
         monitoringTask?.cancel()
         monitoringTask = nil
+        normalizationTask?.cancel()
+        normalizationTask = nil
         stopClipboardObservation()
         for observer in lifecycleObservers {
             notificationCenter.removeObserver(observer)
@@ -352,24 +481,32 @@ public final class VNCClipboardSynchronizer {
         if let connectionStateObserverID {
             session?.removeConnectionStateObserver(connectionStateObserverID)
         }
+        if let capabilityObserverID {
+            session?.removeClipboardCapabilityObserver(capabilityObserverID)
+        }
         sessionObserverID = nil
         connectionStateObserverID = nil
+        capabilityObserverID = nil
         session = nil
     }
 
     func receiveRemoteClipboardText(_ text: String) {
+        receiveRemoteClipboardContent(.text(text))
+    }
+
+    func receiveRemoteClipboardContent(_ content: VNCClipboardContent) {
         guard !invalidated else { return }
-        latestRemoteText = text
+        latestRemoteContent = content
         remoteGeneration &+= 1
 
         if pendingManualGet {
             pendingManualGet = false
-            applyRemoteText(text)
+            applyRemoteContent(content, automatic: false)
             return
         }
 
         guard sharedClipboardEnabled, isEligible else { return }
-        applyRemoteText(text)
+        applyRemoteContent(content, automatic: true)
     }
 
     func localClipboardDidChange() {
@@ -377,7 +514,7 @@ public final class VNCClipboardSynchronizer {
         let currentChangeCount = clipboard.changeCount
         guard currentChangeCount != observedLocalChangeCount else { return }
 
-        if isApplyingRemoteText || !sharedClipboardEnabled || !isEligible {
+        if isApplyingRemoteContent || !sharedClipboardEnabled || !isEligible {
             // Changes made by us, while sharing is disabled, or while another
             // pane/window owns focus must never be replayed later.
             observedLocalChangeCount = currentChangeCount
@@ -388,15 +525,7 @@ public final class VNCClipboardSynchronizer {
         // observer retries it immediately after the session is operational,
         // and polling remains a fallback for custom transports.
         guard canSend() else { return }
-        guard let text = clipboard.readTransferableText() else {
-            // The shared clipboard intentionally supports text and URLs only.
-            observedLocalChangeCount = currentChangeCount
-            return
-        }
-
-        observedLocalChangeCount = currentChangeCount
-        send(text)
-        onTransfer?(.deviceToRemote, text)
+        flushLocalClipboard()
     }
 
     func connectionStateDidChange(_ state: VNCConnectionState) {
@@ -423,9 +552,20 @@ public final class VNCClipboardSynchronizer {
         }
     }
 
+    /// ExtendedClipboard caps arrive after the connection is up, so shared
+    /// mode may only become controllable now.
+    func clipboardCapabilitiesDidChange() {
+        guard !invalidated else { return }
+        if sharedClipboardEnabled, canControlRemoteSharedClipboard() {
+            setRemoteSharedClipboard(true)
+        }
+        retryAutomaticFlush()
+    }
+
     func applicationWillResignActive() {
         guard applicationIsActive else { return }
         applicationIsActive = false
+        cancelAutomaticApply()
         backgroundLocalChangeCount = clipboard.changeCount
         backgroundRemoteGeneration = remoteGeneration
         needsForegroundReconciliation = true
@@ -440,15 +580,86 @@ public final class VNCClipboardSynchronizer {
         hostIsFocused && hostWindowIsActive && applicationIsActive
     }
 
-    private func applyRemoteText(_ text: String) {
-        isApplyingRemoteText = true
-        clipboard.writeText(text)
-        observedLocalChangeCount = clipboard.changeCount
-        isApplyingRemoteText = false
-        onTransfer?(.remoteToDevice, text)
+    private func transmit(_ content: VNCClipboardContent) {
+        send(content)
+        if let text = content.plainText {
+            onTransfer?(.deviceToRemote, text)
+        }
     }
 
-    private func establishBaseline() {
+    /// Shared-mode send of the device clipboard, remembered with the support
+    /// it was read under so retryAutomaticFlush can resend it.
+    private func flushLocalClipboard() {
+        let support = contentSupport()
+        observedLocalChangeCount = clipboard.changeCount
+        automaticFlush = (clipboard.changeCount, support)
+        guard let content = clipboard.readContent(for: support) else { return }
+        transmit(content)
+    }
+
+    /// A change flushed before the server's support grew (ExtendedClipboard
+    /// caps after connect) went out without what the server now accepts.
+    private func retryAutomaticFlush() {
+        guard let flush = automaticFlush,
+              flush.changeCount == clipboard.changeCount,
+              sharedClipboardEnabled, isEligible, canSend() else { return }
+        let support = contentSupport()
+        guard support != flush.support, support.acceptsRichContent else { return }
+        automaticFlush = (flush.changeCount, support)
+        guard let content = clipboard.readContent(for: support),
+              content.hasRichContent else { return }
+        transmit(content)
+    }
+
+    /// Items with only TIFF or BMP images get a PNG first, built off the main
+    /// actor. The write is dropped if a newer apply or a local copy wins, or,
+    /// for shared-mode applies, once this pane stops being eligible.
+    private func applyRemoteContent(_ content: VNCClipboardContent, automatic: Bool) {
+        applyGeneration &+= 1
+        normalizationTask?.cancel()
+        normalizationTask = nil
+        guard VNCClipboardImageNormalizer.needsNormalization(content) else {
+            writeRemoteContent(content)
+            return
+        }
+
+        let generation = applyGeneration
+        let localChangeCount = clipboard.changeCount
+        pendingApplyIsAutomatic = automatic
+        normalizationTask = Task { [weak self] in
+            let normalized = await Task.detached(priority: .userInitiated) {
+                VNCClipboardImageNormalizer.normalized(content)
+            }.value
+            guard let self, !Task.isCancelled, !self.invalidated,
+                  self.applyGeneration == generation,
+                  self.clipboard.changeCount == localChangeCount,
+                  !automatic || (self.sharedClipboardEnabled && self.isEligible)
+            else { return }
+            self.normalizationTask = nil
+            self.writeRemoteContent(normalized)
+        }
+    }
+
+    private func cancelAutomaticApply() {
+        guard normalizationTask != nil, pendingApplyIsAutomatic else { return }
+        normalizationTask?.cancel()
+        normalizationTask = nil
+        applyGeneration &+= 1
+    }
+
+    private func writeRemoteContent(_ content: VNCClipboardContent) {
+        isApplyingRemoteContent = true
+        clipboard.write(content)
+        observedLocalChangeCount = clipboard.changeCount
+        isApplyingRemoteContent = false
+        if let text = content.plainText {
+            onTransfer?(.remoteToDevice, text)
+        }
+    }
+
+    /// Reconciliation keeps a deferred flush the clipboard still matches.
+    private func establishBaseline(keepingAutomaticFlush: Bool = false) {
+        if !keepingAutomaticFlush { automaticFlush = nil }
         observedLocalChangeCount = clipboard.changeCount
         backgroundLocalChangeCount = clipboard.changeCount
         backgroundRemoteGeneration = remoteGeneration
@@ -465,11 +676,13 @@ public final class VNCClipboardSynchronizer {
         let localChanged = clipboard.changeCount != backgroundLocalChangeCount
         let remoteChanged = remoteGeneration != backgroundRemoteGeneration
         if localChanged {
-            sendClipboard()
-        } else if remoteChanged, let latestRemoteText {
-            applyRemoteText(latestRemoteText)
+            if canSend() { flushLocalClipboard() }
+        } else if remoteChanged, let latestRemoteContent {
+            applyRemoteContent(latestRemoteContent, automatic: true)
         } else {
-            establishBaseline()
+            // Caps may have arrived while this pane could not send.
+            retryAutomaticFlush()
+            establishBaseline(keepingAutomaticFlush: true)
         }
     }
 
@@ -517,8 +730,11 @@ public final class VNCClipboardSynchronizer {
     }
 
     private func clearRemoteCache() {
-        latestRemoteText = nil
+        latestRemoteContent = nil
         pendingManualGet = false
+        applyGeneration &+= 1
+        normalizationTask?.cancel()
+        normalizationTask = nil
         // Treat the boundary as a generation change so pending foreground
         // reconciliation cannot apply clipboard data from the prior server.
         remoteGeneration &+= 1
