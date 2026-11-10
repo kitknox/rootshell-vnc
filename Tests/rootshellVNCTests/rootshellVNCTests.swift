@@ -2287,17 +2287,17 @@ final class HardwareKeyboardStateTests: XCTestCase {
         var state = SupplementalHardwareModifierState()
 
         XCTAssertEqual(state.begin(
-            usage: 0x06,
+            .key(0x06),
             keysyms: [KeyboardInputHandler.keysymControlL]), [
                 HardwareKeyboardTransition(
                     downFlag: true,
                     keysym: KeyboardInputHandler.keysymControlL),
             ])
         XCTAssertTrue(state.begin(
-            usage: 0x07,
+            .key(0x07),
             keysyms: [KeyboardInputHandler.keysymControlL]).isEmpty)
-        XCTAssertTrue(state.end(usage: 0x06).isEmpty)
-        XCTAssertEqual(state.end(usage: 0x07), [
+        XCTAssertTrue(state.end(.key(0x06)).isEmpty)
+        XCTAssertEqual(state.end(.key(0x07)), [
             HardwareKeyboardTransition(
                 downFlag: false,
                 keysym: KeyboardInputHandler.keysymControlL),
@@ -2307,13 +2307,19 @@ final class HardwareKeyboardStateTests: XCTestCase {
     func testSupplementalModifierReleaseAllUsesReverseActivationOrder() {
         var state = SupplementalHardwareModifierState()
         _ = state.begin(
-            usage: 0x06,
+            .key(0x06),
             keysyms: [
                 KeyboardInputHandler.keysymControlL,
                 KeyboardInputHandler.keysymAltL,
             ])
+        _ = state.begin(
+            .pointer(1),
+            keysyms: [KeyboardInputHandler.keysymSuperL])
 
         XCTAssertEqual(state.releaseAll(), [
+            HardwareKeyboardTransition(
+                downFlag: false,
+                keysym: KeyboardInputHandler.keysymSuperL),
             HardwareKeyboardTransition(
                 downFlag: false,
                 keysym: KeyboardInputHandler.keysymAltL),
@@ -2322,6 +2328,143 @@ final class HardwareKeyboardStateTests: XCTestCase {
                 keysym: KeyboardInputHandler.keysymControlL),
         ])
         XCTAssertTrue(state.releaseAll().isEmpty)
+        XCTAssertTrue(state.end(.pointer(1)).isEmpty)
+    }
+
+    func testPointerModifiersSurviveKeyboardReset() {
+        var state = SupplementalHardwareModifierState()
+        _ = state.begin(
+            .pointer(1),
+            keysyms: [KeyboardInputHandler.keysymMetaL])
+        _ = state.begin(
+            .key(0x06),
+            keysyms: [
+                KeyboardInputHandler.keysymMetaL,
+                KeyboardInputHandler.keysymShiftL,
+            ])
+
+        // Shared Option stays down for the drag; key-only Shift is released.
+        XCTAssertEqual(state.releaseKeyOwners(), [
+            HardwareKeyboardTransition(
+                downFlag: false,
+                keysym: KeyboardInputHandler.keysymShiftL),
+        ])
+        XCTAssertFalse(state.contains(.key(0x06)))
+        XCTAssertTrue(state.contains(.pointer(1)))
+        XCTAssertEqual(state.end(.pointer(1)), [
+            HardwareKeyboardTransition(
+                downFlag: false,
+                keysym: KeyboardInputHandler.keysymMetaL),
+        ])
+    }
+
+    func testKeyAndPointerOwnersShareOneModifierTransition() {
+        var state = SupplementalHardwareModifierState()
+        let down = [HardwareKeyboardTransition(
+            downFlag: true,
+            keysym: KeyboardInputHandler.keysymSuperL)]
+        let up = [HardwareKeyboardTransition(
+            downFlag: false,
+            keysym: KeyboardInputHandler.keysymSuperL)]
+
+        XCTAssertEqual(state.begin(
+            .pointer(1),
+            keysyms: [KeyboardInputHandler.keysymSuperL]), down)
+        XCTAssertTrue(state.begin(
+            .key(0x06),
+            keysyms: [KeyboardInputHandler.keysymSuperL]).isEmpty)
+        XCTAssertTrue(state.end(.pointer(1)).isEmpty)
+        XCTAssertEqual(state.end(.key(0x06)), up)
+
+        XCTAssertEqual(state.begin(
+            .key(0x06),
+            keysyms: [KeyboardInputHandler.keysymSuperL]), down)
+        XCTAssertTrue(state.begin(
+            .pointer(2),
+            keysyms: [KeyboardInputHandler.keysymSuperL]).isEmpty)
+        XCTAssertTrue(state.end(.key(0x06)).isEmpty)
+        XCTAssertEqual(state.end(.pointer(2)), up)
+    }
+
+    func testPhysicalModifierReleaseKeepsDragModifierDown() {
+        var state = SupplementalHardwareModifierState()
+        let option = KeyboardInputHandler.keysymMetaL
+        let up = [HardwareKeyboardTransition(downFlag: false, keysym: option)]
+
+        // Toolbar Option drag, then a physical Option press and release.
+        XCTAssertEqual(state.begin(.pointer(1), keysyms: [option]), [
+            HardwareKeyboardTransition(downFlag: true, keysym: option),
+        ])
+        XCTAssertTrue(state.begin(.physicalModifier(option), keysyms: [option]).isEmpty)
+        XCTAssertTrue(state.end(.physicalModifier(option)).isEmpty)
+        XCTAssertEqual(state.end(.pointer(1)), up)
+
+        // Physical Option held first, released before the drop.
+        _ = state.begin(.physicalModifier(option), keysyms: [option])
+        XCTAssertTrue(state.begin(.pointer(2), keysyms: [option]).isEmpty)
+        XCTAssertTrue(state.releaseKeyOwners().isEmpty)
+        XCTAssertTrue(state.end(.physicalModifier(option)).isEmpty)
+        XCTAssertEqual(state.end(.pointer(2)), up)
+    }
+
+    func testSharedModifierReleaseReusesItsPressRoute() {
+        var state = SupplementalHardwareModifierState()
+        var routes = ModifierPressRoutes()
+        let shift = KeyboardInputHandler.keysymShiftL
+        var sent: [(down: Bool, usage: UInt32?)] = []
+        func send(_ transitions: [HardwareKeyboardTransition], offered: UInt32?) {
+            for transition in transitions {
+                sent.append((transition.downFlag, routes.usage(for: transition, offered: offered)))
+            }
+        }
+
+        // Physical Shift by HID usage, toolbar drag, physical release, drop.
+        send(state.begin(.physicalModifier(shift), keysyms: [shift]), offered: 0xE1)
+        send(state.begin(.pointer(1), keysyms: [shift]), offered: nil)
+        send(state.end(.physicalModifier(shift)), offered: 0xE1)
+        send(state.end(.pointer(1)), offered: nil)
+        XCTAssertEqual(sent.map(\.down), [true, false])
+        XCTAssertEqual(sent.map(\.usage), [0xE1, 0xE1])
+
+        // Toolbar press first: the physical release falls back to the keysym route.
+        sent.removeAll()
+        send(state.begin(.pointer(2), keysyms: [shift]), offered: nil)
+        send(state.begin(.physicalModifier(shift), keysyms: [shift]), offered: 0xE1)
+        send(state.end(.pointer(2)), offered: nil)
+        send(state.end(.physicalModifier(shift)), offered: 0xE1)
+        XCTAssertEqual(sent.map(\.down), [true, false])
+        XCTAssertEqual(sent.map(\.usage), [nil, nil])
+    }
+
+    func testReleasePointerOwnersKeepsKeyModifiers() {
+        var state = SupplementalHardwareModifierState()
+        _ = state.begin(
+            .key(0x06),
+            keysyms: [KeyboardInputHandler.keysymControlL])
+        _ = state.begin(
+            .pointer(1),
+            keysyms: [
+                KeyboardInputHandler.keysymControlL,
+                KeyboardInputHandler.keysymSuperL,
+            ])
+        _ = state.begin(
+            .pointer(2),
+            keysyms: [KeyboardInputHandler.keysymShiftL])
+
+        XCTAssertEqual(state.releasePointerOwners(), [
+            HardwareKeyboardTransition(
+                downFlag: false,
+                keysym: KeyboardInputHandler.keysymShiftL),
+            HardwareKeyboardTransition(
+                downFlag: false,
+                keysym: KeyboardInputHandler.keysymSuperL),
+        ])
+        XCTAssertTrue(state.releasePointerOwners().isEmpty)
+        XCTAssertEqual(state.end(.key(0x06)), [
+            HardwareKeyboardTransition(
+                downFlag: false,
+                keysym: KeyboardInputHandler.keysymControlL),
+        ])
     }
 
     func testReleaseAllUsesReversePressOrderAndOnlyReleasesOnce() {

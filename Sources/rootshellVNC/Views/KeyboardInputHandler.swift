@@ -234,6 +234,10 @@ public struct KeyboardInputHandler {
             key: Self.keysymForCharacter(character)))
     }
 
+    /// How long a chord's modifiers outlive its final press. Remote apps that
+    /// read live modifier state (shortcuts, Finder drops) miss a burst.
+    nonisolated static let chordReleaseDelay: Duration = .milliseconds(75)
+
     private func handleChord(_ chord: RemoteKeyChord) {
         guard chord.key != 0 else { return }
         for modifier in chord.modifiers {
@@ -242,7 +246,7 @@ public struct KeyboardInputHandler {
         sendKeyEvent(true, chord.key)
         let release = sendKeyEvent
         Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(75))
+            try? await Task.sleep(for: Self.chordReleaseDelay)
             release(false, chord.key)
             for modifier in chord.modifiers.reversed() {
                 release(false, modifier)

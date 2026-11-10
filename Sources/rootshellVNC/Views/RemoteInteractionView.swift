@@ -123,7 +123,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private var toggleFullScreen: (() -> Void)?
     private var disconnect: () -> Void
     private lazy var hardwareKeyboard = HardwareKeyboardController(
-        keyboardHandler: keyboardHandler)
+        keyboardHandler: keyboardHandler,
+        routeModifier: { [weak self] transition, usage in
+            self?.routePhysicalModifier(transition, usage: usage)
+        })
     private var framebufferSize: CGSize = .zero
     private var framebufferOrigin: CGPoint = .zero
     private var viewport = RemoteViewportState()
@@ -209,10 +212,14 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private let suppressedInputView = UIView(frame: .zero)
     private var consumedRemoteAliasUsages: Set<UInt32> = []
     private var universalKeys = UniversalCommandKeyState()
-    /// Supplemental toolbar modifiers held around each physical key until its
-    /// matching key-up. Reference counts keep overlapping physical presses
-    /// from releasing a shared synthetic modifier too early.
+    /// Supplemental toolbar modifiers held around each physical key or pointer
+    /// press until it ends. Reference counts keep overlapping presses from
+    /// releasing a shared synthetic modifier too early.
     private var supplementalModifierState = SupplementalHardwareModifierState()
+    private var modifierPressRoutes = ModifierPressRoutes()
+    private var nextPointerModifierOwner: UInt64 = 0
+    private var pointerDragModifierOwner: UInt64?
+    private var touchHoldModifierOwner: UInt64?
     private weak var monitoredCatalystKeyboardInput: GCKeyboardInput?
     #if targetEnvironment(macCatalyst)
     // Repeat state for Option/Command+arrow chords read from GameController,
@@ -804,6 +811,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             releasePointerDrag()
             releaseTouchHoldDrag()
             releaseAllPressedKeys()
+            releasePointerModifiersNow()
             cancelScrollInteraction()
             stopEdgeScrolling()
             #if !targetEnvironment(macCatalyst)
@@ -1906,62 +1914,107 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private func beginSupplementalModifiersIfNeeded(for usage: UInt32) {
         // Modifier-only presses already have explicit physical transitions.
         guard !(0xE0...0xE7).contains(usage),
-              !supplementalModifierState.contains(usage: usage) else { return }
+              !supplementalModifierState.contains(.key(usage)) else { return }
 
         let configured = keyboardCapture.supplementalModifiers
         guard !configured.isEmpty else { return }
         let keysyms = KeyboardInputHandler.keysyms(
             for: configured,
-            appleModifierConvention: keyboardHandler.usesAppleModifierMapping
-        ).filter {
-            !physicalModifierIsPressed(for: $0)
-        }
+            appleModifierConvention: keyboardHandler.usesAppleModifierMapping)
 
-        // Beginning with an empty list still records a repeat sentinel when
-        // every configured modifier is already held physically.
-        supplementalModifierState.begin(usage: usage, keysyms: keysyms)
+        // The owner record doubles as the repeat sentinel for this usage.
+        supplementalModifierState.begin(.key(usage), keysyms: keysyms)
             .forEach(sendSupplementalTransition)
         keyboardCapture.onSupplementalModifiersConsumed?()
     }
 
     private func endSupplementalModifiers(for usage: UInt32) {
-        supplementalModifierState.end(usage: usage)
+        supplementalModifierState.end(.key(usage))
             .forEach(sendSupplementalTransition)
     }
 
+    /// Keyboard resets run mid-gesture, so they leave pointer holds alone.
     private func releaseAllSupplementalModifiers() {
-        supplementalModifierState.releaseAll()
+        supplementalModifierState.releaseKeyOwners()
             .forEach(sendSupplementalTransition)
+    }
+
+    // MARK: Pointer modifiers
+
+    /// RFB pointer messages carry no modifier bits, so toolbar modifiers go
+    /// down as key events before a press. Returns the owner to end later.
+    private func beginPointerModifiers() -> UInt64? {
+        let configured = keyboardCapture.supplementalModifiers
+        guard !configured.isEmpty else { return nil }
+        let keysyms = KeyboardInputHandler.keysyms(
+            for: configured,
+            appleModifierConvention: keyboardHandler.usesAppleModifierMapping)
+        nextPointerModifierOwner &+= 1
+        let owner = nextPointerModifierOwner
+        supplementalModifierState.begin(.pointer(owner), keysyms: keysyms)
+            .forEach(sendSupplementalTransition)
+        keyboardCapture.onSupplementalModifiersConsumed?()
+        return owner
+    }
+
+    /// Releases after the chord delay so remote apps that read live modifier
+    /// state at click or drop time still see it.
+    private func endPointerModifiers(_ owner: UInt64?) {
+        guard let owner else { return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: KeyboardInputHandler.chordReleaseDelay)
+            guard let self else { return }
+            self.supplementalModifierState.end(.pointer(owner))
+                .forEach(self.sendSupplementalTransition)
+        }
+    }
+
+    private func releasePointerModifiersNow() {
+        supplementalModifierState.releasePointerOwners()
+            .forEach(sendSupplementalTransition)
+    }
+
+    private func clickWithPointerModifiers(_ click: () -> Void) {
+        let owner = beginPointerModifiers()
+        click()
+        endPointerModifiers(owner)
     }
 
     private func sendSupplementalTransition(_ transition: HardwareKeyboardTransition) {
-        keyboardHandler.handleKeysym(
-            downFlag: transition.downFlag,
-            keysym: transition.keysym)
+        sendSharedModifier(transition, usage: nil)
     }
 
-    private func physicalModifierIsPressed(for keysym: UInt32) -> Bool {
-        if keyboardCapture.controlOptionAsCommand {
-            return hardwareKeyboard.emitsModifier(keysym: keysym)
+    /// Every shared-state emission goes through here so a release always
+    /// takes the same API (HID usage or keysym) as the press it ends.
+    private func sendSharedModifier(
+        _ transition: HardwareKeyboardTransition,
+        usage offered: UInt32?
+    ) {
+        if let usage = modifierPressRoutes.usage(for: transition, offered: offered) {
+            keyboardHandler.handlePhysicalKey(
+                downFlag: transition.downFlag,
+                usage: usage,
+                keysym: transition.keysym)
+        } else {
+            keyboardHandler.handleKeysym(
+                downFlag: transition.downFlag,
+                keysym: transition.keysym)
         }
-        switch keysym {
-        case KeyboardInputHandler.keysymControlL:
-            return hardwareKeyboard.contains(usage: 0xE0)
-                || hardwareKeyboard.contains(usage: 0xE4)
-        case KeyboardInputHandler.keysymShiftL:
-            return hardwareKeyboard.contains(usage: 0xE1)
-                || hardwareKeyboard.contains(usage: 0xE5)
-        // Option maps to Alt_L on standard servers and Meta_L on Apple servers;
-        // both correspond to the physical Option keys (HID usage 0xE2/0xE6), so
-        // a supplemental Option isn't re-sent when physical Option is held.
-        case KeyboardInputHandler.keysymAltL, KeyboardInputHandler.keysymMetaL:
-            return hardwareKeyboard.contains(usage: 0xE2)
-                || hardwareKeyboard.contains(usage: 0xE6)
-        case KeyboardInputHandler.keysymSuperL:
-            return hardwareKeyboard.contains(usage: 0xE3)
-                || hardwareKeyboard.contains(usage: 0xE7)
-        default:
-            return false
+    }
+
+    /// Physical modifiers share reference counts with toolbar holds, so
+    /// releasing one source never lifts a modifier another still holds.
+    private func routePhysicalModifier(
+        _ transition: HardwareKeyboardTransition,
+        usage: UInt32?
+    ) {
+        let owner = SupplementalHardwareModifierState.Owner
+            .physicalModifier(transition.keysym)
+        let transitions = transition.downFlag
+            ? supplementalModifierState.begin(owner, keysyms: [transition.keysym])
+            : supplementalModifierState.end(owner)
+        for routed in transitions {
+            sendSharedModifier(routed, usage: usage)
         }
     }
 
@@ -1969,6 +2022,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         releaseAllPressedKeys()
         releasePointerDrag()
         releaseTouchHoldDrag()
+        releasePointerModifiersNow()
         stopEdgeScrolling()
         #if !targetEnvironment(macCatalyst)
         remoteCursorHoverLocation = nil
@@ -1981,6 +2035,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         releaseAllPressedKeys()
         releasePointerDrag()
         releaseTouchHoldDrag()
+        releasePointerModifiersNow()
         stopEdgeScrolling()
         #if !targetEnvironment(macCatalyst)
         remoteCursorHoverLocation = nil
@@ -1992,6 +2047,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         if pointerDragActive, let point = lastPointerPoint {
             touchHandler.handleDragEnd(x: point.x, y: point.y)
         }
+        endPointerModifiers(pointerDragModifierOwner)
+        pointerDragModifierOwner = nil
         pointerDragActive = false
         lastPointerPoint = nil
     }
@@ -2264,7 +2321,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
               let point = framebufferPoint(
                   for: touch.location(in: self)) else { return }
         focusForHardwareKeyboard()
-        touchHandler.handleRightClick(x: point.x, y: point.y)
+        clickWithPointerModifiers {
+            touchHandler.handleRightClick(x: point.x, y: point.y)
+        }
     }
 
     private func cancelScrollInteraction() {
@@ -2557,6 +2616,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
                 Self.lastPencilContactView = self
             }
             lastPointerPoint = point
+            if !pointerDragActive {
+                pointerDragModifierOwner = beginPointerModifiers()
+            }
             pointerDragActive = true
             touchHandler.handleDrag(x: point.x, y: point.y)
         case .ended, .cancelled, .failed:
@@ -2582,10 +2644,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         // matching a trackpad click on a decelerating native view.
         catchMomentumFlingIfActive()
         focusForHardwareKeyboardIfNeeded(recognizer)
-        if recognizer.buttonMask.contains(.secondary) {
-            touchHandler.handleRightClick(x: point.x, y: point.y)
-        } else {
-            touchHandler.handleTap(x: point.x, y: point.y)
+        clickWithPointerModifiers {
+            if recognizer.buttonMask.contains(.secondary) {
+                touchHandler.handleRightClick(x: point.x, y: point.y)
+            } else {
+                touchHandler.handleTap(x: point.x, y: point.y)
+            }
         }
     }
 
@@ -2601,11 +2665,15 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             // second as an ordinary click, as a native scroll view would.
             momentumCatchPending = false
             momentumCatchTimestamp = 0
-            touchHandler.handleTap(x: point.x, y: point.y)
+            clickWithPointerModifiers {
+                touchHandler.handleTap(x: point.x, y: point.y)
+            }
             return
         }
         catchMomentumFlingIfActive()
-        touchHandler.handleDoubleTap(x: point.x, y: point.y)
+        clickWithPointerModifiers {
+            touchHandler.handleDoubleTap(x: point.x, y: point.y)
+        }
     }
 
     @objc private func handleRightTap(_ recognizer: UITapGestureRecognizer) {
@@ -2627,7 +2695,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             lastPointerPoint = point
             lastKnownFramebufferPoint = point
         }
-        touchHandler.handleRightClick(x: point.x, y: point.y)
+        clickWithPointerModifiers {
+            touchHandler.handleRightClick(x: point.x, y: point.y)
+        }
     }
 
     @objc private func handleDirectTouchState(
@@ -2688,6 +2758,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             touchHoldDragLastPoint = point
             touchHoldDragActive = true
             lastPointerPoint = point
+            touchHoldModifierOwner = beginPointerModifiers()
             touchHandler.handleDrag(x: point.x, y: point.y)
         case (.drag, .changed):
             guard touchHoldDragActive,
@@ -2744,6 +2815,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             // was never moved to. Sync the pointer first, exactly as the
             // scroll path does, or remote UIs hit-test the previous spot.
             touchHandler.handleMove(x: point.x, y: point.y)
+            touchHoldModifierOwner = beginPointerModifiers()
             touchHandler.handleDrag(x: point.x, y: point.y)
         case (.drag, .changed):
             guard touchHoldDragActive else { return }
@@ -2772,7 +2844,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         focusForHardwareKeyboardIfNeeded(recognizer)
         lastPointerPoint = point
         lastKnownFramebufferPoint = point
-        touchHandler.handleTap(x: point.x, y: point.y)
+        clickWithPointerModifiers {
+            touchHandler.handleTap(x: point.x, y: point.y)
+        }
     }
 
     /// Two-finger scrolling in `.trackpad`, driving the same precise pipeline
@@ -3041,6 +3115,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         if touchHoldDragActive, let point = touchHoldDragLastPoint {
             touchHandler.handleDragEnd(x: point.x, y: point.y)
         }
+        endPointerModifiers(touchHoldModifierOwner)
+        touchHoldModifierOwner = nil
         resetTouchHoldDrag()
     }
 
@@ -3838,7 +3914,9 @@ extension RemoteInputUIView: UIContextMenuInteractionDelegate {
         guard let point = framebufferPoint(for: location) else { return nil }
         catchMomentumFlingIfActive()
         focusForHardwareKeyboard()
-        touchHandler.handleRightClick(x: point.x, y: point.y)
+        clickWithPointerModifiers {
+            touchHandler.handleRightClick(x: point.x, y: point.y)
+        }
         // The remote desktop owns the contextual action; suppress a local menu.
         return nil
     }
@@ -3861,7 +3939,9 @@ extension RemoteInputUIView: UIPencilInteractionDelegate {
             // the tap.
             guard bounds.contains(hoverLocation),
                   let point = framebufferPoint(for: hoverLocation) else { return }
-            touchHandler.handleRightClick(x: point.x, y: point.y)
+            clickWithPointerModifiers {
+                touchHandler.handleRightClick(x: point.x, y: point.y)
+            }
             return
         }
         // No hover data: only the most recently pencil-touched view responds,
@@ -3869,7 +3949,9 @@ extension RemoteInputUIView: UIPencilInteractionDelegate {
         guard Self.lastPencilContactView === self,
               CACurrentMediaTime() - lastPencilContactTimestamp <= Self.pencilBarrelTapRecency,
               let point = lastPencilFramebufferPoint else { return }
-        touchHandler.handleRightClick(x: point.x, y: point.y)
+        clickWithPointerModifiers {
+            touchHandler.handleRightClick(x: point.x, y: point.y)
+        }
     }
 }
 #endif

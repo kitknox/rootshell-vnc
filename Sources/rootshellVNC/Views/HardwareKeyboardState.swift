@@ -53,23 +53,34 @@ struct HardwareKeyboardState: Sendable {
 }
 
 /// Bookkeeping for host-toolbar modifiers wrapped around physical key
-/// presses. A modifier remains down until every overlapping target key that
-/// borrowed it has been released.
+/// presses and pointer presses. A modifier remains down until every
+/// overlapping owner that borrowed it has ended.
 struct SupplementalHardwareModifierState: Sendable {
-    private var keysymsByUsage: [UInt32: [UInt32]] = [:]
+    enum Owner: Hashable, Sendable {
+        /// A physical key, identified by HID usage.
+        case key(UInt32)
+        /// One pointer click or drag, identified by a per-press id.
+        case pointer(UInt64)
+        /// A physical modifier key, identified by the keysym it sends.
+        case physicalModifier(UInt32)
+    }
+
+    private var keysymsByOwner: [Owner: [UInt32]] = [:]
+    private var ownerOrder: [Owner] = []
     private var referenceCounts: [UInt32: Int] = [:]
     private var activationOrder: [UInt32] = []
 
-    func contains(usage: UInt32) -> Bool {
-        keysymsByUsage[usage] != nil
+    func contains(_ owner: Owner) -> Bool {
+        keysymsByOwner[owner] != nil
     }
 
     mutating func begin(
-        usage: UInt32,
+        _ owner: Owner,
         keysyms: [UInt32]
     ) -> [HardwareKeyboardTransition] {
-        guard usage != 0, keysymsByUsage[usage] == nil else { return [] }
-        keysymsByUsage[usage] = keysyms
+        guard owner != .key(0), keysymsByOwner[owner] == nil else { return [] }
+        keysymsByOwner[owner] = keysyms
+        ownerOrder.append(owner)
         var transitions: [HardwareKeyboardTransition] = []
         for keysym in keysyms where keysym != 0 {
             let count = referenceCounts[keysym, default: 0]
@@ -84,10 +95,11 @@ struct SupplementalHardwareModifierState: Sendable {
         return transitions
     }
 
-    mutating func end(usage: UInt32) -> [HardwareKeyboardTransition] {
-        guard let keysyms = keysymsByUsage.removeValue(forKey: usage) else {
+    mutating func end(_ owner: Owner) -> [HardwareKeyboardTransition] {
+        guard let keysyms = keysymsByOwner.removeValue(forKey: owner) else {
             return []
         }
+        ownerOrder.removeAll { $0 == owner }
         var transitions: [HardwareKeyboardTransition] = []
         for keysym in keysyms.reversed() {
             let next = max(0, (referenceCounts[keysym] ?? 1) - 1)
@@ -104,14 +116,54 @@ struct SupplementalHardwareModifierState: Sendable {
         return transitions
     }
 
+    /// Ends every key owner. Keysyms a pointer owner also holds stay down.
+    mutating func releaseKeyOwners() -> [HardwareKeyboardTransition] {
+        endAll { if case .key = $0 { true } else { false } }
+    }
+
+    /// Ends every pointer owner. Keysyms a key owner also holds stay down.
+    mutating func releasePointerOwners() -> [HardwareKeyboardTransition] {
+        endAll { if case .pointer = $0 { true } else { false } }
+    }
+
     mutating func releaseAll() -> [HardwareKeyboardTransition] {
         let transitions = activationOrder.reversed().map {
             HardwareKeyboardTransition(downFlag: false, keysym: $0)
         }
-        keysymsByUsage.removeAll(keepingCapacity: true)
+        keysymsByOwner.removeAll(keepingCapacity: true)
+        ownerOrder.removeAll(keepingCapacity: true)
         referenceCounts.removeAll(keepingCapacity: true)
         activationOrder.removeAll(keepingCapacity: true)
         return transitions
+    }
+
+    private mutating func endAll(
+        where matches: (Owner) -> Bool
+    ) -> [HardwareKeyboardTransition] {
+        var transitions: [HardwareKeyboardTransition] = []
+        for owner in ownerOrder.reversed() where matches(owner) {
+            transitions += end(owner)
+        }
+        return transitions
+    }
+}
+
+/// The input API each shared modifier went down through. Physical-key hosts
+/// track HID and keysym presses separately, so a release must match its press.
+struct ModifierPressRoutes: Sendable {
+    private var usages: [UInt32: UInt32] = [:]
+
+    /// The HID usage to send `transition` with, or nil for the keysym route.
+    /// A release ignores `offered` and reuses whatever its press used.
+    mutating func usage(
+        for transition: HardwareKeyboardTransition,
+        offered: UInt32?
+    ) -> UInt32? {
+        guard transition.downFlag else {
+            return usages.removeValue(forKey: transition.keysym)
+        }
+        usages[transition.keysym] = offered
+        return offered
     }
 }
 
@@ -280,9 +332,16 @@ final class HardwareKeyboardController {
     private var delayTimer: Timer?
     private var repeatTimer: Timer?
     private var repeatingUsage: UInt32?
+    /// Receives every physical modifier transition (usage nil for keysym-only
+    /// sends) so the owner can share it with toolbar-held modifiers.
+    private let routeModifier: (@MainActor (HardwareKeyboardTransition, UInt32?) -> Void)?
 
-    init(keyboardHandler: KeyboardInputHandler) {
+    init(
+        keyboardHandler: KeyboardInputHandler,
+        routeModifier: (@MainActor (HardwareKeyboardTransition, UInt32?) -> Void)? = nil
+    ) {
         self.keyboardHandler = keyboardHandler
+        self.routeModifier = routeModifier
     }
 
     var hasPressedKeys: Bool { !state.isEmpty || !commandModifiers.physical.isEmpty }
@@ -294,7 +353,7 @@ final class HardwareKeyboardController {
     @discardableResult
     func press(usage: UInt32, keysym: UInt32) -> Bool {
         if controlOptionAsCommand, (0xE0...0xE7).contains(usage) {
-            commandModifiers.press(usage: usage, keysym: keysym).forEach(send)
+            commandModifiers.press(usage: usage, keysym: keysym).forEach(sendModifier)
             return true
         }
         guard let transition = state.press(usage: usage, keysym: keysym) else {
@@ -313,7 +372,7 @@ final class HardwareKeyboardController {
     @discardableResult
     func release(usage: UInt32) -> Bool {
         if controlOptionAsCommand, (0xE0...0xE7).contains(usage) {
-            commandModifiers.release(usage: usage).forEach(send)
+            commandModifiers.release(usage: usage).forEach(sendModifier)
             return true
         }
         guard let transition = state.release(usage: usage) else { return false }
@@ -325,7 +384,7 @@ final class HardwareKeyboardController {
     func releaseAll() {
         stopRepeat()
         state.releaseAllWithUsages().forEach { send($0.transition, usage: $0.usage) }
-        commandModifiers.releaseAll().forEach(send)
+        commandModifiers.releaseAll().forEach(sendModifier)
     }
 
     func synchronizeModifiers(_ modifiers: VNCKeyboardModifiers) {
@@ -334,11 +393,7 @@ final class HardwareKeyboardController {
             modifiers: modifiers,
             optionKeysym: KeyboardInputHandler.optionLeftKeysym(
                 appleModifierConvention: keyboardHandler.usesAppleModifierMapping)
-        ).forEach(send)
-    }
-
-    func emitsModifier(keysym: UInt32) -> Bool {
-        commandModifiers.contains(keysym: keysym)
+        ).forEach(sendModifier)
     }
 
     var isControlOptionChordActive: Bool {
@@ -386,7 +441,16 @@ final class HardwareKeyboardController {
             keysym: transition.keysym)
     }
 
+    private func sendModifier(_ transition: HardwareKeyboardTransition) {
+        guard let routeModifier else { return send(transition) }
+        routeModifier(transition, nil)
+    }
+
     private func send(_ transition: HardwareKeyboardTransition, usage: UInt32) {
+        if let routeModifier, (0xE0...0xE7).contains(usage) {
+            routeModifier(transition, usage)
+            return
+        }
         keyboardHandler.handlePhysicalKey(
             downFlag: transition.downFlag,
             usage: usage,
