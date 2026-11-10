@@ -40,6 +40,8 @@ struct RemoteInteractionView: UIViewRepresentable {
     let disconnect: () -> Void
     let remoteCursor: RemoteCursor?
     let remoteCursorPresence: RemoteCursorPresence
+    /// Accepts file drops as uploads when set.
+    var fileTransfers: VNCFileTransferController? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -76,6 +78,9 @@ struct RemoteInteractionView: UIViewRepresentable {
 
     func updateUIView(_ uiView: RemoteInputUIView, context: Context) {
         context.coordinator.parent = self
+        if uiView.fileTransfers !== fileTransfers {
+            uiView.fileTransfers = fileTransfers
+        }
         uiView.update(
             framebufferSize: framebufferSize,
             viewport: viewport,
@@ -116,6 +121,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     var onViewportChange: ((RemoteViewportState) -> Void)?
     var onKeyboardActiveChange: ((Bool) -> Void)?
     var onHardwareKeyboardAttachedChange: ((Bool) -> Void)?
+    var fileTransfers: VNCFileTransferController? {
+        didSet { configureFileDrop() }
+    }
+    private var fileDropInteraction: UIDropInteraction?
+    private var uploadDragActive = false
+    private var lastUploadDropPoint: (x: UInt16, y: UInt16)?
 
     private let touchHandler: TouchInputHandler
     private let keyboardHandler: KeyboardInputHandler
@@ -4540,4 +4551,89 @@ extension RemoteInputUIView: UIPencilInteractionDelegate {
     }
 }
 #endif
+
+/// Files dropped on the remote screen upload into whatever the Mac drops
+/// them on. The Mac's own drag follows the local one while it is over us.
+extension RemoteInputUIView: UIDropInteractionDelegate {
+    fileprivate func configureFileDrop() {
+        if fileTransfers != nil, fileDropInteraction == nil {
+            let interaction = UIDropInteraction(delegate: self)
+            addInteraction(interaction)
+            fileDropInteraction = interaction
+        } else if fileTransfers == nil, let interaction = fileDropInteraction {
+            removeInteraction(interaction)
+            fileDropInteraction = nil
+        }
+    }
+
+    private func fileDropPoint(_ session: UIDropSession) -> (x: UInt16, y: UInt16)? {
+        let location = session.location(in: self)
+        let visible = viewport.nearestVisibleViewPoint(
+            to: location, viewSize: bounds.size, framebufferSize: framebufferSize) ?? location
+        let point = framebufferPoint(for: visible) ?? lastUploadDropPoint
+        lastUploadDropPoint = point
+        return point
+    }
+
+    func dropInteraction(_ interaction: UIDropInteraction, canHandle session: UIDropSession) -> Bool {
+        // Local drags count too (the file manager, downloaded rows); tab and
+        // text drags carry no file type and are skipped by `fileType(for:)`.
+        guard let fileTransfers, fileTransfers.canUpload else { return false }
+        return session.items.contains {
+            VNCFileTransferController.fileType(for: $0.itemProvider) != nil
+        }
+    }
+
+    func dropInteraction(_ interaction: UIDropInteraction, sessionDidEnter session: UIDropSession) {
+        guard !uploadDragActive, let fileTransfers else { return }
+        lastUploadDropPoint = nil
+        guard let point = fileDropPoint(session) else { return }
+        let names = session.items.compactMap {
+            VNCFileTransferController.suggestedName(for: $0.itemProvider)
+        }
+        releasePointerDrag()
+        uploadDragActive = fileTransfers.beginUploadDrag(names: names, x: point.x, y: point.y)
+    }
+
+    func dropInteraction(
+        _ interaction: UIDropInteraction,
+        sessionDidUpdate session: UIDropSession
+    ) -> UIDropProposal {
+        guard uploadDragActive, let point = fileDropPoint(session) else {
+            return UIDropProposal(operation: .cancel)
+        }
+        fileTransfers?.moveUploadDrag(x: point.x, y: point.y)
+        return UIDropProposal(operation: .copy)
+    }
+
+    func dropInteraction(_ interaction: UIDropInteraction, sessionDidExit session: UIDropSession) {
+        guard uploadDragActive else { return }
+        uploadDragActive = false
+        fileTransfers?.cancelUploadDrag()
+    }
+
+    func dropInteraction(_ interaction: UIDropInteraction, performDrop session: UIDropSession) {
+        guard uploadDragActive, let point = fileDropPoint(session) else { return }
+        uploadDragActive = false
+        fileTransfers?.dropUpload(
+            itemProviders: session.items.map(\.itemProvider), x: point.x, y: point.y)
+        // The Mac's pointer is now at the drop; keep the trackpad cursor with it.
+        lastKnownFramebufferPoint = point
+        if var model = trackpadModel {
+            model.place(at: CGPoint(
+                x: CGFloat(point.x) - framebufferOrigin.x,
+                y: CGFloat(point.y) - framebufferOrigin.y))
+            trackpadModel = model
+            #if !targetEnvironment(macCatalyst)
+            refreshTrackpadCursorImage()
+            #endif
+        }
+    }
+
+    func dropInteraction(_ interaction: UIDropInteraction, sessionDidEnd session: UIDropSession) {
+        guard uploadDragActive else { return }
+        uploadDragActive = false
+        fileTransfers?.cancelUploadDrag()
+    }
+}
 #endif

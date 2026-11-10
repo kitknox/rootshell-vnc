@@ -289,7 +289,7 @@ public enum MessageWriter: Sendable {
     /// carrying the server messages a High Performance session accepts.
     public static func writeAppleMediaStreamConfiguration() -> Data {
         writeAppleViewerInfo(acceptedServerMessages: [
-            0, 2, 3, 0x14, 0x15, 0x1e, 0x1f, 0x20, 0x23, 0x49,
+            0, 2, 3, 0x14, 0x15, 0x1e, 0x1f, 0x20, 0x22, 0x23, 0x49,
         ])
     }
 

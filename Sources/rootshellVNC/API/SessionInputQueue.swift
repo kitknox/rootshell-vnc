@@ -17,6 +17,8 @@ enum SessionInputEvent: Sendable, Equatable {
     case scroll(AppleScrollEvent)
     case gesture(AppleGestureEvent)
     case clipboard(ClipboardContent)
+    /// A prebuilt file-transfer message kept in order with pointer input.
+    case fileTransfer(Data)
     case clipboardRequest
     case sharedClipboard(Bool)
     case curtain(enabled: Bool, message: String)

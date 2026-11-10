@@ -249,6 +249,15 @@ public enum SessionEvent: Sendable {
     /// A TCP control stream chunk observed after accepting Apple's media stream.
     case appleMediaControlRecord(encryptedLength: Int, encryptedPrefix: Data, plaintextPrefix: Data?, decryptError: String?)
 
+    /// An upload drag was dropped into this folder on the Mac.
+    case appleUploadRequest(AppleFileTransferProtocol.UploadRequest)
+
+    /// The files being dragged on the Mac, after a drag-out request.
+    case appleDragOutReply(AppleFileTransferProtocol.DragOutReply)
+
+    /// One file-transfer stream message.
+    case appleFileCopy(AppleFileTransferProtocol.ServerMessage)
+
     /// The connection was closed.
     case disconnected
 }
@@ -755,6 +764,14 @@ public actor TransportSession {
     /// This remains nil for regular RFB servers, which therefore use standard
     /// wheel-button input.
     private var appleServerCapabilities: AppleServerCapabilities?
+    private var lastPointerMessageNanos: UInt64 = 0
+    /// Key for encrypted input events: the session key, then the High
+    /// Performance stream key once ComCryption starts.
+    private var appleInputEncryptionKey: Data?
+    /// File data yielded to the session and not yet written.
+    private var outstandingFileTransferBytes = 0
+    private var fileTransferCreditWaiter: CheckedContinuation<Void, Never>?
+    static let maximumOutstandingFileTransferBytes = 8 * 1024 * 1024
     private var appleClipboardRequestID: UInt32 = 0
     private var sharedClipboardEnabled = false
     /// A negative cut-text length means ExtendedClipboard only after a
@@ -1023,8 +1040,24 @@ public actor TransportSession {
 
     /// Send a key event to the server.
     public func sendKeyEvent(downFlag: Bool, key: UInt32) async throws {
-        let msg = ClientMessage.keyEvent(downFlag: downFlag, key: key)
-        try await sendClientPayload(msg.serialize())
+        try await sendClientPayload(keyMessage(downFlag: downFlag, keysym: key))
+    }
+
+    /// The input key for command 0x10, when this Mac server takes it.
+    private var appleEncryptedInputKey: Data? {
+        guard appleServerCapabilities?.supportsServerCommand(
+            AppleEncryptedInput.messageType) == true else { return nil }
+        return appleInputEncryptionKey ?? appleSessionKey
+    }
+
+    /// Mac servers that take command 0x10 get keystrokes encrypted; the Mac
+    /// maps the keysym exactly as for an RFB KeyEvent.
+    private func keyMessage(downFlag: Bool, keysym: UInt32) -> Data {
+        if let key = appleEncryptedInputKey,
+           let message = AppleEncryptedInput.keyMessage(down: downFlag, keysym: keysym, key: key) {
+            return message
+        }
+        return ClientMessage.keyEvent(downFlag: downFlag, key: keysym).serialize()
     }
 
     /// Send a run of key/pointer events as one socket write. The queue-side
@@ -1037,15 +1070,10 @@ public actor TransportSession {
         for event in events {
             switch event {
             case .key(let downFlag, let key):
-                payload.append(ClientMessage.keyEvent(
-                    downFlag: downFlag, key: key).serialize())
+                payload.append(keyMessage(downFlag: downFlag, keysym: key))
             case .pointer(let buttonMask, let x, let y):
-                let wireButtonMask = Self.pointerButtonMaskForWire(
-                    buttonMask,
-                    serverVersion: stateMachine.negotiatedVersion)
                 pointerButtonMask = buttonMask
-                payload.append(ClientMessage.pointerEvent(
-                    buttonMask: wireButtonMask, x: x, y: y).serialize())
+                payload.append(pointerMessage(buttonMask: buttonMask, x: x, y: y))
             }
         }
         try await sendClientPayload(payload)
@@ -1054,13 +1082,28 @@ public actor TransportSession {
     /// Send a pointer (mouse/touch) event to the server.
     public func sendPointerEvent(buttonMask: UInt8, x: UInt16, y: UInt16) async throws {
         pointerButtonMask = buttonMask
-        let msg = ClientMessage.pointerEvent(
-            buttonMask: Self.pointerButtonMaskForWire(
-                buttonMask,
-                serverVersion: stateMachine.negotiatedVersion),
-            x: x,
-            y: y)
-        try await sendClientPayload(msg.serialize())
+        try await sendClientPayload(pointerMessage(buttonMask: buttonMask, x: x, y: y))
+    }
+
+    /// Mac servers that take command 0x10 get the encrypted mouse event, which
+    /// is also how the Mac learns which viewer owns a drag. Others get RFB's.
+    private func pointerMessage(buttonMask: UInt8, x: UInt16, y: UInt16) -> Data {
+        let wireButtonMask = Self.pointerButtonMaskForWire(
+            buttonMask,
+            serverVersion: stateMachine.negotiatedVersion)
+        let now = DispatchTime.now().uptimeNanoseconds
+        defer { lastPointerMessageNanos = now }
+        if wireButtonMask & ~AppleEncryptedInput.buttonBits == 0,
+           let key = appleEncryptedInputKey {
+            let delta = lastPointerMessageNanos == 0 ? 0 : (now &- lastPointerMessageNanos) / 1_000
+            if let message = AppleEncryptedInput.mouseMessage(
+                buttons: wireButtonMask, x: x, y: y,
+                timeDeltaMicroseconds: UInt32(clamping: delta), key: key) {
+                return message
+            }
+        }
+        return ClientMessage.pointerEvent(
+            buttonMask: wireButtonMask, x: x, y: y).serialize()
     }
 
     /// Apple RFB 3.889 uses native macOS button ordering: right is bit 1 and
@@ -1191,6 +1234,19 @@ public actor TransportSession {
                 for: extendedClipboard.acceptedFormats)
         }
         return .plainText
+    }
+
+    public var supportsAppleFileUpload: Bool {
+        AppleFileTransferProtocol.supportsUpload(appleServerCapabilities)
+    }
+
+    public var supportsAppleFileDownload: Bool {
+        AppleFileTransferProtocol.supportsDownload(appleServerCapabilities)
+    }
+
+    /// Send one prebuilt file-transfer message on the control channel.
+    public func sendAppleFileTransferMessage(_ message: Data) async throws {
+        try await sendClientPayload(message)
     }
 
     public var supportsRemoteClipboardRequest: Bool {
@@ -2093,11 +2149,16 @@ public actor TransportSession {
     /// Server messages `readLoop` parses. Advertising any other type in viewer
     /// info would let the server send one that ends the session.
     static let standardAcceptedServerMessages: [UInt8] = [
-        0, 2, 3, 0x14, AppleClipboardProtocol.packedScrapMessageType,
+        0, 2, 3, 0x14,
+        AppleFileTransferProtocol.uploadRequestMessageType,
+        AppleClipboardProtocol.packedScrapMessageType,
+        AppleFileTransferProtocol.dragMessageType,
+        AppleFileTransferProtocol.fileCopyMessageType,
     ]
 
     private func readLoop() async {
         while !Task.isCancelled {
+            await waitForFileTransferCredit()
             do {
                 if acceptedAppleMediaStream, hasEncryptedAppleMediaControl {
                     try await drainAppleMediaControlRecord()
@@ -2120,6 +2181,12 @@ public actor TransportSession {
                     try await handleApplePackedClipboard()
                 case 0x14:
                     try await handleAppleAutoPasteboardInfo()
+                case AppleFileTransferProtocol.uploadRequestMessageType:
+                    try await handleAppleUploadRequest()
+                case AppleFileTransferProtocol.dragMessageType:
+                    try await handleAppleDragOutReply()
+                case AppleFileTransferProtocol.fileCopyMessageType:
+                    try await handleAppleFileCopy()
                 default:
                     log.warning("Unknown server message type: \(messageType)")
                     throw VNCProtocolError.protocolViolation(
@@ -2874,6 +2941,37 @@ public actor TransportSession {
         decodeApplePackedClipboard(
             compressed,
             uncompressedLength: uncompressedLength)
+    }
+
+    // readLoop consumed each type byte below.
+    private func handleAppleUploadRequest() async throws {
+        let header = Data([AppleFileTransferProtocol.uploadRequestMessageType])
+            + (try await readControlChannel(
+                exactly: AppleFileTransferProtocol.uploadRequestHeaderSize - 1))
+        let path = try await readControlChannel(
+            exactly: AppleFileTransferProtocol.uploadRequestPathLength(header: header))
+        if let request = AppleFileTransferProtocol.uploadRequest(header: header, path: path) {
+            continuation?.yield(.appleUploadRequest(request))
+        }
+    }
+
+    private func handleAppleDragOutReply() async throws {
+        let header = Data([AppleFileTransferProtocol.dragMessageType])
+            + (try await readControlChannel(exactly: AppleFileTransferProtocol.dragHeaderSize - 1))
+        let compressed = try await readControlChannel(
+            exactly: AppleFileTransferProtocol.dragOutReplyLength(header: header))
+        continuation?.yield(.appleDragOutReply(
+            AppleFileTransferProtocol.dragOutReply(header: header, compressed: compressed)))
+    }
+
+    private func handleAppleFileCopy() async throws {
+        let prefix = Data([AppleFileTransferProtocol.fileCopyMessageType])
+            + (try await readControlChannel(exactly: AppleFileTransferProtocol.fileCopyPrefixSize - 1))
+        let payload = try await readControlChannel(
+            exactly: AppleFileTransferProtocol.fileCopyPayloadLength(prefix: prefix))
+        if let message = AppleFileTransferProtocol.serverMessage(payload: payload) {
+            yieldFileCopy(message)
+        }
     }
 
     private func handleAppleAutoPasteboardInfo() async throws {
@@ -4059,6 +4157,10 @@ public actor TransportSession {
                         let record = try decryptAppleMediaComCryptionRecord(encryptedRecord)
                         dumpAppleMediaPlaintextIfRequested(record.payload)
                         dumpAppleMediaServerRecordIfRequested(record.payload)
+                        if isAppleFileTransferRecord(record.payload) {
+                            try await ingestAppleDecryptedRFBPayload(record.payload)
+                            continue
+                        }
                         plaintextPrefix = record.plaintextPrefix
                         decryptError = describeAppleMediaPlaintext(record.payload)
                         if try await handleAppleMediaServerControlIfPresent(record.payload) {
@@ -4093,6 +4195,10 @@ public actor TransportSession {
                     do {
                         let plaintext = try channel.decrypt(encryptedRecord)
                         dumpAppleMediaServerRecordIfRequested(plaintext)
+                        if isAppleFileTransferRecord(plaintext) {
+                            try await ingestAppleDecryptedRFBPayload(plaintext)
+                            continue
+                        }
                         plaintextPrefix = Data(plaintext.prefix(64))
                         decryptError = describeAppleMediaPlaintext(plaintext)
                         if try await handleAppleMediaServerControlIfPresent(plaintext) {
@@ -4171,6 +4277,10 @@ public actor TransportSession {
                 guard try drainAppleDecryptedServerCutText() else { return }
             case AppleClipboardProtocol.packedScrapMessageType:
                 guard try drainAppleDecryptedPackedClipboard() else { return }
+            case AppleFileTransferProtocol.uploadRequestMessageType,
+                 AppleFileTransferProtocol.dragMessageType,
+                 AppleFileTransferProtocol.fileCopyMessageType:
+                guard try drainAppleDecryptedFileTransfer(messageType) else { return }
             case 0x14:
                 guard base + 8 <= appleDecryptedRFBBuffer.endIndex else {
                     return
@@ -4212,12 +4322,98 @@ public actor TransportSession {
         _ messageType: UInt8
     ) -> Bool {
         switch messageType {
+        // File-transfer types are matched on their whole header instead
+        // (`appleFileTransferMessageStarts`): media controls can start with them.
         case 0, 2, 3, 0x14,
              AppleClipboardProtocol.packedScrapMessageType:
             return true
         default:
             return false
         }
+    }
+
+    /// File-transfer records, including the rest of a message split across
+    /// records, bypass the media scanners: file bytes can look like RTP.
+    private func isAppleFileTransferRecord(_ payload: Data) -> Bool {
+        if let pending = appleDecryptedRFBBuffer.first {
+            return pending == AppleFileTransferProtocol.fileCopyMessageType
+                || pending == AppleFileTransferProtocol.dragMessageType
+                || pending == AppleFileTransferProtocol.uploadRequestMessageType
+        }
+        return appleFileTransferMessageStarts(in: payload)
+    }
+
+    /// Returns false until the whole message is buffered.
+    private func drainAppleDecryptedFileTransfer(_ messageType: UInt8) throws -> Bool {
+        let buffer = appleDecryptedRFBBuffer
+        let base = buffer.startIndex
+        let available = buffer.endIndex - base
+        func slice(_ start: Int, _ end: Int) -> Data { Data(buffer[base + start..<base + end]) }
+
+        let end: Int
+        let event: SessionEvent?
+        switch messageType {
+        case AppleFileTransferProtocol.uploadRequestMessageType:
+            let headerSize = AppleFileTransferProtocol.uploadRequestHeaderSize
+            guard available >= headerSize else { return false }
+            let header = slice(0, headerSize)
+            end = headerSize + (try AppleFileTransferProtocol.uploadRequestPathLength(header: header))
+            guard available >= end else { return false }
+            event = AppleFileTransferProtocol.uploadRequest(header: header, path: slice(headerSize, end))
+                .map { .appleUploadRequest($0) }
+        case AppleFileTransferProtocol.dragMessageType:
+            let headerSize = AppleFileTransferProtocol.dragHeaderSize
+            guard available >= headerSize else { return false }
+            let header = slice(0, headerSize)
+            end = headerSize + (try AppleFileTransferProtocol.dragOutReplyLength(header: header))
+            guard available >= end else { return false }
+            event = .appleDragOutReply(AppleFileTransferProtocol.dragOutReply(
+                header: header, compressed: slice(headerSize, end)))
+        default:
+            let prefixSize = AppleFileTransferProtocol.fileCopyPrefixSize
+            guard available >= prefixSize else { return false }
+            end = prefixSize + (try AppleFileTransferProtocol.fileCopyPayloadLength(
+                prefix: slice(0, prefixSize)))
+            guard available >= end else { return false }
+            let message = AppleFileTransferProtocol.serverMessage(payload: slice(prefixSize, end))
+            appleDecryptedRFBBuffer.removeSubrange(base..<base + end)
+            if let message { yieldFileCopy(message) }
+            return true
+        }
+        appleDecryptedRFBBuffer.removeSubrange(base..<base + end)
+        if let event { continuation?.yield(event) }
+        return true
+    }
+
+    /// Counts file data until the session reports it written.
+    private func yieldFileCopy(_ message: AppleFileTransferProtocol.ServerMessage) {
+        outstandingFileTransferBytes += message.dataByteCount
+        continuation?.yield(.appleFileCopy(message))
+    }
+
+    /// The session wrote `count` bytes of file data from ``SessionEvent/appleFileCopy(_:)``.
+    public func acknowledgeFileTransferBytes(_ count: Int) {
+        outstandingFileTransferBytes = max(0, outstandingFileTransferBytes - count)
+        guard outstandingFileTransferBytes <= Self.maximumOutstandingFileTransferBytes else { return }
+        releaseFileTransferCreditWaiter()
+    }
+
+    /// Stops reading while disk writes lag behind, so the Mac's sender waits
+    /// on TCP instead of the download piling up in memory.
+    private func waitForFileTransferCredit() async {
+        while outstandingFileTransferBytes > Self.maximumOutstandingFileTransferBytes,
+              !Task.isCancelled {
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { fileTransferCreditWaiter = $0 }
+            } onCancel: {
+                Task { await self.releaseFileTransferCreditWaiter() }
+            }
+        }
+    }
+
+    private func releaseFileTransferCreditWaiter() {
+        fileTransferCreditWaiter?.resume()
+        fileTransferCreditWaiter = nil
     }
 
     private func drainAppleDecryptedFramebufferUpdate() async throws -> Bool {
@@ -4473,6 +4669,8 @@ public actor TransportSession {
         applePreviousMediaComCryptionChannel = appleMediaComCryptionChannel
         applePreviousMediaServerPacketID = appleMediaServerPacketID
         appleMediaComCryptionChannel = try AppleComCryptionChannel(key: key, iv: iv)
+        // From here the Mac decrypts input events with the stream key too.
+        appleInputEncryptionKey = key
         appleMediaServerPacketID = 0
         appleMediaClientPacketID = 0
         // Encrypted session: SRTP keys will follow on the control channel, so

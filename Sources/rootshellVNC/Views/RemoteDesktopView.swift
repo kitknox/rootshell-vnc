@@ -55,6 +55,7 @@ public struct RemoteDesktopView: View {
     #if canImport(UIKit)
     @State private var keyboardViewportMetrics = DockedKeyboardViewportMetrics()
     @State private var hardwareKeyboardAttached = false
+    @State private var showsFileTransfers = false
     #endif
 
     #if !canImport(UIKit)
@@ -256,6 +257,13 @@ public struct RemoteDesktopView: View {
 
                     viewportControls
 
+                    #if canImport(UIKit)
+                    fileTransferOverlay(
+                        viewSize: geometry.size,
+                        framebufferSize: framebufferSize,
+                        framebufferOrigin: framebufferOrigin)
+                    #endif
+
                     VNCCurtainPrompt(
                         session: session,
                         isPresented: $curtainPromptPresented)
@@ -435,7 +443,8 @@ public struct RemoteDesktopView: View {
             // Apple's adaptive profile asks the server for cached cursor
             // images so the responsive local pointer can adopt their shape.
             remoteCursor: session.remoteCursor,
-            remoteCursorPresence: session.remoteCursorPresence)
+            remoteCursorPresence: session.remoteCursorPresence,
+            fileTransfers: session.fileTransfers)
             .frame(width: viewSize.width, height: viewSize.height)
             .contentShape(Rectangle())
         #else
@@ -473,6 +482,94 @@ public struct RemoteDesktopView: View {
         .allowsHitTesting(true)
         #endif
     }
+
+    #if canImport(UIKit)
+    private struct DragOutTargetGeometry: Equatable {
+        let viewSize: CGSize
+        let framebufferSize: CGSize
+        let framebufferOrigin: CGPoint
+        let viewport: RemoteViewportState
+    }
+
+    @ViewBuilder
+    private func fileTransferOverlay(
+        viewSize: CGSize,
+        framebufferSize: CGSize,
+        framebufferOrigin: CGPoint
+    ) -> some View {
+        let transfers = session.fileTransfers
+        let geometry = DragOutTargetGeometry(
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            framebufferOrigin: framebufferOrigin,
+            viewport: viewport)
+        ZStack {
+            if transfers.showsDragOutTarget, let target = dragOutTargetFrame(geometry) {
+                VNCDragOutTargetView(
+                    names: transfers.remoteDraggedNames,
+                    isTargeted: transfers.remoteDragOverTarget)
+                    .position(x: target.midX, y: target.midY)
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+            }
+            if showsFileTransfers {
+                VNCFileTransfersPanel(controller: transfers) {
+                    showsFileTransfers = false
+                }
+                .padding(16)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.easeOut(duration: 0.15), value: transfers.showsDragOutTarget)
+        .animation(.easeOut(duration: 0.2), value: showsFileTransfers)
+        .onAppear { updateDragOutTarget(geometry) }
+        .onChange(of: geometry) { _, newGeometry in
+            updateDragOutTarget(newGeometry)
+        }
+        .onChange(of: transfers.transfers.count) { oldCount, newCount in
+            if newCount > oldCount { showsFileTransfers = true }
+        }
+    }
+
+    /// Top center of the visible remote screen, where a Mac's menu bar sits.
+    private func dragOutTargetFrame(_ geometry: DragOutTargetGeometry) -> CGRect? {
+        guard let frame = geometry.viewport.displayedFrame(
+            viewSize: geometry.viewSize,
+            framebufferSize: geometry.framebufferSize) else { return nil }
+        let visible = frame.intersection(CGRect(origin: .zero, size: geometry.viewSize))
+        let size = VNCDragOutTargetView.size
+        guard !visible.isNull, visible.height > size.height * 3 else { return nil }
+        let width = min(size.width, visible.width - 16)
+        return CGRect(
+            x: visible.midX - width / 2,
+            y: visible.minY + 16,
+            width: width,
+            height: size.height)
+    }
+
+    private func updateDragOutTarget(_ geometry: DragOutTargetGeometry) {
+        let transfers = session.fileTransfers
+        func remotePoint(_ point: CGPoint) -> CGPoint? {
+            geometry.viewport.framebufferPoint(
+                for: point,
+                viewSize: geometry.viewSize,
+                framebufferSize: geometry.framebufferSize)
+        }
+        guard let frame = dragOutTargetFrame(geometry),
+              let topLeft = remotePoint(CGPoint(x: frame.minX, y: frame.minY)),
+              let bottomRight = remotePoint(CGPoint(x: frame.maxX - 0.5, y: frame.maxY - 0.5)) else {
+            if transfers.dragOutTarget != nil { transfers.dragOutTarget = nil }
+            return
+        }
+        let rect = CGRect(
+            x: topLeft.x + geometry.framebufferOrigin.x,
+            y: topLeft.y + geometry.framebufferOrigin.y,
+            width: bottomRight.x - topLeft.x,
+            height: bottomRight.y - topLeft.y)
+        if transfers.dragOutTarget != rect { transfers.dragOutTarget = rect }
+    }
+    #endif
 
     @ViewBuilder
     private var hudMenu: some View {
@@ -533,6 +630,21 @@ public struct RemoteDesktopView: View {
                     onSharedClipboardUserChange: onSharedClipboardUserChange
                 )
             }
+
+            #if canImport(UIKit)
+            if session.fileTransfers.canUpload || session.fileTransfers.canDownload
+                || !session.fileTransfers.transfers.isEmpty {
+                Button {
+                    showsFileTransfers.toggle()
+                } label: {
+                    Label(
+                        showsFileTransfers
+                            ? String(localized: "Hide File Transfers", bundle: .module)
+                            : String(localized: "File Transfers", bundle: .module),
+                        systemImage: "arrow.up.arrow.down.circle")
+                }
+            }
+            #endif
 
             Divider()
 

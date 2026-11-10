@@ -766,7 +766,7 @@ final class TransportSessionScriptedTests: XCTestCase {
 
         var expected = Data([0x81])
         expected.append(ClientMessage.appleViewerInfo(
-            acceptedServerMessages: [0, 2, 3, 0x14, 0x1f]).serialize())
+            acceptedServerMessages: [0, 2, 3, 0x14, 0x1e, 0x1f, 0x20, 0x22]).serialize())
         expected.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
         let handshakeBytes = ProtocolVersion.apple.wireBytes().count + 1
         let sent = await connection.sentBytes()

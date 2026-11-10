@@ -59,13 +59,75 @@ func appleRFBServerMessageOffset(in payload: Data) -> Int? {
         case 0x14, AppleClipboardProtocol.packedScrapMessageType:
             return true
         default:
-            return false
+            return appleFileTransferMessageStarts(in: payload, at: offset)
         }
     }
 
     if isMessage(at: 0) { return 0 }
     if isMessage(at: 2) { return 2 }
     return nil
+}
+
+/// Whether a file-transfer message starts at `offset`. Some media-control
+/// records begin with a small length byte that equals these message types,
+/// so each type is matched on its whole header, not its first byte. A record
+/// that ends inside the header matches when every byte present fits, so the
+/// rest is buffered instead of the bytes being reframed.
+func appleFileTransferMessageStarts(in payload: Data, at offset: Int = 0) -> Bool {
+    guard offset >= 0, payload.count > offset else { return false }
+    let start = payload.startIndex + offset
+    let available = payload.count - offset
+    func fits(_ index: Int, _ test: (UInt8) -> Bool) -> Bool {
+        index >= available || test(payload[start + index])
+    }
+    func uint32(_ index: Int) -> Int? {
+        index + 4 <= available
+            ? AppleClipboardProtocol.uint32BE(payload, at: start + index).map(Int.init)
+            : nil
+    }
+    func uint16(_ index: Int) -> Int? {
+        index + 2 <= available
+            ? Int(payload[start + index]) << 8 | Int(payload[start + index + 1])
+            : nil
+    }
+    switch payload[start] {
+    case AppleFileTransferProtocol.fileCopyMessageType:
+        // Type, zero, U32 length (at most 1 MiB), U16 version 1, server command.
+        guard fits(1, { $0 == 0 }), fits(2, { $0 == 0 }), fits(3, { $0 <= 0x10 }),
+              fits(6, { $0 == 0 }), fits(7, { $0 == 1 }) else { return false }
+        if let length = uint32(2),
+           !(8...AppleFileTransferProtocol.maximumFileCopyLength).contains(length) {
+            return false
+        }
+        if let command = uint16(8), ![0x64, 0x65, 0x66, 0x67, 0x68, 0xc8, 0x12c].contains(command) {
+            return false
+        }
+        return true
+    case AppleFileTransferProtocol.dragMessageType:
+        // Drag-out reply: zero padding, handle, sizes, then a zlib stream.
+        guard fits(1, { $0 == 0 }), fits(2, { $0 == 0 }), fits(3, { $0 == 0 }),
+              fits(16, { $0 == 0x78 }) else { return false }
+        let uncompressed = uint32(8)
+        if let uncompressed,
+           !(1...AppleFileTransferProtocol.maximumDragScrapSize).contains(uncompressed) {
+            return false
+        }
+        if let compressed = uint32(12),
+           compressed == 0 || compressed > (uncompressed ?? 0) + 1024 {
+            return false
+        }
+        return true
+    case AppleFileTransferProtocol.uploadRequestMessageType:
+        // Upload request: a POSIX folder path follows the 12-byte header.
+        let header = AppleFileTransferProtocol.uploadRequestHeaderSize
+        if let pathLength = uint32(8),
+           !(1...AppleFileTransferProtocol.maximumPathLength).contains(pathLength) {
+            return false
+        }
+        return fits(header, { $0 == UInt8(ascii: "/") })
+    default:
+        return false
+    }
 }
 
 /// Flags at byte 6 of Apple's media-server configuration message.

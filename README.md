@@ -33,6 +33,9 @@ small standalone viewer used to develop it.
 - Match Client sizing and live display reconfiguration
 - Apple precise scrolling and native gesture events, with portable RFB fallbacks
 - Shared and manual clipboard transfers that keep images and rich text
+- Drag-and-drop file transfer with progress and cancel: files dropped on the
+  screen copy into the Mac folder they land on, and files dragged to the
+  download target on the Mac's screen are saved on the device
 - Remote curtain control and Apple login-window detection with an explicit
   user-confirmed password-send flow
 
@@ -47,6 +50,8 @@ small standalone viewer used to develop it.
   package to run through an SSH direct-tcpip channel, tssh tunnel, or another
   application-owned transport
 - Encrypted Apple control and media channels, including SRTP/SRTCP support
+- Encrypted keyboard and pointer input to Macs in Standard and High
+  Performance sessions
 
 ### Native client experience
 
