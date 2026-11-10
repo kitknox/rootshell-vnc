@@ -201,6 +201,26 @@ struct RemoteViewportState: Equatable, Sendable {
         return CGPoint(x: x, y: y)
     }
 
+    /// The nearest view point on the visible desktop, for a drag that has
+    /// left it. Max edges are half-open, so they stay half a remote pixel in.
+    func nearestVisibleViewPoint(
+        to viewPoint: CGPoint,
+        viewSize: CGSize,
+        framebufferSize: CGSize
+    ) -> CGPoint? {
+        guard viewPoint.x.isFinite, viewPoint.y.isFinite,
+              let frame = displayedFrame(
+                  viewSize: viewSize,
+                  framebufferSize: framebufferSize) else { return nil }
+        let visible = frame.intersection(CGRect(origin: .zero, size: viewSize))
+        guard !visible.isNull, visible.width > 0, visible.height > 0 else { return nil }
+        let insetX = min(visible.width, frame.width / framebufferSize.width) / 2
+        let insetY = min(visible.height, frame.height / framebufferSize.height) / 2
+        return CGPoint(
+            x: min(max(viewPoint.x, visible.minX), visible.maxX - insetX),
+            y: min(max(viewPoint.y, visible.minY), visible.maxY - insetY))
+    }
+
     /// Inverse of `framebufferPoint(for:viewSize:framebufferSize:)`.
     ///
     /// Deliberately does not require the result to be on screen: a virtual

@@ -20,6 +20,7 @@ struct RemoteInteractionView: UIViewRepresentable {
     let serverRendersCursor: Bool
     /// Dot over a server-drawn pointer; see `RemoteScreenView`.
     let showsLocalCursorDot: Bool
+    let touchGestures: RemoteTouchGestureConfiguration
     @Binding var keyboardActive: Bool
     @Binding var hardwareKeyboardAttached: Bool
 
@@ -84,6 +85,7 @@ struct RemoteInteractionView: UIViewRepresentable {
             cursorHeight: cursorHeight,
             serverRendersCursor: serverRendersCursor,
             showsLocalCursorDot: showsLocalCursorDot,
+            touchGestures: touchGestures,
             keyboardActive: keyboardActive,
             keyboardCaptured: keyboardCapture.isCaptured
                 && !suspendsKeyboardCapture,
@@ -171,6 +173,16 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private var pointerDragActive = false
     private var touchHoldDragLastPoint: (x: UInt16, y: UInt16)?
     private var touchHoldDragActive = false
+    /// The button the current touch hold presses: one finger holds left,
+    /// two hold right, three hold middle.
+    private var touchHoldDragButton = RemotePointerButton.left
+    private var touchGestures = RemoteTouchGestureConfiguration.standard
+    private var swipeTracker = MultiFingerSwipeTracker()
+    private lazy var buttonIndicator = TouchButtonIndicatorView()
+    /// A mouse or trackpad press of a button other than primary. UIKit gives
+    /// those no recognizer, so raw touches (iPad, visionOS) or GameController
+    /// (Catalyst middle button) drive it from press to release.
+    private var physicalButtonPress: PhysicalButtonPress?
     private var lastKnownFramebufferPoint: (x: UInt16, y: UInt16)?
     private var lastScrollPoint: (x: UInt16, y: UInt16)?
     private var scrollPointAccumulator = ScrollPointAccumulator()
@@ -191,7 +203,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private var momentumDisplayLink: CADisplayLink?
     private var edgeScrollPointerLocation: CGPoint?
     private var edgeScrollLastTimestamp: CFTimeInterval = 0
-    private var edgeScrollIsDragging = false
+    /// The button an edge-scroll step holds, or nil while only hovering.
+    private var edgeScrollDragButton: RemotePointerButton?
     private var edgeScrollDisplayLink: CADisplayLink?
     private var pointerDragIsPencil = false
     /// Last pencil drag position and time, for barrel-tap right-clicks on
@@ -292,6 +305,23 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private lazy var trackpadScrollRecognizer = UIPanGestureRecognizer(
         target: self,
         action: #selector(handleTrackpadScroll(_:)))
+    /// Three-finger tap middle-clicks where a two-finger tap would right-click.
+    private lazy var middleTapRecognizer = UITapGestureRecognizer(
+        target: self,
+        action: #selector(handleMiddleTap(_:)))
+    /// Still fingers that outlast the hold delay press a button and drag with
+    /// it, in both pointer modes: two fingers hold right, three hold middle.
+    private lazy var twoFingerHoldRecognizer = MultiFingerHoldGestureRecognizer(
+        fingerCount: 2,
+        target: self,
+        action: #selector(handleMultiFingerHold(_:)))
+    private lazy var threeFingerHoldRecognizer = MultiFingerHoldGestureRecognizer(
+        fingerCount: 3,
+        target: self,
+        action: #selector(handleMultiFingerHold(_:)))
+    private lazy var threeFingerSwipeRecognizer = UIPanGestureRecognizer(
+        target: self,
+        action: #selector(handleThreeFingerSwipe(_:)))
     private lazy var hoverRecognizer = UIHoverGestureRecognizer(
         target: self,
         action: #selector(handleHover(_:)))
@@ -732,6 +762,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         // event that only the context-menu machinery consumes — it never
         // reaches touchesBegan or tap recognizers, even with buttonMaskRequired.
         addInteraction(secondaryClickInteraction)
+        Self.installCatalystMouseButtonHandlers()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(mouseDidConnect(_:)),
+            name: .GCMouseDidConnect,
+            object: nil)
         #else
         addInteraction(pointerInteraction)
         #if !os(visionOS)
@@ -795,6 +831,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
 
     override var canBecomeFirstResponder: Bool { true }
 
+    /// Three-finger swipes, taps and holds belong to the remote desktop, not
+    /// to the system's undo, redo and paste gestures.
+    override var editingInteractionConfiguration: UIEditingInteractionConfiguration {
+        .none
+    }
+
     override func becomeFirstResponder() -> Bool {
         let became = super.becomeFirstResponder()
         if became { configureHardwareKeyboardMonitor(for: GCKeyboard.coalesced) }
@@ -810,6 +852,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         if newWindow == nil {
             releasePointerDrag()
             releaseTouchHoldDrag()
+            releasePhysicalButtonPress()
             releaseAllPressedKeys()
             releasePointerModifiersNow()
             cancelScrollInteraction()
@@ -860,6 +903,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         cursorHeight: CGFloat,
         serverRendersCursor: Bool,
         showsLocalCursorDot: Bool,
+        touchGestures: RemoteTouchGestureConfiguration,
         keyboardActive: Bool,
         keyboardCaptured: Bool,
         inputViewsGeneration: UInt64,
@@ -902,6 +946,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             #else
             pointerInteraction.invalidate()
             #endif
+        }
+        if self.touchGestures != touchGestures {
+            self.touchGestures = touchGestures
+            applyTouchGestureConfiguration()
         }
         if self.pointerMode != pointerMode {
             let previousPointerMode = self.pointerMode
@@ -2022,6 +2070,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         releaseAllPressedKeys()
         releasePointerDrag()
         releaseTouchHoldDrag()
+        releasePhysicalButtonPress()
         releasePointerModifiersNow()
         stopEdgeScrolling()
         #if !targetEnvironment(macCatalyst)
@@ -2035,6 +2084,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         releaseAllPressedKeys()
         releasePointerDrag()
         releaseTouchHoldDrag()
+        releasePhysicalButtonPress()
         releasePointerModifiersNow()
         stopEdgeScrolling()
         #if !targetEnvironment(macCatalyst)
@@ -2291,6 +2341,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         if touches.contains(where: { $0.type == .direct }) {
             stopEdgeScrolling()
+            catchMomentumForMultiFingerLanding(touches, event: event)
         }
         if touches.contains(where: { $0.type != .direct }) {
             catchMomentumFlingIfActive()
@@ -2299,32 +2350,224 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         // Catalyst never delivers secondary clicks as indirect-pointer
         // touches; they arrive as a touchless button event consumed by
         // secondaryClickInteraction instead.
-        handleSecondaryPointerDown(in: touches, event: event)
+        beginPhysicalButtonPress(in: touches, event: event)
         #endif
         super.touchesBegan(touches, with: event)
     }
 
-    /// A context-menu interaction also owns held primary-button input, which
-    /// can cancel a Finder drag before it moves. Route an actual trackpad
-    /// secondary button from its raw mask instead, leaving primary holds under
-    /// the dedicated drag recognizer's exclusive control.
-    private func handleSecondaryPointerDown(
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if let touch = physicalButtonPressTouch(in: touches) {
+            continuePhysicalButtonPress(at: touch.location(in: self))
+        }
+        super.touchesMoved(touches, with: event)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if physicalButtonPressTouch(in: touches) != nil {
+            releasePhysicalButtonPress()
+        }
+        super.touchesEnded(touches, with: event)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if physicalButtonPressTouch(in: touches) != nil {
+            releasePhysicalButtonPress()
+        }
+        super.touchesCancelled(touches, with: event)
+    }
+
+    /// Fingers that land together never reach the one-finger recognizer's
+    /// touch-down hook, so a fling they stop is caught here. As with one
+    /// finger, the catching touch must not click or hold a button.
+    private func catchMomentumForMultiFingerLanding(
+        _ touches: Set<UITouch>,
+        event: UIEvent?
+    ) {
+        let landed = touches.filter { $0.type == .direct }.count
+        let down = event?.allTouches?.filter { $0.type == .direct }.count ?? landed
+        guard landed >= 2, landed == down else { return }
+        momentumCatchPending = catchMomentumFlingIfActive()
+        momentumCatchTimestamp = momentumCatchPending ? CACurrentMediaTime() : 0
+    }
+
+    // MARK: Physical non-primary buttons
+
+    private struct PhysicalButtonPress {
+        let button: RemotePointerButton
+        /// The indirect-pointer touch carrying the press; nil when
+        /// GameController reports it instead.
+        let touch: ObjectIdentifier?
+        let modifierOwner: UInt64?
+        /// Where the button goes up; cleanup may clear `lastPointerPoint` first.
+        var lastPoint: (x: UInt16, y: UInt16)
+    }
+
+    /// The context-menu interaction and the zero-delay drag recognizer both
+    /// own primary input, so other buttons are read from the raw mask: a real
+    /// press, drag and release rather than a click fired on button-down.
+    private func beginPhysicalButtonPress(
         in touches: Set<UITouch>,
         event: UIEvent?
     ) {
-        guard let event,
-              event.buttonMask.contains(.secondary),
-              !event.buttonMask.contains(.primary),
+        guard physicalButtonPress == nil, !pointerDragActive,
+              let event,
+              let button = Self.physicalButton(for: event.buttonMask),
               let touch = touches.first(where: {
                   $0.type == .indirectPointer
               }),
               let point = framebufferPoint(
                   for: touch.location(in: self)) else { return }
         focusForHardwareKeyboard()
-        clickWithPointerModifiers {
-            touchHandler.handleRightClick(x: point.x, y: point.y)
+        beginPhysicalButtonPress(button, touch: ObjectIdentifier(touch), at: point)
+    }
+
+    private static func physicalButton(
+        for mask: UIEvent.ButtonMask
+    ) -> RemotePointerButton? {
+        guard !mask.contains(.primary) else { return nil }
+        if mask.contains(.button(3)) { return .middle }
+        if mask.contains(.secondary) { return .right }
+        return nil
+    }
+
+    private func beginPhysicalButtonPress(
+        _ button: RemotePointerButton,
+        touch: ObjectIdentifier?,
+        at point: (x: UInt16, y: UInt16)
+    ) {
+        lastPointerPoint = point
+        lastKnownFramebufferPoint = point
+        touchHandler.handleMove(x: point.x, y: point.y)
+        let owner = beginPointerModifiers()
+        touchHandler.handleDrag(x: point.x, y: point.y, button: button)
+        physicalButtonPress = PhysicalButtonPress(
+            button: button,
+            touch: touch,
+            modifierOwner: owner,
+            lastPoint: point)
+    }
+
+    private func physicalButtonPressTouch(in touches: Set<UITouch>) -> UITouch? {
+        guard let id = physicalButtonPress?.touch else { return nil }
+        return touches.first { ObjectIdentifier($0) == id }
+    }
+
+    /// Hover pauses while a button is down, so the press itself moves the
+    /// drawn cursor and pans a zoomed desktop.
+    private func continuePhysicalButtonPress(at location: CGPoint) {
+        guard let button = physicalButtonPress?.button else { return }
+        #if !targetEnvironment(macCatalyst)
+        updateRemoteCursorImage(at: location)
+        #endif
+        updatePointerPanning(at: location, dragButton: button)
+        guard let point = framebufferPoint(for: location) else { return }
+        movePhysicalButtonPress(to: point)
+    }
+
+    private func movePhysicalButtonPress(to point: (x: UInt16, y: UInt16)) {
+        guard var press = physicalButtonPress,
+              press.lastPoint != point else { return }
+        press.lastPoint = point
+        physicalButtonPress = press
+        lastPointerPoint = point
+        touchHandler.handleDrag(x: point.x, y: point.y, button: press.button)
+    }
+
+    private func releasePhysicalButtonPress() {
+        guard let press = physicalButtonPress else { return }
+        physicalButtonPress = nil
+        stopEdgeScrolling()
+        touchHandler.handleDragEnd(x: press.lastPoint.x, y: press.lastPoint.y)
+        endPointerModifiers(press.modifierOwner)
+        #if targetEnvironment(macCatalyst)
+        handOffCatalystMouseButtons()
+        #endif
+    }
+
+    #if targetEnvironment(macCatalyst)
+    /// The pane under the pointer, or the pane whose press is still down;
+    /// only it answers GameController's buttons.
+    private static weak var catalystMouseButtonOwner: RemoteInputUIView?
+    /// The pane the pointer entered while another one held a press.
+    private static weak var catalystMouseButtonNextOwner: RemoteInputUIView?
+
+    /// Catalyst hands UIKit no middle-button events, so GameController
+    /// reports them. The handler routes to whichever pane owns the pointer.
+    private static func installCatalystMouseButtonHandlers(on mice: [GCMouse] = GCMouse.mice()) {
+        for mouse in mice {
+            mouse.mouseInput?.middleButton?.pressedChangedHandler = { _, _, pressed in
+                Task { @MainActor in
+                    RemoteInputUIView.catalystMouseButtonOwner?
+                        .handleCatalystMiddleButton(pressed: pressed)
+                }
+            }
         }
     }
+
+    @objc private func mouseDidConnect(_ notification: Notification) {
+        guard let mouse = notification.object as? GCMouse else { return }
+        Self.installCatalystMouseButtonHandlers(on: [mouse])
+    }
+
+    private func claimCatalystMouseButtons() {
+        guard Self.catalystMouseButtonOwner !== self else {
+            Self.catalystMouseButtonNextOwner = nil
+            return
+        }
+        // A press stays with the pane it began in until the button comes up.
+        if Self.catalystMouseButtonOwner?.physicalButtonPress != nil {
+            Self.catalystMouseButtonNextOwner = self
+            return
+        }
+        Self.catalystMouseButtonOwner = self
+    }
+
+    /// While another pane holds a press, motion over this one is that drag's,
+    /// not hover here. Returns true when the event was taken.
+    private func forwardHoverToCatalystPressOwner(
+        _ recognizer: UIHoverGestureRecognizer
+    ) -> Bool {
+        guard let owner = Self.catalystMouseButtonOwner, owner !== self,
+              owner.physicalButtonPress != nil else { return false }
+        guard recognizer.state == .began || recognizer.state == .changed else { return true }
+        claimCatalystMouseButtons()
+        // Another window's coordinates mean nothing to the owner.
+        guard owner.window === window else { return true }
+        // Off its desktop the owner's pointer pins to the nearest visible
+        // pixel, as a drag off a screen's edge does.
+        let location = convert(recognizer.location(in: self), to: owner)
+        guard let pinned = owner.viewport.nearestVisibleViewPoint(
+            to: location,
+            viewSize: owner.bounds.size,
+            framebufferSize: owner.framebufferSize) else { return true }
+        owner.continuePhysicalButtonPress(at: pinned)
+        return true
+    }
+
+    private func handOffCatalystMouseButtons() {
+        guard Self.catalystMouseButtonOwner === self,
+              let next = Self.catalystMouseButtonNextOwner else { return }
+        Self.catalystMouseButtonNextOwner = nil
+        Self.catalystMouseButtonOwner = next
+    }
+
+    private func handleCatalystMiddleButton(pressed: Bool) {
+        guard pressed else {
+            if physicalButtonPress?.button == .middle {
+                releasePhysicalButtonPress()
+            }
+            return
+        }
+        guard physicalButtonPress == nil, !pointerDragActive,
+              window?.isKeyWindow == true,
+              hoverRecognizer.state == .began || hoverRecognizer.state == .changed,
+              let point = framebufferPoint(
+                  for: hoverRecognizer.location(in: self)) else { return }
+        catchMomentumFlingIfActive()
+        focusForHardwareKeyboard()
+        beginPhysicalButtonPress(.middle, touch: nil, at: point)
+    }
+    #endif
 
     private func cancelScrollInteraction() {
         endDirectScrollPhase(.cancelled)
@@ -2521,6 +2764,22 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         trackpadScrollRecognizer.allowedTouchTypes = directTouchTypes
         trackpadScrollRecognizer.delegate = self
 
+        middleTapRecognizer.numberOfTouchesRequired = 3
+        middleTapRecognizer.allowedTouchTypes = directTouchTypes
+        middleTapRecognizer.delegate = self
+
+        // Any motion before the hold delay fails these, leaving the fingers
+        // to pinch, pan, scroll or swipe.
+        for hold in [twoFingerHoldRecognizer, threeFingerHoldRecognizer] {
+            hold.allowedTouchTypes = directTouchTypes
+            hold.delegate = self
+        }
+
+        threeFingerSwipeRecognizer.minimumNumberOfTouches = 3
+        threeFingerSwipeRecognizer.maximumNumberOfTouches = 3
+        threeFingerSwipeRecognizer.allowedTouchTypes = directTouchTypes
+        threeFingerSwipeRecognizer.delegate = self
+
         hoverRecognizer.allowedTouchTypes = pointerTypes
         hoverRecognizer.delegate = self
 
@@ -2535,12 +2794,28 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             rightTapRecognizer,
             trackpadTapRecognizer,
             trackpadScrollRecognizer,
+            middleTapRecognizer,
+            twoFingerHoldRecognizer,
+            threeFingerHoldRecognizer,
+            threeFingerSwipeRecognizer,
             hoverRecognizer,
         ] {
             recognizer.cancelsTouchesInView = false
             addGestureRecognizer(recognizer)
         }
         updateRecognizerEnablement()
+        applyTouchGestureConfiguration()
+    }
+
+    private func applyTouchGestureConfiguration() {
+        let holdDuration = touchGestures.resolvedHoldDuration
+        directTouchRecognizer.holdDuration = holdDuration
+        twoFingerHoldRecognizer.holdDuration = holdDuration
+        threeFingerHoldRecognizer.holdDuration = holdDuration
+        threeFingerSwipeRecognizer.isEnabled = touchGestures.hasSwipeActions
+        if !touchGestures.showsButtonIndicator {
+            buttonIndicator.hide()
+        }
     }
 
     /// One finger means a different thing in each mode, so the recognizers
@@ -2600,7 +2875,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             // pan normally for zoomed-in edge reach.
             let isInitialPencilContact = pointerDragIsPencil && !pointerDragActive
             if !isInitialPencilContact {
-                updatePointerPanning(at: location, isDragging: true)
+                updatePointerPanning(at: location, dragButton: .left)
             }
             guard let point = framebufferPoint(for: location) else { return }
             if isInitialPencilContact {
@@ -2677,6 +2952,19 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     @objc private func handleRightTap(_ recognizer: UITapGestureRecognizer) {
+        handleMultiFingerTap(recognizer, button: .right)
+    }
+
+    @objc private func handleMiddleTap(_ recognizer: UITapGestureRecognizer) {
+        handleMultiFingerTap(recognizer, button: .middle)
+    }
+
+    /// Multi-finger taps click at the fingers in `.direct` and at the
+    /// virtual cursor in `.trackpad`.
+    private func handleMultiFingerTap(
+        _ recognizer: UITapGestureRecognizer,
+        button: RemotePointerButton
+    ) {
         guard recognizer.state == .ended else { return }
         let usesTrackpad = pointerMode == .trackpad
         let location = usesTrackpad
@@ -2696,7 +2984,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             lastKnownFramebufferPoint = point
         }
         clickWithPointerModifiers {
-            touchHandler.handleRightClick(x: point.x, y: point.y)
+            touchHandler.handleClick(button, x: point.x, y: point.y)
         }
     }
 
@@ -2754,19 +3042,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         case (.drag, .began):
             guard let point = framebufferPoint(
                 for: recognizer.currentLocation) else { return }
-            fireDragEngageFeedback()
-            touchHoldDragLastPoint = point
-            touchHoldDragActive = true
-            lastPointerPoint = point
-            touchHoldModifierOwner = beginPointerModifiers()
-            touchHandler.handleDrag(x: point.x, y: point.y)
+            beginTouchHoldDrag(.left, at: point, anchor: recognizer.currentLocation)
         case (.drag, .changed):
             guard touchHoldDragActive,
                   let point = framebufferPoint(
                     for: recognizer.currentLocation) else { return }
-            touchHoldDragLastPoint = point
-            lastPointerPoint = point
-            touchHandler.handleDrag(x: point.x, y: point.y)
+            continueTouchHoldDrag(at: point, anchor: recognizer.currentLocation)
         case (.drag, .ended), (.drag, .cancelled):
             releaseTouchHoldDrag()
         default:
@@ -2802,21 +3083,11 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         case (.drag, .began):
             recenterTrackpadCursorIfOffscreen()
             guard let point = trackpadWirePoint() else { return }
-            fireDragEngageFeedback()
             // Movement under the slop before the hold committed was noise, not
             // intent: start the drag from where the finger rests.
             beginTrackpadStroke(from: recognizer.translation)
-            touchHoldDragLastPoint = point
-            touchHoldDragActive = true
-            lastPointerPoint = point
             lastKnownFramebufferPoint = point
-            // Touch-down sends no absolute move in this mode, so a hold that
-            // follows no cursor motion would press at a coordinate the server
-            // was never moved to. Sync the pointer first, exactly as the
-            // scroll path does, or remote UIs hit-test the previous spot.
-            touchHandler.handleMove(x: point.x, y: point.y)
-            touchHoldModifierOwner = beginPointerModifiers()
-            touchHandler.handleDrag(x: point.x, y: point.y)
+            beginTouchHoldDrag(.left, at: point, anchor: trackpadCursorViewPoint())
         case (.drag, .changed):
             guard touchHoldDragActive else { return }
             if moveTrackpadCursor(to: recognizer.translation) {
@@ -2987,8 +3258,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         lastPointerPoint = point
         lastKnownFramebufferPoint = point
         if buttonHeld {
-            touchHoldDragLastPoint = point
-            touchHandler.handleDrag(x: point.x, y: point.y)
+            continueTouchHoldDrag(at: point, anchor: trackpadCursorViewPoint())
         } else {
             touchHandler.handleMove(x: point.x, y: point.y)
         }
@@ -3111,6 +3381,48 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         touchHandler.handleMove(x: point.x, y: point.y)
     }
 
+    /// Presses `button` for a touch hold. The pointer syncs first: trackpad
+    /// mode sent no move at touch-down, and a multi-finger centroid is not
+    /// where the first finger landed, so remote UIs would hit-test elsewhere.
+    /// `anchor` is the view point the held-button label floats above.
+    private func beginTouchHoldDrag(
+        _ button: RemotePointerButton,
+        at point: (x: UInt16, y: UInt16),
+        anchor: CGPoint?
+    ) {
+        fireDragEngageFeedback()
+        // Read before the press consumes a one-shot toolbar modifier.
+        let modifiers = keyboardCapture.supplementalModifiers
+        touchHoldDragButton = button
+        touchHoldDragLastPoint = point
+        touchHoldDragActive = true
+        lastPointerPoint = point
+        touchHandler.handleMove(x: point.x, y: point.y)
+        touchHoldModifierOwner = beginPointerModifiers()
+        touchHandler.handleDrag(x: point.x, y: point.y, button: button)
+        guard touchGestures.showsButtonIndicator, let anchor else { return }
+        if buttonIndicator.superview == nil {
+            addSubview(buttonIndicator)
+        }
+        bringSubviewToFront(buttonIndicator)
+        buttonIndicator.show(
+            title: TouchButtonIndicatorText.title(for: button, modifiers: modifiers),
+            near: anchor,
+            in: bounds)
+    }
+
+    private func continueTouchHoldDrag(
+        at point: (x: UInt16, y: UInt16),
+        anchor: CGPoint?
+    ) {
+        touchHoldDragLastPoint = point
+        lastPointerPoint = point
+        touchHandler.handleDrag(x: point.x, y: point.y, button: touchHoldDragButton)
+        if let anchor, buttonIndicator.isShowing {
+            buttonIndicator.move(near: anchor, in: bounds)
+        }
+    }
+
     private func releaseTouchHoldDrag() {
         if touchHoldDragActive, let point = touchHoldDragLastPoint {
             touchHandler.handleDragEnd(x: point.x, y: point.y)
@@ -3123,10 +3435,78 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private func resetTouchHoldDrag() {
         touchHoldDragLastPoint = nil
         touchHoldDragActive = false
+        touchHoldDragButton = .left
+        buttonIndicator.hide()
+    }
+
+    /// Two- and three-finger holds. In `.direct` the fingers' centroid is the
+    /// pointer; in `.trackpad` they nudge the virtual cursor as one finger
+    /// does, with the button held.
+    @objc private func handleMultiFingerHold(
+        _ recognizer: MultiFingerHoldGestureRecognizer
+    ) {
+        let button: RemotePointerButton = recognizer.fingerCount == 2 ? .right : .middle
+        let usesTrackpad = pointerMode == .trackpad
+        switch recognizer.state {
+        case .began:
+            if usesTrackpad {
+                recenterTrackpadCursorIfOffscreen()
+                guard let point = trackpadWirePoint() else { return }
+                beginTrackpadStroke(from: recognizer.translation)
+                lastKnownFramebufferPoint = point
+                beginTouchHoldDrag(button, at: point, anchor: trackpadCursorViewPoint())
+            } else {
+                guard let point = framebufferPoint(for: recognizer.centroid) else { return }
+                beginTouchHoldDrag(button, at: point, anchor: recognizer.centroid)
+            }
+        case .changed:
+            guard touchHoldDragActive, touchHoldDragButton == button else { return }
+            if usesTrackpad {
+                if moveTrackpadCursor(to: recognizer.translation) {
+                    sendTrackpadPointer(buttonHeld: true)
+                }
+            } else if let point = framebufferPoint(for: recognizer.centroid) {
+                continueTouchHoldDrag(at: point, anchor: recognizer.centroid)
+            }
+        case .ended, .cancelled:
+            guard touchHoldDragActive, touchHoldDragButton == button else { return }
+            releaseTouchHoldDrag()
+            trackpadVelocity.reset()
+        default:
+            break
+        }
+    }
+
+    /// Fires one remote command per three-finger stroke.
+    @objc private func handleThreeFingerSwipe(_ recognizer: UIPanGestureRecognizer) {
+        switch recognizer.state {
+        case .began:
+            swipeTracker.reset()
+            catchMomentumFlingIfActive()
+            momentumCatchPending = false
+            momentumCatchTimestamp = 0
+            performSwipe(swipeTracker.update(translation: recognizer.translation(in: self)))
+        case .changed:
+            performSwipe(swipeTracker.update(translation: recognizer.translation(in: self)))
+        case .ended:
+            performSwipe(swipeTracker.end(
+                translation: recognizer.translation(in: self),
+                velocity: recognizer.velocity(in: self)))
+        default:
+            break
+        }
+    }
+
+    private func performSwipe(_ direction: RemoteSwipeDirection?) {
+        guard let direction,
+              let command = touchGestures.action(for: direction).command else { return }
+        fireDragEngageFeedback()
+        keyboardHandler.handleRemoteCommand(command)
     }
 
     @objc private func handleHover(_ recognizer: UIHoverGestureRecognizer) {
         #if targetEnvironment(macCatalyst)
+        if forwardHoverToCatalystPressOwner(recognizer) { return }
         if recognizer.state == .ended || recognizer.state == .cancelled {
             stopEdgeScrolling()
             NSCursor.arrow.set()
@@ -3152,6 +3532,17 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
 
         if recognizer.state == .began || recognizer.state == .changed {
             catchMomentumForPointerMove(to: recognizer.location(in: self))
+            #if targetEnvironment(macCatalyst)
+            claimCatalystMouseButtons()
+            #endif
+        }
+
+        // A held non-primary button turns pointer motion into its drag.
+        if physicalButtonPress != nil {
+            if recognizer.state == .began || recognizer.state == .changed {
+                continuePhysicalButtonPress(at: recognizer.location(in: self))
+            }
+            return
         }
 
         if !directScrollPhaseActive,
@@ -3160,7 +3551,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
            recognizer.state == .began || recognizer.state == .changed {
             updatePointerPanning(
                 at: recognizer.location(in: self),
-                isDragging: false)
+                dragButton: nil)
         }
 
         guard !directScrollPhaseActive,
@@ -3177,13 +3568,14 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         touchHandler.handleMove(x: point.x, y: point.y)
     }
 
+    /// `dragButton` is the button held while the pointer moves, nil for hover.
     private func updatePointerPanning(
         at location: CGPoint,
-        isDragging: Bool
+        dragButton: RemotePointerButton?
     ) {
         switch viewportPanningMode {
         case .edge:
-            updateEdgeScrolling(at: location, isDragging: isDragging)
+            updateEdgeScrolling(at: location, dragButton: dragButton)
         case .continuous:
             stopEdgeScrolling()
             let translation = viewport.cursorFollowingTranslation(
@@ -3201,10 +3593,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
 
     private func updateEdgeScrolling(
         at location: CGPoint,
-        isDragging: Bool
+        dragButton: RemotePointerButton?
     ) {
         edgeScrollPointerLocation = location
-        edgeScrollIsDragging = isDragging
+        edgeScrollDragButton = dragButton
         let translation = viewport.edgeScrollTranslation(
             for: location,
             viewSize: bounds.size,
@@ -3257,9 +3649,13 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         guard let point = framebufferPoint(for: location),
               lastPointerPoint?.x != point.x
                 || lastPointerPoint?.y != point.y else { return }
+        if physicalButtonPress != nil {
+            movePhysicalButtonPress(to: point)
+            return
+        }
         lastPointerPoint = point
-        if edgeScrollIsDragging {
-            touchHandler.handleDrag(x: point.x, y: point.y)
+        if let button = edgeScrollDragButton {
+            touchHandler.handleDrag(x: point.x, y: point.y, button: button)
         } else {
             touchHandler.handleMove(x: point.x, y: point.y)
         }
@@ -3270,7 +3666,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         edgeScrollDisplayLink = nil
         edgeScrollPointerLocation = nil
         edgeScrollLastTimestamp = 0
-        edgeScrollIsDragging = false
+        edgeScrollDragButton = nil
     }
 
     #if targetEnvironment(macCatalyst)
@@ -3588,6 +3984,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         guard !directScrollPhaseActive,
               !momentumScrollPhaseActive,
               !pointerDragActive,
+              physicalButtonPress == nil,
               scrollRecognizer.state != .began,
               scrollRecognizer.state != .changed,
               let point = framebufferPoint(for: request.location) else {
@@ -3658,6 +4055,14 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
                     $0.type == .pencil
                 } == true
             }
+            #if !targetEnvironment(macCatalyst)
+            // A non-primary press is tracked from raw touches; a tap
+            // recognizer analysing it would only delay its release.
+            if gestureRecognizer === tapRecognizer || gestureRecognizer === doubleTapRecognizer,
+               Self.physicalButton(for: event.buttonMask) != nil {
+                return false
+            }
+            #endif
             return true
         }
     }
@@ -3671,6 +4076,20 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         // viewport; the cursor pulls the desktop along instead.
         if gestureRecognizer === viewportPanRecognizer,
            pointerMode == .trackpad {
+            return false
+        }
+        // Fingers that stopped a fling never hold a button. Failing here,
+        // before recognition, leaves them free to scroll or pan on.
+        if gestureRecognizer === twoFingerHoldRecognizer
+            || gestureRecognizer === threeFingerHoldRecognizer,
+           momentumCatchPending {
+            return false
+        }
+        // A third finger belongs to the middle-button and swipe gestures.
+        if gestureRecognizer === pinchRecognizer
+            || gestureRecognizer === viewportPanRecognizer
+            || gestureRecognizer === trackpadScrollRecognizer,
+           gestureRecognizer.numberOfTouches > 2 {
             return false
         }
         #if targetEnvironment(macCatalyst)
@@ -3698,6 +4117,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             || recognizer === rightTapRecognizer
             || recognizer === trackpadTapRecognizer
             || recognizer === trackpadScrollRecognizer
+            || recognizer === middleTapRecognizer
+            || recognizer === twoFingerHoldRecognizer
+            || recognizer === threeFingerHoldRecognizer
+            || recognizer === threeFingerSwipeRecognizer
             || recognizer === hoverRecognizer
     }
 
@@ -3795,7 +4218,7 @@ final class DirectTouchGestureRecognizer: UIGestureRecognizer {
     var onTouchDown: ((CGPoint) -> Bool)?
 
     private let movementSlop: CGFloat = 6
-    private let holdDuration: TimeInterval = 0.3
+    var holdDuration = RemoteTouchGestureConfiguration.defaultHoldDuration
     private var trackedTouch: UITouch?
     private var startLocation = CGPoint(x: 0, y: 0)
     private var holdTimer: Timer?
@@ -3901,6 +4324,168 @@ final class DirectTouchGestureRecognizer: UIGestureRecognizer {
         holdTimer = nil
         guard state == .possible, trackedTouch != nil else { return }
         mode = .drag
+        state = .began
+    }
+}
+
+/// Several fingers that land together and stay still for `holdDuration`
+/// hold a remote button. Motion before then fails the gesture so pinch, pan,
+/// scroll and swipes keep their fingers; lifting first leaves a tap.
+@MainActor
+final class MultiFingerHoldGestureRecognizer: UIGestureRecognizer {
+    let fingerCount: Int
+    var holdDuration = RemoteTouchGestureConfiguration.defaultHoldDuration
+    /// Mean location of the held fingers.
+    private(set) var centroid = CGPoint(x: 0, y: 0)
+    /// Centroid motion since all the fingers were down.
+    private(set) var translation = CGPoint(x: 0, y: 0)
+
+    private let movementSlop: CGFloat = 10
+    /// Fingers further apart in time than this are separate gestures, so a
+    /// one-finger drag never turns into a two-finger one.
+    private let landingWindow: TimeInterval = 0.25
+    private var trackedTouches: [UITouch] = []
+    private var startLocations: [ObjectIdentifier: CGPoint] = [:]
+    private var startCentroid = CGPoint(x: 0, y: 0)
+    private var firstLandingTimestamp: TimeInterval = 0
+    private var holdTimer: Timer?
+
+    init(fingerCount: Int, target: Any?, action: Selector?) {
+        self.fingerCount = fingerCount
+        super.init(target: target, action: action)
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesBegan(touches, with: event)
+        guard state == .possible else {
+            // A finger added mid-drag does not change the press.
+            for touch in touches { ignore(touch, for: event) }
+            return
+        }
+        if trackedTouches.isEmpty {
+            firstLandingTimestamp = event.timestamp
+        }
+        trackedTouches.append(contentsOf: touches)
+        guard trackedTouches.count <= fingerCount,
+              event.timestamp - firstLandingTimestamp <= landingWindow else {
+            failGesture()
+            return
+        }
+        guard trackedTouches.count == fingerCount else { return }
+        for touch in trackedTouches {
+            startLocations[ObjectIdentifier(touch)] = touch.location(in: view)
+        }
+        startCentroid = currentCentroid()
+        centroid = startCentroid
+        translation = CGPoint(x: 0, y: 0)
+        scheduleHoldTimer()
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesMoved(touches, with: event)
+        guard trackedTouches.count == fingerCount else { return }
+        centroid = currentCentroid()
+        translation = CGPoint(
+            x: centroid.x - startCentroid.x,
+            y: centroid.y - startCentroid.y)
+        switch state {
+        case .possible:
+            if trackedTouches.contains(where: movedPastSlop) {
+                failGesture()
+            }
+        case .began, .changed:
+            state = .changed
+        default:
+            break
+        }
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesEnded(touches, with: event)
+        guard touches.contains(where: isTracked) else { return }
+        switch state {
+        case .possible:
+            failGesture()
+        case .began, .changed:
+            // Lifting any finger ends the press; the centroid would jump.
+            state = .ended
+        default:
+            break
+        }
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesCancelled(touches, with: event)
+        switch state {
+        case .possible:
+            failGesture()
+        case .began, .changed:
+            state = .cancelled
+        default:
+            break
+        }
+    }
+
+    override func reset() {
+        super.reset()
+        invalidateHoldTimer()
+        trackedTouches.removeAll()
+        startLocations.removeAll()
+        startCentroid = CGPoint(x: 0, y: 0)
+        centroid = CGPoint(x: 0, y: 0)
+        translation = CGPoint(x: 0, y: 0)
+        firstLandingTimestamp = 0
+    }
+
+    private func isTracked(_ touch: UITouch) -> Bool {
+        trackedTouches.contains { $0 === touch }
+    }
+
+    private func movedPastSlop(_ touch: UITouch) -> Bool {
+        guard let start = startLocations[ObjectIdentifier(touch)] else { return false }
+        let location = touch.location(in: view)
+        return hypot(location.x - start.x, location.y - start.y) >= movementSlop
+    }
+
+    private func currentCentroid() -> CGPoint {
+        guard !trackedTouches.isEmpty else { return CGPoint(x: 0, y: 0) }
+        var sum = CGPoint(x: 0, y: 0)
+        for touch in trackedTouches {
+            let location = touch.location(in: view)
+            sum.x += location.x
+            sum.y += location.y
+        }
+        let count = CGFloat(trackedTouches.count)
+        return CGPoint(x: sum.x / count, y: sum.y / count)
+    }
+
+    private func failGesture() {
+        invalidateHoldTimer()
+        if state == .possible {
+            state = .failed
+        }
+    }
+
+    private func scheduleHoldTimer() {
+        invalidateHoldTimer()
+        let timer = Timer(
+            timeInterval: holdDuration,
+            target: self,
+            selector: #selector(commitHold),
+            userInfo: nil,
+            repeats: false)
+        RunLoop.main.add(timer, forMode: .common)
+        holdTimer = timer
+    }
+
+    private func invalidateHoldTimer() {
+        holdTimer?.invalidate()
+        holdTimer = nil
+    }
+
+    @objc private func commitHold() {
+        holdTimer = nil
+        guard state == .possible, trackedTouches.count == fingerCount else { return }
         state = .began
     }
 }

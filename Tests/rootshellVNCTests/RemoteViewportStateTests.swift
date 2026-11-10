@@ -29,6 +29,52 @@ final class RemoteViewportStateTests: XCTestCase {
             framebufferSize: framebufferSize))
     }
 
+    func testNearestVisiblePointStaysOnTheDesktop() throws {
+        let viewport = RemoteViewportState()
+        // Right of the view, and below the letterboxed desktop.
+        for outside in [CGPoint(x: 1400, y: 300), CGPoint(x: 500, y: 990), CGPoint(x: -50, y: -50)] {
+            let pinned = try XCTUnwrap(viewport.nearestVisibleViewPoint(
+                to: outside,
+                viewSize: viewSize,
+                framebufferSize: framebufferSize))
+            let remote = try XCTUnwrap(viewport.framebufferPoint(
+                for: pinned,
+                viewSize: viewSize,
+                framebufferSize: framebufferSize))
+            XCTAssertLessThan(remote.x, framebufferSize.width)
+            XCTAssertLessThan(remote.y, framebufferSize.height)
+        }
+        let corner = try XCTUnwrap(viewport.nearestVisibleViewPoint(
+            to: CGPoint(x: 5000, y: 5000),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize))
+        let remoteCorner = try XCTUnwrap(viewport.framebufferPoint(
+            for: corner,
+            viewSize: viewSize,
+            framebufferSize: framebufferSize))
+        XCTAssertEqual(remoteCorner.x, framebufferSize.width - 0.5, accuracy: 0.001)
+        XCTAssertEqual(remoteCorner.y, framebufferSize.height - 0.5, accuracy: 0.001)
+        // A point already on the desktop is unchanged.
+        XCTAssertEqual(viewport.nearestVisibleViewPoint(
+            to: CGPoint(x: 400, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize), CGPoint(x: 400, y: 500))
+    }
+
+    func testNearestVisiblePointUsesTheVisiblePartWhenZoomed() throws {
+        var viewport = RemoteViewportState()
+        viewport.zoom(by: 3, around: CGPoint(x: 500, y: 500), viewSize: viewSize, framebufferSize: framebufferSize)
+        let pinned = try XCTUnwrap(viewport.nearestVisibleViewPoint(
+            to: CGPoint(x: 2000, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize))
+        XCTAssertLessThan(pinned.x, viewSize.width)
+        XCTAssertNotNil(viewport.framebufferPoint(
+            for: pinned,
+            viewSize: viewSize,
+            framebufferSize: framebufferSize))
+    }
+
     func testPinchKeepsRemotePixelUnderAnchor() throws {
         var viewport = RemoteViewportState()
         // Keep the requested offset within the pan bounds so clamping does

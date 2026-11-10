@@ -101,11 +101,7 @@ enum RemoteMenuShortcut: String, CaseIterable, Identifiable {
 
     var menuTitle: String {
         guard !Self.keys.contains(self) else { return title }
-        var symbols = ""
-        if modifiers.contains(.control) { symbols += "⌃" }
-        if modifiers.contains(.option) { symbols += "⌥" }
-        if modifiers.contains(.shift) { symbols += "⇧" }
-        if modifiers.contains(.command) { symbols += "⌘" }
+        var symbols = modifiers.symbols
         switch character {
         case "\t": symbols += "⇥"
         case " ": symbols += String(localized: "Space", bundle: .module)

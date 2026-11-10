@@ -77,6 +77,7 @@ public struct RemoteDesktopView: View {
     /// host owns this because only it knows the display the desktop is being
     /// viewed on and what the user asked for.
     private let cursorHeight: CGFloat
+    private let touchGestures: RemoteTouchGestureConfiguration
 
     #if canImport(UIKit)
     /// A host-provided accessory can remain visible without the software
@@ -98,6 +99,7 @@ public struct RemoteDesktopView: View {
         initialPointerMode: RemotePointerMode = .direct,
         pointerSpeed: Double = 1.0,
         cursorHeight: CGFloat = 17,
+        touchGestures: RemoteTouchGestureConfiguration = .standard,
         onSharedClipboardUserChange: (@MainActor (Bool) -> Void)? = nil,
         hostOwnsRecoveryChrome: Bool = false,
         brightnessGain: Double = 1.0
@@ -113,6 +115,7 @@ public struct RemoteDesktopView: View {
             initialPointerMode: initialPointerMode,
             pointerSpeed: pointerSpeed,
             cursorHeight: cursorHeight,
+            touchGestures: touchGestures,
             onSharedClipboardUserChange: onSharedClipboardUserChange,
             hostOwnsRecoveryChrome: hostOwnsRecoveryChrome,
             brightnessGain: brightnessGain,
@@ -136,6 +139,7 @@ public struct RemoteDesktopView: View {
         initialPointerMode: RemotePointerMode = .direct,
         pointerSpeed: Double = 1.0,
         cursorHeight: CGFloat = 17,
+        touchGestures: RemoteTouchGestureConfiguration = .standard,
         onSharedClipboardUserChange: (@MainActor (Bool) -> Void)? = nil,
         hostOwnsRecoveryChrome: Bool = false,
         brightnessGain: Double = 1.0,
@@ -152,6 +156,7 @@ public struct RemoteDesktopView: View {
             initialPointerMode: initialPointerMode,
             pointerSpeed: pointerSpeed,
             cursorHeight: cursorHeight,
+            touchGestures: touchGestures,
             onSharedClipboardUserChange: onSharedClipboardUserChange,
             hostOwnsRecoveryChrome: hostOwnsRecoveryChrome,
             brightnessGain: brightnessGain,
@@ -169,6 +174,7 @@ public struct RemoteDesktopView: View {
         initialPointerMode: RemotePointerMode,
         pointerSpeed: Double,
         cursorHeight: CGFloat,
+        touchGestures: RemoteTouchGestureConfiguration,
         onSharedClipboardUserChange: (@MainActor (Bool) -> Void)?,
         hostOwnsRecoveryChrome: Bool,
         brightnessGain: Double,
@@ -181,6 +187,7 @@ public struct RemoteDesktopView: View {
         self._pointerMode = State(initialValue: initialPointerMode)
         self.pointerSpeed = pointerSpeed
         self.cursorHeight = cursorHeight
+        self.touchGestures = touchGestures
         self._keyboardCapture = State(
             initialValue: keyboardCapture ?? VNCKeyboardCapture())
         self.isFullScreen = isFullScreen
@@ -412,6 +419,7 @@ public struct RemoteDesktopView: View {
             cursorHeight: cursorHeight,
             serverRendersCursor: session.activeCursorRendering == .server,
             showsLocalCursorDot: false,
+            touchGestures: touchGestures,
             keyboardActive: $keyboardActive,
             hardwareKeyboardAttached: $hardwareKeyboardAttached,
             framebufferSize: framebufferSize,

@@ -42,6 +42,7 @@ public struct RemoteScreenView: View {
     private let cursorHeight: CGFloat
     private let serverRendersCursor: Bool
     private let showsLocalCursorDot: Bool
+    private let touchGestures: RemoteTouchGestureConfiguration
     private let brightnessGain: Double
     private let disconnect: () -> Void
     private let hudMenuExtras: AnyView?
@@ -74,6 +75,7 @@ public struct RemoteScreenView: View {
         cursorHeight: CGFloat = 17,
         serverRendersCursor: Bool = true,
         showsLocalCursorDot: Bool = false,
+        touchGestures: RemoteTouchGestureConfiguration = .standard,
         brightnessGain: Double = 1.0,
         disconnect: @escaping () -> Void,
         @ViewBuilder hudMenuExtras: () -> MenuExtras
@@ -88,6 +90,7 @@ public struct RemoteScreenView: View {
         self.cursorHeight = cursorHeight
         self.serverRendersCursor = serverRendersCursor
         self.showsLocalCursorDot = showsLocalCursorDot
+        self.touchGestures = touchGestures
         self.brightnessGain = brightnessGain
         self.disconnect = disconnect
         self.hudMenuExtras = AnyView(hudMenuExtras())
@@ -132,6 +135,7 @@ public struct RemoteScreenView: View {
                             cursorHeight: cursorHeight,
                             serverRendersCursor: serverRendersCursor,
                             showsLocalCursorDot: showsLocalCursorDot,
+                            touchGestures: touchGestures,
                             keyboardActive: $keyboardActive,
                             hardwareKeyboardAttached: $hardwareKeyboardAttached,
                             framebufferSize: framebufferSize,

@@ -83,12 +83,19 @@ public struct TouchInputHandler {
     ///   - x: X coordinate in framebuffer pixels.
     ///   - y: Y coordinate in framebuffer pixels.
     public func handleTap(x: UInt16, y: UInt16) {
-        // Move to position
+        handleClick(.left, x: x, y: y)
+    }
+
+    /// Click `button` once: move, press, release.
+    public func handleClick(_ button: RemotePointerButton, x: UInt16, y: UInt16) {
         sendPointerEvent(0, x, y)
-        // Press left button
-        sendPointerEvent(Self.leftButton, x, y)
-        // Release left button
+        sendPointerEvent(button.mask, x, y)
         sendPointerEvent(0, x, y)
+    }
+
+    /// Middle-click, which browsers use to open links in a new tab.
+    public func handleMiddleClick(x: UInt16, y: UInt16) {
+        handleClick(.middle, x: x, y: y)
     }
 
     /// Handle a right-click (context menu) at the given framebuffer coordinates.
@@ -99,12 +106,7 @@ public struct TouchInputHandler {
     ///   - x: X coordinate in framebuffer pixels.
     ///   - y: Y coordinate in framebuffer pixels.
     public func handleRightClick(x: UInt16, y: UInt16) {
-        // Move to position
-        sendPointerEvent(0, x, y)
-        // Press right button
-        sendPointerEvent(Self.rightButton, x, y)
-        // Release right button
-        sendPointerEvent(0, x, y)
+        handleClick(.right, x: x, y: y)
     }
 
     /// Handle pointer movement (e.g., during a drag gesture).
@@ -118,16 +120,17 @@ public struct TouchInputHandler {
         sendPointerEvent(0, x, y)
     }
 
-    /// Handle a drag with the left button held down.
+    /// Handle a drag with `button` held down.
     ///
     /// - Parameters:
     ///   - x: X coordinate in framebuffer pixels.
     ///   - y: Y coordinate in framebuffer pixels.
-    public func handleDrag(x: UInt16, y: UInt16) {
-        sendPointerEvent(Self.leftButton, x, y)
+    ///   - button: The button held through the drag.
+    public func handleDrag(x: UInt16, y: UInt16, button: RemotePointerButton = .left) {
+        sendPointerEvent(button.mask, x, y)
     }
 
-    /// Handle a drag end (release the left button).
+    /// Handle a drag end (release every button).
     ///
     /// - Parameters:
     ///   - x: X coordinate in framebuffer pixels.

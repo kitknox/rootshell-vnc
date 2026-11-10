@@ -55,8 +55,9 @@ small standalone viewer used to develop it.
 - Reusable `ConnectionView` and `RemoteDesktopView` SwiftUI components
 - `RemoteScreenView`, which gives another protocol's video the same input,
   zoom, and HUD as `RemoteDesktopView`, with optional physical-key forwarding
-- Touch, mouse, trackpad, and Apple Pencil input for pointer movement, clicking,
-  dragging, scrolling, hover, and gestures
+- Touch, mouse, trackpad, and Apple Pencil input for pointer movement, left,
+  middle, and right clicks and drags, scrolling, hover, and multi-finger gestures
+  (`RemoteTouchGestureConfiguration` sets the hold delay and swipe mappings)
 - Software and hardware keyboard capture with host-reserved shortcut routing
 - Zooming, panning, viewport controls, fullscreen integration, and keyboard-aware
   layout
