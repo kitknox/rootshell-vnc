@@ -59,6 +59,23 @@ public enum VNCKeyboardPrimaryInputView {
     case systemKeyboardWhenRequested(otherwise: UIView)
 }
 
+/// A keyboard the container app shows in place of the system keyboard.
+@MainActor
+public struct VNCHostKeyboard {
+    public var inputView: UIView?
+    /// For a keyboard that needs its own controller, such as a retained
+    /// self-sizing one. UIKit prefers it over the view.
+    public var inputViewController: UIInputViewController?
+
+    public init(
+        inputView: UIView? = nil,
+        inputViewController: UIInputViewController? = nil
+    ) {
+        self.inputView = inputView
+        self.inputViewController = inputViewController
+    }
+}
+
 /// One coherent snapshot of the input views supplied by a container app.
 /// Updating the snapshot causes a focused responder to reload both views
 /// together, preventing primary/accessory state from getting out of sync.
@@ -66,13 +83,27 @@ public enum VNCKeyboardPrimaryInputView {
 public struct VNCKeyboardInputViews {
     public var primary: VNCKeyboardPrimaryInputView
     public var accessory: UIView?
+    /// Shown, without the accessory, whenever the software keyboard is
+    /// requested. Supplying it ahead of the request keeps the system
+    /// keyboard from appearing first.
+    public var hostKeyboard: VNCHostKeyboard?
+
+    /// Whether a host view stands in for the system keyboard on request.
+    /// The host then decides when its keyboard hides.
+    public var replacesSystemKeyboard: Bool {
+        if hostKeyboard != nil { return true }
+        if case .custom = primary { return true }
+        return false
+    }
 
     public init(
         primary: VNCKeyboardPrimaryInputView = .packageDefault,
-        accessory: UIView? = nil
+        accessory: UIView? = nil,
+        hostKeyboard: VNCHostKeyboard? = nil
     ) {
         self.primary = primary
         self.accessory = accessory
+        self.hostKeyboard = hostKeyboard
     }
 
     public static var packageDefault: Self { Self() }
@@ -152,6 +183,16 @@ public final class VNCKeyboardCapture {
     /// nonempty supplemental modifiers. Hosts use this to consume one-shot
     /// state; locked state can remain in ``supplementalModifiers``.
     public var onSupplementalModifiersConsumed: (@MainActor () -> Void)?
+
+    /// Counts the key presses the remote responder has sent. A host that
+    /// types on the user's behalf compares it to know whether the user has
+    /// typed since.
+    @ObservationIgnored
+    public private(set) var keyboardInputGeneration: UInt64 = 0
+
+    func noteKeyboardInput() {
+        keyboardInputGeneration &+= 1
+    }
 
     /// Whether the software keyboard should be shown for the remote desktop.
     ///

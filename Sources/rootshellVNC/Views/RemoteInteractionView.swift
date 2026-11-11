@@ -755,7 +755,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         disconnect: @escaping () -> Void
     ) {
         self.touchHandler = touchHandler
-        self.keyboardHandler = keyboardHandler
+        self.keyboardHandler = keyboardHandler.notifyingKeyDown { [weak keyboardCapture] in
+            keyboardCapture?.noteKeyboardInput()
+        }
         self.keyboardCapture = keyboardCapture
         self.requestPasswordSend = requestPasswordSend
         self.requestDictation = requestDictation
@@ -882,6 +884,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     /// atomically replace the primary and accessory views through
     /// ``VNCKeyboardCapture/inputViews``.
     override var inputView: UIView? {
+        if let hostKeyboard = requestedHostKeyboard { return hostKeyboard.inputView }
         switch keyboardCapture.inputViews.primary {
         case .packageDefault:
             return softwareKeyboardRequested ? nil : suppressedInputView
@@ -899,9 +902,18 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     /// accessory to override, so a host toolbar there goes unshown.
     #if !os(visionOS)
     override var inputAccessoryView: UIView? {
-        keyboardCapture.inputViews.accessory
+        requestedHostKeyboard == nil ? keyboardCapture.inputViews.accessory : nil
     }
     #endif
+
+    override var inputViewController: UIInputViewController? {
+        requestedHostKeyboard?.inputViewController
+    }
+
+    /// The container's own keyboard, once the software keyboard is requested.
+    private var requestedHostKeyboard: VNCHostKeyboard? {
+        softwareKeyboardRequested ? keyboardCapture.inputViews.hostKeyboard : nil
+    }
 
     var hasText: Bool { true }
 
@@ -4196,14 +4208,16 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         onKeyboardActiveChange?(false)
     }
 
+    /// A host keyboard can shrink to nothing while it floats in the app, which
+    /// UIKit reports as a hide. Only the system keyboard's hide is a dismissal.
     @objc private func softwareKeyboardWillHide() {
-        guard softwareKeyboardRequested else { return }
+        guard softwareKeyboardRequested, !keyboardCapture.inputViews.replacesSystemKeyboard else { return }
         softwareKeyboardRequested = false
         onKeyboardActiveChange?(false)
     }
 
     @objc private func softwareKeyboardDidHide() {
-        guard softwareKeyboardRequested else { return }
+        guard softwareKeyboardRequested, !keyboardCapture.inputViews.replacesSystemKeyboard else { return }
         softwareKeyboardRequested = false
         onKeyboardActiveChange?(false)
     }

@@ -116,6 +116,24 @@ public struct KeyboardInputHandler {
 
     private let sendPhysicalKeyEvent: PhysicalKeyEventHandler?
 
+    /// A copy that calls `onKeyDown` before every key press it sends.
+    func notifyingKeyDown(_ onKeyDown: @escaping @MainActor () -> Void) -> KeyboardInputHandler {
+        var physical: PhysicalKeyEventHandler?
+        if let send = sendPhysicalKeyEvent {
+            physical = { (downFlag: Bool, usage: UInt32, keysym: UInt32) in
+                if downFlag { onKeyDown() }
+                send(downFlag, usage, keysym)
+            }
+        }
+        return KeyboardInputHandler(
+            sendKeyEvent: { [sendKeyEvent] downFlag, keysym in
+                if downFlag { onKeyDown() }
+                sendKeyEvent(downFlag, keysym)
+            },
+            usesAppleModifierConvention: usesAppleModifierConvention,
+            sendPhysicalKeyEvent: physical)
+    }
+
     var forwardsPhysicalKeys: Bool { sendPhysicalKeyEvent != nil }
 
     /// A hardware key transition whose HID usage is known.
