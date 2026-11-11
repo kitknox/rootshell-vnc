@@ -84,4 +84,19 @@ final class HUDDockPositionTests: XCTestCase {
         XCTAssertEqual(center.x, 20)
         XCTAssertEqual(center.y, 15)
     }
+
+    func testSafeAreaAddsToMarginOnlyOnHonoredEdges() {
+        let safeArea = HUDLayoutInsets(top: 59, leading: 0, bottom: 34, trailing: 72)
+
+        XCTAssertEqual(
+            HUDLayoutInsets(margin: 12, safeArea: safeArea),
+            HUDLayoutInsets(top: 71, leading: 12, bottom: 46, trailing: 84))
+        // A takeover that covers a side rail lets the HUD reach that edge.
+        XCTAssertEqual(
+            HUDLayoutInsets(margin: 12, safeArea: safeArea, honoring: [.top, .bottom]),
+            HUDLayoutInsets(top: 71, leading: 12, bottom: 46, trailing: 12))
+        XCTAssertEqual(
+            HUDLayoutInsets(margin: 12),
+            HUDLayoutInsets(top: 12, leading: 12, bottom: 12, trailing: 12))
+    }
 }

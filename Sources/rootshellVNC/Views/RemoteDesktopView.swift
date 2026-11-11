@@ -69,6 +69,9 @@ public struct RemoteDesktopView: View {
     private let toggleFullScreen: (() -> Void)?
     private let hudMenuExtras: AnyView?
     private let keyboardAvoidanceMode: VNCKeyboardAvoidanceMode
+    /// Edges whose safe area the HUD keeps clear of. A host that covers a
+    /// system region (a full-screen takeover over a side rail) drops its edge.
+    private let hudSafeAreaEdges: Edge.Set
     private let clipboardSynchronizer: VNCClipboardSynchronizer?
     private let onSharedClipboardUserChange: (@MainActor (Bool) -> Void)?
     private let hostOwnsRecoveryChrome: Bool
@@ -95,6 +98,7 @@ public struct RemoteDesktopView: View {
         isFullScreen: Bool = false,
         toggleFullScreen: (() -> Void)? = nil,
         keyboardAvoidanceMode: VNCKeyboardAvoidanceMode = .automatic,
+        hudSafeAreaEdges: Edge.Set = .all,
         clipboardSynchronizer: VNCClipboardSynchronizer? = nil,
         initialViewportPanningMode: RemoteViewportPanningMode = .edge,
         initialPointerMode: RemotePointerMode = .direct,
@@ -111,6 +115,7 @@ public struct RemoteDesktopView: View {
             isFullScreen: isFullScreen,
             toggleFullScreen: toggleFullScreen,
             keyboardAvoidanceMode: keyboardAvoidanceMode,
+            hudSafeAreaEdges: hudSafeAreaEdges,
             clipboardSynchronizer: clipboardSynchronizer,
             initialViewportPanningMode: initialViewportPanningMode,
             initialPointerMode: initialPointerMode,
@@ -135,6 +140,7 @@ public struct RemoteDesktopView: View {
         isFullScreen: Bool = false,
         toggleFullScreen: (() -> Void)? = nil,
         keyboardAvoidanceMode: VNCKeyboardAvoidanceMode = .automatic,
+        hudSafeAreaEdges: Edge.Set = .all,
         clipboardSynchronizer: VNCClipboardSynchronizer? = nil,
         initialViewportPanningMode: RemoteViewportPanningMode = .edge,
         initialPointerMode: RemotePointerMode = .direct,
@@ -152,6 +158,7 @@ public struct RemoteDesktopView: View {
             isFullScreen: isFullScreen,
             toggleFullScreen: toggleFullScreen,
             keyboardAvoidanceMode: keyboardAvoidanceMode,
+            hudSafeAreaEdges: hudSafeAreaEdges,
             clipboardSynchronizer: clipboardSynchronizer,
             initialViewportPanningMode: initialViewportPanningMode,
             initialPointerMode: initialPointerMode,
@@ -170,6 +177,7 @@ public struct RemoteDesktopView: View {
         isFullScreen: Bool,
         toggleFullScreen: (() -> Void)?,
         keyboardAvoidanceMode: VNCKeyboardAvoidanceMode,
+        hudSafeAreaEdges: Edge.Set,
         clipboardSynchronizer: VNCClipboardSynchronizer?,
         initialViewportPanningMode: RemoteViewportPanningMode,
         initialPointerMode: RemotePointerMode,
@@ -194,6 +202,7 @@ public struct RemoteDesktopView: View {
         self.isFullScreen = isFullScreen
         self.toggleFullScreen = toggleFullScreen
         self.keyboardAvoidanceMode = keyboardAvoidanceMode
+        self.hudSafeAreaEdges = hudSafeAreaEdges
         self.clipboardSynchronizer = clipboardSynchronizer
         self.onSharedClipboardUserChange = onSharedClipboardUserChange
         self.brightnessGain = brightnessGain
@@ -470,7 +479,7 @@ public struct RemoteDesktopView: View {
     @ViewBuilder
     private var viewportControls: some View {
         #if canImport(UIKit)
-        DraggableHUDOverlay {
+        DraggableHUDOverlay(safeAreaEdges: hudSafeAreaEdges) {
             hudMenu
         }
         #else

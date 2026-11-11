@@ -38,6 +38,9 @@ public struct RemoteScreenView: View {
     private let isFullScreen: Bool
     private let toggleFullScreen: (() -> Void)?
     private let keyboardAvoidanceMode: VNCKeyboardAvoidanceMode
+    /// Edges whose safe area the HUD keeps clear of. A host that covers a
+    /// system region (a full-screen takeover over a side rail) drops its edge.
+    private let hudSafeAreaEdges: Edge.Set
     private let pointerSpeed: Double
     private let cursorHeight: CGFloat
     private let serverRendersCursor: Bool
@@ -69,6 +72,7 @@ public struct RemoteScreenView: View {
         isFullScreen: Bool = false,
         toggleFullScreen: (() -> Void)? = nil,
         keyboardAvoidanceMode: VNCKeyboardAvoidanceMode = .automatic,
+        hudSafeAreaEdges: Edge.Set = .all,
         initialViewportPanningMode: RemoteViewportPanningMode = .edge,
         initialPointerMode: RemotePointerMode = .direct,
         pointerSpeed: Double = 1.0,
@@ -86,6 +90,7 @@ public struct RemoteScreenView: View {
         self.isFullScreen = isFullScreen
         self.toggleFullScreen = toggleFullScreen
         self.keyboardAvoidanceMode = keyboardAvoidanceMode
+        self.hudSafeAreaEdges = hudSafeAreaEdges
         self.pointerSpeed = pointerSpeed
         self.cursorHeight = cursorHeight
         self.serverRendersCursor = serverRendersCursor
@@ -154,7 +159,7 @@ public struct RemoteScreenView: View {
                             .contentShape(Rectangle())
                     }
 
-                    DraggableHUDOverlay {
+                    DraggableHUDOverlay(safeAreaEdges: hudSafeAreaEdges) {
                         hudMenu
                     }
                 }

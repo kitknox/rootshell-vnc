@@ -17,6 +17,39 @@ struct HUDLayoutInsets: Equatable, Sendable {
     var leading: CGFloat
     var bottom: CGFloat
     var trailing: CGFloat
+
+    /// A uniform margin plus the safe area on the edges the HUD keeps clear of.
+    /// `safeArea` is physical (`leading` is the left edge), like the geometry.
+    init(
+        margin: CGFloat,
+        safeArea: HUDLayoutInsets = .zero,
+        honoring edges: HUDSafeAreaEdges = .all
+    ) {
+        top = margin + (edges.contains(.top) ? max(0, safeArea.top) : 0)
+        leading = margin + (edges.contains(.left) ? max(0, safeArea.leading) : 0)
+        bottom = margin + (edges.contains(.bottom) ? max(0, safeArea.bottom) : 0)
+        trailing = margin + (edges.contains(.right) ? max(0, safeArea.trailing) : 0)
+    }
+
+    init(top: CGFloat, leading: CGFloat, bottom: CGFloat, trailing: CGFloat) {
+        self.top = top
+        self.leading = leading
+        self.bottom = bottom
+        self.trailing = trailing
+    }
+
+    static let zero = HUDLayoutInsets(top: 0, leading: 0, bottom: 0, trailing: 0)
+}
+
+/// Physical edges whose safe area the HUD stays out of.
+struct HUDSafeAreaEdges: OptionSet, Equatable, Sendable {
+    let rawValue: Int
+
+    static let top = HUDSafeAreaEdges(rawValue: 1 << 0)
+    static let left = HUDSafeAreaEdges(rawValue: 1 << 1)
+    static let bottom = HUDSafeAreaEdges(rawValue: 1 << 2)
+    static let right = HUDSafeAreaEdges(rawValue: 1 << 3)
+    static let all: HUDSafeAreaEdges = [.top, .left, .bottom, .right]
 }
 
 /// Pure layout helpers for the draggable HUD.
@@ -155,14 +188,21 @@ private final class HUDDragPanGestureRecognizer: UIPanGestureRecognizer {
 /// Touches outside the HUD fall through to the remote desktop below.
 struct DraggableHUDOverlay<Content: View>: UIViewRepresentable {
     var inset: CGFloat = 12
+    /// Edges whose safe area the HUD keeps clear of.
+    var safeAreaEdges: Edge.Set = .all
     @ViewBuilder var content: () -> Content
 
     func makeUIView(context: Context) -> DraggableHUDOverlayHostView {
         let view = DraggableHUDOverlayHostView()
         view.inset = inset
+        view.safeAreaEdges = safeAreaEdges
 
         let host = UIHostingController(rootView: AnyView(content()))
         host.view.backgroundColor = .clear
+        // The overlay places the HUD itself. Left on, the button's own host
+        // insets its content for a keyboard or safe area it happens to sit
+        // in, which resizes and displaces the button.
+        host.safeAreaRegions = []
         // Self-size to the SwiftUI content instead of the proposed bounds.
         host.sizingOptions = .intrinsicContentSize
         context.coordinator.host = host
@@ -180,6 +220,7 @@ struct DraggableHUDOverlay<Content: View>: UIViewRepresentable {
         // the UIView and is untouched by content updates.
         context.coordinator.host?.rootView = AnyView(content())
         uiView.inset = inset
+        uiView.safeAreaEdges = safeAreaEdges
         uiView.setNeedsLayout()
     }
 
@@ -216,6 +257,7 @@ final class DraggableHUDOverlayHostView: UIView {
     weak var hostController: UIViewController?
     weak var hostedView: UIView?
     var inset: CGFloat = 12
+    var safeAreaEdges: Edge.Set = .all
 
     /// Edge-relative state, rather than an absolute center, prevents a HUD
     /// clamped above the software keyboard from staying in the middle after
@@ -307,18 +349,37 @@ final class DraggableHUDOverlayHostView: UIView {
     }
 
     private func allowedCenterRect(for size: CGSize) -> CGRect {
-        // RemoteDesktopView's host-managed mode already receives bounds that
-        // stop above the keyboard/toolbar. Applying this hosting view's safe
-        // area again double-counts that obstruction and strands a bottom-
-        // docked HUD around the middle of the remaining pane.
-        HUDDockGeometry.allowedCenterRect(
+        // UIKit's safe area is where these bounds really reach under system
+        // regions, and never includes the keyboard. A host-managed pane
+        // already ends above the keyboard and toolbar, so its bounds are the
+        // whole answer there.
+        let safeArea = safeAreaInsets
+        return HUDDockGeometry.allowedCenterRect(
             in: bounds,
             contentSize: size,
             insets: HUDLayoutInsets(
-                top: inset,
-                leading: inset,
-                bottom: inset,
-                trailing: inset))
+                margin: inset,
+                safeArea: HUDLayoutInsets(
+                    top: safeArea.top,
+                    leading: safeArea.left,
+                    bottom: safeArea.bottom,
+                    trailing: safeArea.right),
+                honoring: physicalSafeAreaEdges))
+    }
+
+    private var physicalSafeAreaEdges: HUDSafeAreaEdges {
+        let rightToLeft = effectiveUserInterfaceLayoutDirection == .rightToLeft
+        var edges: HUDSafeAreaEdges = []
+        if safeAreaEdges.contains(.top) { edges.insert(.top) }
+        if safeAreaEdges.contains(.bottom) { edges.insert(.bottom) }
+        if safeAreaEdges.contains(.leading) { edges.insert(rightToLeft ? .right : .left) }
+        if safeAreaEdges.contains(.trailing) { edges.insert(rightToLeft ? .left : .right) }
+        return edges
+    }
+
+    override func safeAreaInsetsDidChange() {
+        super.safeAreaInsetsDidChange()
+        setNeedsLayout()
     }
 
     private func preserveDragCenter(
