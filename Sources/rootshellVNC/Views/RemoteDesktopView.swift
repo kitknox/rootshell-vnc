@@ -451,7 +451,7 @@ public struct RemoteDesktopView: View {
             requestPasswordSend: requestPasswordSend,
             requestDictation: requestDictation,
             toggleFullScreen: toggleFullScreen,
-            disconnect: { session.disconnect() },
+            disconnect: { session.requestUserDisconnect() },
             // Apple's adaptive profile asks the server for cached cursor
             // images so the responsive local pointer can adopt their shape.
             remoteCursor: session.remoteCursor,
@@ -661,7 +661,7 @@ public struct RemoteDesktopView: View {
             Divider()
 
             Button(role: .destructive) {
-                session.disconnect()
+                session.requestUserDisconnect()
             } label: {
                 Label(String(localized: "Close Connection", bundle: .module), systemImage: "xmark.circle")
             }

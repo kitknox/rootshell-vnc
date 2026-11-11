@@ -1379,6 +1379,29 @@ public final class VNCSession {
         }
     }
 
+    /// Host hook for a user-initiated Close Connection. When set, the HUD
+    /// item and its keyboard command call this instead of `disconnect()`,
+    /// so the host can finish its own work before disconnecting.
+    @ObservationIgnored
+    public var userDisconnectHandler: (@MainActor () -> Void)?
+
+    /// Close Connection as chosen by the user in the viewer's own chrome.
+    public func requestUserDisconnect() {
+        if let userDisconnectHandler {
+            userDisconnectHandler()
+        } else {
+            disconnect()
+        }
+    }
+
+    /// Waits until queued input has been written to the transport, so a
+    /// following `disconnect()` cannot drop it.
+    public func flushPendingInput() async {
+        while let task = inputTask {
+            await task.value
+        }
+    }
+
     /// Disconnect from the current VNC server.
     ///
     /// Cancels all active tasks, closes the transport, and resets the session
