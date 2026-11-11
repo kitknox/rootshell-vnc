@@ -139,6 +139,32 @@ final class AppleMediaFeedbackTests: XCTestCase {
         XCTAssertEqual(AppleMediaRateController.nativeScreenMaximumBitrateBps, 60_000_000)
     }
 
+    func testBandwidthProfilesSelectTheMacsScreenModes() {
+        XCTAssertEqual(AppleMediaBandwidthProfile.full.screenNegotiatorMode, 7)
+        XCTAssertEqual(AppleMediaBandwidthProfile.full.minimumBitrateBps, 20_000_000)
+        XCTAssertEqual(AppleMediaBandwidthProfile.full.maximumBitrateBps, 60_000_000)
+        XCTAssertEqual(AppleMediaBandwidthProfile.constrained.screenNegotiatorMode, 5)
+        XCTAssertEqual(AppleMediaBandwidthProfile.constrained.minimumBitrateBps, 333_000)
+        XCTAssertEqual(AppleMediaBandwidthProfile.constrained.maximumBitrateBps, 6_000_000)
+    }
+
+    func testConstrainedRateControllerBacksOffToItsOwnFloor() {
+        let profile = AppleMediaBandwidthProfile.constrained
+        let controller = AppleMediaRateController(
+            minTargetBps: profile.minimumBitrateBps,
+            maxTargetBps: profile.maximumBitrateBps,
+            initialTargetBps: 4_000_000)
+        _ = controller.update(now: 0)
+        XCTAssertEqual(controller.targetBitrateBps, 4_000_000)
+        for step in 1...30 {
+            let now = Double(step)
+            controller.onConfirmedLoss(count: 1, now: now)
+            _ = controller.update(now: now)
+        }
+
+        XCTAssertEqual(controller.targetBitrateBps, 333_000)
+    }
+
     func testGenericNACKPacksContiguousAndSparseSequenceNumbers() {
         XCTAssertEqual(
             appleMediaGenericNACKEntries(missingSequences: [100, 101, 103, 117, 118]),

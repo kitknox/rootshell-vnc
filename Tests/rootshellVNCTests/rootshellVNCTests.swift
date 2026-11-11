@@ -2880,6 +2880,38 @@ final class VideoBandGeometryTests: XCTestCase {
     }
 
     @MainActor
+    func testLowBandwidthPaddedPictureKeepsTheRealDisplaySize() async {
+        let session = VNCSession(configuration: VNCConfiguration(
+            videoQualityMode: .adaptive,
+            highPerformanceBandwidth: .constrained,
+            displaySizingMode: .remoteDisplay))
+        await session.updateRemoteDisplayRegions([
+            RFBScreenLayout(id: 1, x: 0, y: 0, width: 2976, height: 1860, flags: 0),
+        ])
+
+        await session.applyAcceptedMediaStreamGeometry(VideoFrameGeometry(
+            width: 2976, height: 1888, mediaGeneration: 1))
+
+        XCTAssertEqual(session.framebufferWidth, 2976)
+        XCTAssertEqual(session.framebufferHeight, 1860)
+    }
+
+    @MainActor
+    func testFullBandwidthKeepsTheCodedPictureSize() async {
+        let session = VNCSession(configuration: VNCConfiguration(
+            videoQualityMode: .adaptive,
+            displaySizingMode: .remoteDisplay))
+        await session.updateRemoteDisplayRegions([
+            RFBScreenLayout(id: 1, x: 0, y: 0, width: 2976, height: 1860, flags: 0),
+        ])
+
+        await session.applyAcceptedMediaStreamGeometry(VideoFrameGeometry(
+            width: 2976, height: 1888, mediaGeneration: 1))
+
+        XCTAssertEqual(session.framebufferHeight, 1888)
+    }
+
+    @MainActor
     func testAdaptiveAuthoritativeGeometryCreatesAndResizesCursorFramebuffer() async throws {
         let session = VNCSession(configuration: VNCConfiguration(
             videoQualityMode: .adaptive,
@@ -3086,6 +3118,67 @@ final class VideoBandGeometryTests: XCTestCase {
         XCTAssertEqual(stitchedFrame.maxY, 110, accuracy: 0.001)
         XCTAssertEqual(renderer.containerLayer.bounds.height, 110, accuracy: 0.001)
         XCTAssertTrue(renderer.containerLayer.masksToBounds)
+    }
+
+    @MainActor
+    func testLowBandwidthCropsTheCenterOfAPaddedPicture() throws {
+        // Black, red, green, black rows: the screen is the middle two.
+        let padded = try makeRowBuffer(width: 4, rows: [
+            (0, 0, 0), (0, 0, 255), (0, 255, 0), (0, 0, 0),
+        ])
+        XCTAssertEqual(try composedTopRows(of: padded, centered: true), [.red, .green])
+        XCTAssertEqual(try composedTopRows(of: padded, centered: false), [.black, .red])
+    }
+
+    private enum RowColor { case black, red, green }
+
+    @MainActor
+    private func composedTopRows(
+        of buffer: CVPixelBuffer,
+        centered: Bool
+    ) throws -> [RowColor] {
+        let renderer = VideoBandLayerRenderer()
+        renderer.setCentersPaddedPicture(centered)
+        renderer.setViewBounds(CGRect(x: 0, y: 0, width: 4, height: 2))
+        renderer.setScreenSize(width: 4, height: 2)
+        var committed: CVPixelBuffer?
+        renderer.onFrameCommitted = { frame, _ in committed = frame }
+        renderer.setBands([1: buffer])
+        let frame = try XCTUnwrap(committed)
+        CVPixelBufferLockBaseAddress(frame, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(frame, .readOnly) }
+        let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(frame))
+            .assumingMemoryBound(to: UInt8.self)
+        let rowBytes = CVPixelBufferGetBytesPerRow(frame)
+        return (0..<2).map { row in
+            let pixel = base + row * rowBytes
+            if pixel[2] > 128 { return .red }
+            if pixel[1] > 128 { return .green }
+            return .black
+        }
+    }
+
+    /// A BGRA buffer whose rows are filled with the given (b, g, r) colors.
+    private func makeRowBuffer(
+        width: Int,
+        rows: [(UInt8, UInt8, UInt8)]
+    ) throws -> CVPixelBuffer {
+        let buffer = try makePixelBuffer(width: width, height: rows.count)
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(buffer))
+            .assumingMemoryBound(to: UInt8.self)
+        let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
+        for (row, color) in rows.enumerated() {
+            for column in 0..<width {
+                let pixel = base + row * rowBytes + column * 4
+                pixel[0] = color.0
+                pixel[1] = color.1
+                pixel[2] = color.2
+                pixel[3] = 255
+            }
+        }
+        return buffer
     }
 
     private func makePixelBuffer(width: Int, height: Int) throws -> CVPixelBuffer {

@@ -290,6 +290,13 @@ final class VNCConfigurationTransportTests: XCTestCase {
 
     private static let stubDatagramProvider: VNCDatagramProvider = { _, _, _ in -1 }
 
+    func testHighPerformanceBandwidthDefaultsToFullAndCarriesThrough() {
+        XCTAssertEqual(VNCConfiguration().highPerformanceBandwidth, .full)
+        XCTAssertEqual(
+            VNCConfiguration(highPerformanceBandwidth: .constrained).highPerformanceBandwidth,
+            .constrained)
+    }
+
     func testInitKeepsAdaptiveWithDatagramProvider() {
         let configuration = VNCConfiguration(
             videoQualityMode: .adaptive,

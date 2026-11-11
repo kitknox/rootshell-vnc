@@ -242,8 +242,8 @@ public enum SessionEvent: Sendable {
     /// The Apple media UDP receive socket was opened.
     case appleMediaUDPStarted(localPort: UInt16)
 
-    /// High Performance media cannot work on this path; the control channel
-    /// is still healthy, so the session can continue in Standard.
+    /// High Performance media is failing on this path; the control channel
+    /// is still healthy. Sustained loss repeats every two lossy windows.
     case appleMediaUnavailable(reason: String)
 
     /// A TCP control stream chunk observed after accepting Apple's media stream.
@@ -495,6 +495,9 @@ public actor TransportSession {
     /// Legacy direct-transport switch for disabling adaptive rate control. The
     /// public Full Quality mode never enters the lossy media path at all.
     private var appleMediaNetworkProfile: AppleMediaNetworkProfile = .unknown
+    /// Fixed per connection: a live stream answers a new media request with a
+    /// re-key, not a new offer, so changing it takes a reconnect.
+    public let appleMediaBandwidthProfile: AppleMediaBandwidthProfile
     // NOTE (2026-07-12): do NOT scale the initial advertised capacity by
     // framebuffer area. The server ignores the RCTL estimate while sending its
     // bootstrap IRAP, but the reduced value still leaks into
@@ -865,6 +868,7 @@ public actor TransportSession {
         displayCount: Int = 1,
         requestsVirtualDisplays: Bool = false,
         appleMediaTilesPerFrameOverride: UInt64? = nil,
+        appleMediaBandwidthProfile: AppleMediaBandwidthProfile = .full,
         serverRendersCursor: Bool = false,
         connection: (any RFBConnection)? = nil,
         datagramProvider: AppleMediaDatagramProvider? = nil,
@@ -874,6 +878,7 @@ public actor TransportSession {
         let environment = ProcessInfo.processInfo.environment
         self.runtimeEnvironment = environment
         self.appleMediaTilesPerFrameOverride = appleMediaTilesPerFrameOverride
+        self.appleMediaBandwidthProfile = appleMediaBandwidthProfile
         #if DEBUG
         self.appleMediaDecodedRTPDumpPath = VNCDiagnostics.value(
             for: "ROOTSHELL_VNC_DUMP_DECODED_RTP", environment: environment)
@@ -1473,6 +1478,12 @@ public actor TransportSession {
 
     public var currentAppleMediaTilesPerFrame: Int {
         activeAppleMediaTilesPerFrame
+    }
+
+    /// Whether the Mac's capture is too large for one picture, the only case in
+    /// which a one-picture stream without video should retry with four tiles.
+    public var appleMediaCaptureExceedsOnePicture: Bool {
+        !AppleMediaVideoMode.fitsOnePicture(totalLumaSamples: appleMediaActiveCaptureLumaSamples)
     }
 
     /// Install the in-session media-generation boundary callback. This is
@@ -5579,9 +5590,7 @@ public actor TransportSession {
 
         let configuration = try appleMediaServerConfigurationMessage()
         if rateControlEnabled, appleMediaRateController == nil {
-            appleMediaRateController = AppleMediaRateController(
-                maxTargetBps: appleMediaRateControllerMaxBps,
-                initialTargetBps: appleMediaNetworkProfile.initialCapacityBps)
+            appleMediaRateController = makeAppleMediaRateController()
         }
         rebuildAppleMediaSRTPContexts()
         try await sendAppleMediaControlPayload(configuration)
@@ -5597,11 +5606,12 @@ public actor TransportSession {
         // disabling the slot causes the server to reject the whole compound
         // configuration, including UDP HEVC video.
         let generatedAudioOffer = try appleAVCMediaStreamOffer(mode: 8)
+        let screenMode = effectiveAppleMediaBandwidthProfile.screenNegotiatorMode
         let generatedVideoOffer = try appleAVCMediaStreamOffer(
-            mode: 7,
+            mode: screenMode,
             displayIndex: 0)
         let generatedVideo2Offer = appleMediaDisplayCount > 1
-            ? try appleAVCMediaStreamOffer(mode: 7, displayIndex: 1)
+            ? try appleAVCMediaStreamOffer(mode: screenMode, displayIndex: 1)
             : nil
         let audioOffer = generatedAudioOffer.data
         let videoOffer = generatedVideoOffer.data
@@ -5751,6 +5761,10 @@ public actor TransportSession {
         pixelWidth: Int,
         pixelHeight: Int
     ) -> Int {
+        // A Mac encodes one picture in mode 5 whatever the offer asks for.
+        if effectiveAppleMediaBandwidthProfile == .constrained {
+            return 1
+        }
         if let override = appleMediaTilesPerFrameOverride,
            (1...4).contains(override) {
             return Int(override)
@@ -6035,15 +6049,13 @@ public actor TransportSession {
         continuation?.yield(.appleMediaUnavailable(reason: reason))
     }
 
-    /// The Mac's High Performance encoder does not target below about 20 Mbps.
-    private static let appleMediaHighPerformanceFloorBps: Double = 20_000_000
-
-    /// Whether this path likely cannot carry the High Performance floor: a
-    /// cellular bearer, or a measured packet-train rate under it.
+    /// Whether this path likely cannot carry the current profile's floor: a
+    /// cellular bearer under the full profile, or a measured rate under it.
     public var appleMediaPathBelowHighPerformanceFloor: Bool {
-        if appleMediaNetworkProfile.radioClass != .none { return true }
+        let profile = effectiveAppleMediaBandwidthProfile
+        if profile == .full, appleMediaNetworkProfile.radioClass != .none { return true }
         let estimate = appleMediaReceiveBandwidthEstimator.estimateBps
-        return estimate > 0 && estimate < Self.appleMediaHighPerformanceFloorBps
+        return estimate > 0 && estimate < profile.minimumBitrateBps
     }
 
     /// Unrepaired-loss windows: two consecutive 5 s windows of at least 200
@@ -6066,8 +6078,10 @@ public actor TransportSession {
         let lossy = expected >= 200 && appleMediaQualityWindowLost * 5 >= expected
         appleMediaConsecutiveLossyWindows = lossy ? appleMediaConsecutiveLossyWindows + 1 : 0
         if appleMediaConsecutiveLossyWindows >= 2 {
-            reportAppleMediaUnavailable(
-                "sustained loss \(appleMediaQualityWindowLost)/\(expected) packets")
+            appleMediaConsecutiveLossyWindows = 0
+            let reason = "sustained loss \(appleMediaQualityWindowLost)/\(expected) packets"
+            log.error("High Performance media unavailable: \(reason)")
+            continuation?.yield(.appleMediaUnavailable(reason: reason))
         }
         appleMediaQualityWindowStartNanos = nowNanos
         appleMediaQualityWindowReceived = 0
@@ -6670,9 +6684,7 @@ public actor TransportSession {
 
             if rateControlEnabled {
                 let controller = appleMediaRateController ?? {
-                    let created = AppleMediaRateController(
-                        maxTargetBps: appleMediaRateControllerMaxBps,
-                        initialTargetBps: appleMediaNetworkProfile.initialCapacityBps)
+                    let created = makeAppleMediaRateController()
                     appleMediaRateController = created
                     return created
                 }()
@@ -6755,9 +6767,7 @@ public actor TransportSession {
 
             if rateControlEnabled {
                 let controller = appleMediaRateController ?? {
-                    let created = AppleMediaRateController(
-                        maxTargetBps: appleMediaRateControllerMaxBps,
-                        initialTargetBps: appleMediaNetworkProfile.initialCapacityBps)
+                    let created = makeAppleMediaRateController()
                     appleMediaRateController = created
                     return created
                 }()
@@ -7334,13 +7344,21 @@ public actor TransportSession {
 
     }
 
-    /// Ceiling for the receive-capacity estimator (bps). The bearer only sets
-    /// the initial prior; the ceiling is the 60 Mbps negotiated screen tier on
-    /// every path. RCTL serializes kbps as UInt16; estimates above that only
-    /// delay a later loss response because several reductions would still
-    /// encode as the same saturated value.
-    private var appleMediaRateControllerMaxBps: Double {
-        AppleMediaRateController.nativeScreenMaximumBitrateBps
+    /// wayshare is not a Mac: it keeps mode 7 and its four strips.
+    private var effectiveAppleMediaBandwidthProfile: AppleMediaBandwidthProfile {
+        SecurityType.offersAppleSRPWithoutMacTypes(stateMachine.offeredSecurityTypes)
+            ? .full
+            : appleMediaBandwidthProfile
+    }
+
+    private func makeAppleMediaRateController() -> AppleMediaRateController {
+        let profile = effectiveAppleMediaBandwidthProfile
+        return AppleMediaRateController(
+            minTargetBps: profile.minimumBitrateBps,
+            maxTargetBps: profile.maximumBitrateBps,
+            initialTargetBps: min(
+                profile.maximumBitrateBps,
+                appleMediaNetworkProfile.initialCapacityBps))
     }
 
     private func startAppleMediaAudioRTCPFeedbackLoop() {

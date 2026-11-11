@@ -51,6 +51,7 @@ final class AppleMediaRateController {
         let recoveryQueueDelayVetoSeconds: Double
 
         static func fromEnvironment(
+            minimumCapacity: Double,
             maximumCapacity: Double,
             defaultInitialCapacity: Double?
         ) -> Config {
@@ -60,7 +61,7 @@ final class AppleMediaRateController {
             }
             let minimum = value(
                 "ROOTSHELL_VNC_RC_MIN_KBPS",
-                default: AppleMediaRateController.nativeScreenMinimumBitrateBps / 1_000
+                default: minimumCapacity / 1_000
             ) * 1_000
             let maximum = value(
                 "ROOTSHELL_VNC_RC_MAX_KBPS",
@@ -153,8 +154,13 @@ final class AppleMediaRateController {
     private var owrdLongAverageLag: Double?
     private(set) var owrdSeconds: Double = 0
 
-    init(maxTargetBps: Double, initialTargetBps: Double? = nil) {
+    init(
+        minTargetBps: Double = AppleMediaRateController.nativeScreenMinimumBitrateBps,
+        maxTargetBps: Double,
+        initialTargetBps: Double? = nil
+    ) {
         config = Config.fromEnvironment(
+            minimumCapacity: minTargetBps,
             maximumCapacity: maxTargetBps,
             defaultInitialCapacity: initialTargetBps)
         capacityEstimate = config.initialCapacity

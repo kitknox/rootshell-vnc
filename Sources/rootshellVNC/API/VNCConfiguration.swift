@@ -161,6 +161,10 @@ public struct VNCConfiguration: Sendable {
         }
     }
 
+    /// The High Performance bitrate range. `.constrained` keeps HEVC working
+    /// below the full profile's 20 Mbps floor, with a 6 Mbps ceiling.
+    public var highPerformanceBandwidth: AppleMediaBandwidthProfile
+
     /// Host-supplied factory for the connection carrying the RFB byte stream
     /// (an SSH direct-tcpip channel, a tssh tunnel, ...). `nil` uses a direct
     /// TCP connection.
@@ -369,6 +373,7 @@ public struct VNCConfiguration: Sendable {
     ///     transport; clamps `.adaptive` quality to `.standard` unless
     ///     `datagramProvider` is also given.
     ///   - datagramProvider: Optional UDP media path for the tunnel.
+    ///   - highPerformanceBandwidth: The High Performance bitrate range.
     ///   - displaySizingMode: `nil` picks Match Client for High Performance
     ///     and Remote Display otherwise.
     public init(
@@ -376,6 +381,7 @@ public struct VNCConfiguration: Sendable {
         preferredEncodings: [Encoding] = [.copyRect, .raw],
         enableHighPerformanceMode: Bool = true,
         videoQualityMode: VideoQualityMode = .adaptive,
+        highPerformanceBandwidth: AppleMediaBandwidthProfile = .full,
         displaySizingMode: DisplaySizingMode? = nil,
         displayCount: Int = 1,
         displayMode: DisplayMode? = nil,
@@ -403,6 +409,7 @@ public struct VNCConfiguration: Sendable {
             ? .standard
             : videoQualityMode
         self.videoQualityMode = videoQualityMode
+        self.highPerformanceBandwidth = highPerformanceBandwidth
         self.transportProvider = transportProvider
         self.datagramProvider = datagramProvider
         let requestedDisplayMode = displayMode ?? (

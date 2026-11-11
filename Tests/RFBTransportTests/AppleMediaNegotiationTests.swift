@@ -295,6 +295,13 @@ final class AppleMediaNegotiationTests: XCTestCase {
             4)
     }
 
+    func testOnlyCapturesBeyondOnePictureNeedFourTiles() {
+        XCTAssertFalse(AppleMediaVideoMode.fitsOnePicture(totalLumaSamples: 5120 * 2880))
+        XCTAssertTrue(AppleMediaVideoMode.fitsOnePicture(totalLumaSamples: 2048 * 1904))
+        XCTAssertTrue(AppleMediaVideoMode.fitsOnePicture(totalLumaSamples: 2720 * 1872))
+        XCTAssertFalse(AppleMediaVideoMode.fitsOnePicture(totalLumaSamples: 0))
+    }
+
     func testPublicAirSizedOfferRequestsConventionalSinglePictureHEVC() throws {
         let tiles = AppleMediaNegotiationProfile.publicDecoderTilesPerFrame(
             pixelWidth: 3664,

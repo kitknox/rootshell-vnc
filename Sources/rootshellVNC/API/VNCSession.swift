@@ -2139,7 +2139,7 @@ public final class VNCSession {
             logger.info("Apple media UDP started on local port \(localPort)")
 
         case .appleMediaUnavailable(let reason):
-            fallBackToStandard(reason: reason)
+            stepDownHighPerformance(reason: reason)
 
         case .appleMediaControlRecord:
             break
@@ -2744,7 +2744,8 @@ public final class VNCSession {
         await applyAcceptedMediaStreamGeometry(geometry)
     }
 
-    func applyAcceptedMediaStreamGeometry(_ geometry: VideoFrameGeometry) async {
+    func applyAcceptedMediaStreamGeometry(_ codedGeometry: VideoFrameGeometry) async {
+        let geometry = unpaddedMediaGeometry(codedGeometry)
         guard geometry.width > 0, geometry.height > 0,
               geometry.width <= Int(UInt16.max),
               geometry.height <= Int(UInt16.max) else { return }
@@ -2791,6 +2792,31 @@ public final class VNCSession {
             mediaDisplaySizeOverride: (
                 width: geometry.width,
                 height: geometry.height))
+    }
+
+    /// Low Bandwidth (mode 5) centers the screen in a picture padded up to a
+    /// 16-point multiple. Layout, input bounds, and committed frames take the
+    /// real size: the one requested for Match Client, or the reported display.
+    private func unpaddedMediaGeometry(_ geometry: VideoFrameGeometry) -> VideoFrameGeometry {
+        guard configuration.highPerformanceBandwidth == .constrained else { return geometry }
+        var candidates: [(width: Int, height: Int)] = []
+        if let requested = lastRequestedClientDisplaySize ?? preparedClientDisplaySize {
+            candidates.append((Int(requested.pixelWidth), Int(requested.pixelHeight)))
+        }
+        if let display = remoteDisplayRegions.first {
+            candidates.append((Int(display.width), Int(display.height)))
+        }
+        for size in candidates {
+            let padWidth = geometry.width - size.width
+            let padHeight = geometry.height - size.height
+            guard (0..<32).contains(padWidth), (0..<32).contains(padHeight),
+                  padWidth + padHeight > 0 else { continue }
+            return VideoFrameGeometry(
+                width: size.width,
+                height: size.height,
+                mediaGeneration: geometry.mediaGeneration)
+        }
+        return geometry
     }
 
     private func handleError(_ error: VNCProtocolError) {
@@ -3694,7 +3720,7 @@ public final class VNCSession {
         // repeated "Connection interrupted".
         guard consecutiveMediaBootstrapReconnects
                 < Self.maximumConsecutiveMediaBootstrapReconnects else {
-            if !fallBackToStandard(reason: "video could not start (\(reason))") {
+            if !stepDownHighPerformance(reason: "video could not start (\(reason))") {
                 failAfterMediaBootstrapExhausted(reason: reason)
             }
             return
@@ -3706,7 +3732,7 @@ public final class VNCSession {
                await transport.appleMediaPathBelowHighPerformanceFloor,
                let self,
                self.transportSession === transport,
-               self.fallBackToStandard(
+               self.stepDownHighPerformance(
                    reason: "network below High Performance's bandwidth floor") {
                 return
             }
@@ -3736,6 +3762,10 @@ public final class VNCSession {
         scheduleReconnect(immediate: true)
     }
 
+    /// Seconds a new stream may go without a video source: a Mac waking its
+    /// display captured nothing for over 5 s.
+    nonisolated private static let mediaSourceStartupGrace = 10
+
     /// Room for the server's long-term-reference repair to arrive after a loss.
     nonisolated private static let lossKeyframeGrace: Duration = .milliseconds(400)
     /// Decoder output this soon after the loss may be a frame already in flight.
@@ -3750,6 +3780,28 @@ public final class VNCSession {
         guard let manager else { return false }
         return manager.decodeProgress.lastDecoderOutputNanos
             <= lossNanos &+ inFlightDecodeNanos
+    }
+
+    /// Step a failing High Performance session down: the full profile reconnects
+    /// in the low-bandwidth one, which falls back to Standard only while no
+    /// video decodes. Returns whether a reconnect started.
+    @discardableResult
+    private func stepDownHighPerformance(reason: String) -> Bool {
+        guard configuration.videoQualityMode == .adaptive else { return false }
+        guard configuration.highPerformanceBandwidth == .constrained else {
+            var constrained = configuration
+            constrained.highPerformanceBandwidth = .constrained
+            guard reconnect(with: constrained) else { return false }
+            logger.warning("Continuing in low-bandwidth High Performance: \(reason)")
+            return true
+        }
+        let lastOutput = videoStreamManager?.decodeProgress.lastDecoderOutputNanos ?? 0
+        if lastOutput != 0,
+           DispatchTime.now().uptimeNanoseconds &- lastOutput < 2_000_000_000 {
+            logger.info("Keeping High Performance through \(reason): video is decoding")
+            return false
+        }
+        return fallBackToStandard(reason: reason)
     }
 
     /// Leave High Performance for this session and reconnect in Standard,
@@ -3794,6 +3846,7 @@ public final class VNCSession {
                 configuration.displaySizingMode == .matchClient,
             appleMediaTilesPerFrameOverride:
                 appleMediaTilesPerFrameOverride,
+            appleMediaBandwidthProfile: configuration.highPerformanceBandwidth,
             serverRendersCursor: cursorRendering == .server,
             connection: customConnection,
             datagramProvider: configuration.datagramProvider,
@@ -3801,6 +3854,9 @@ public final class VNCSession {
             certificateValidationHandler: configuration.certificateValidationHandler)
         negotiatedCursorRendering = cursorRendering
         transportSession = transport
+        let centersPaddedPicture = configuration.highPerformanceBandwidth == .constrained
+        videoBandRenderer.setCentersPaddedPicture(centersPaddedPicture)
+        secondaryVideoBandRenderer.setCentersPaddedPicture(centersPaddedPicture)
 
         if configuration.displaySizingMode == .matchClient,
            let preparedClientDisplaySize {
@@ -4466,12 +4522,12 @@ public final class VNCSession {
                         self?.noteMediaBootstrapHealthy()
                         return
                     }
-                    // Some servers accept tilesPerFrame=1 in message 2 but
-                    // never instantiate a video RTP source for it. This is a
-                    // profile rejection, not packet loss, so FIR cannot help.
-                    // Retry quickly with the native compound capability.
-                    if sources == 1, decoded == 0, tick >= 3,
-                       await transport.videoSourceCount == 0 {
+                    // A one-picture stream with no source after the grace is
+                    // a profile rejection only when the capture is too big for
+                    // one picture; four tiles on a smaller one overrun the cap.
+                    if sources == 1, decoded == 0, tick >= Self.mediaSourceStartupGrace,
+                       await transport.videoSourceCount == 0,
+                       await transport.appleMediaCaptureExceedsOnePicture {
                         self?.forceMediaBootstrapReconnect(
                             reason: "one-picture profile produced no video source",
                             retryTilesPerFrame: 4)
@@ -4479,7 +4535,7 @@ public final class VNCSession {
                     }
                     // Not one video packet: the UDP media path does not work
                     // here, and only Standard can show anything.
-                    if decoded == 0, tick >= 5,
+                    if decoded == 0, tick >= Self.mediaSourceStartupGrace,
                        await transport.videoSourceCount == 0,
                        self?.fallBackToStandard(
                            reason: "no video reached this device") == true {

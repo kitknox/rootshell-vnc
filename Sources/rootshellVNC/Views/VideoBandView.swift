@@ -91,6 +91,12 @@ public final class VideoBandLayerRenderer {
         layout()
     }
 
+    /// Low Bandwidth (mode 5) centers the screen in a padded picture; crop its
+    /// middle rather than the top-left corner.
+    public func setCentersPaddedPicture(_ centers: Bool) {
+        compositor.centersSinglePicture = centers
+    }
+
     public func configureExpectedBandCount(_ count: Int) {
         expectedBandCount = max(1, count)
     }
@@ -365,6 +371,7 @@ private final class CompoundBandSurfaceCompositor {
     private var pool: CVPixelBufferPool?
     private var poolWidth = 0
     private var poolHeight = 0
+    var centersSinglePicture = false
 
     func reset() {
         pool = nil
@@ -384,21 +391,24 @@ private final class CompoundBandSurfaceCompositor {
         let outputBounds = CGRect(x: 0, y: 0, width: width, height: height)
         var frame = CIImage(color: .black).cropped(to: outputBounds)
         var top = 0
+        let centered = centersSinglePicture && bands.count == 1
 
         for (_, pixelBuffer) in bands.sorted(by: { $0.key < $1.key }) {
             guard top < height else { break }
             let sourceWidth = CVPixelBufferGetWidth(pixelBuffer)
             let sourceHeight = CVPixelBufferGetHeight(pixelBuffer)
-            let validHeight = min(sourceHeight, height - top)
+            let leftInset = centered ? max(0, (sourceWidth - width) / 2) : 0
+            let topInset = centered ? max(0, (sourceHeight - height) / 2) : 0
+            let validHeight = min(sourceHeight - topInset, height - top)
             guard sourceWidth > 0, validHeight > 0 else { continue }
 
-            // CIImage uses a bottom-left origin. The server's coded padding is
-            // at the bottom of the last band, so retain the top valid rows.
+            // CIImage uses a bottom-left origin. Coded padding is at the bottom
+            // of the last band, so retain the top valid rows, after any inset.
             let source = CIImage(cvPixelBuffer: pixelBuffer)
             let crop = CGRect(
-                x: source.extent.minX,
-                y: source.extent.maxY - CGFloat(validHeight),
-                width: min(CGFloat(width), source.extent.width),
+                x: source.extent.minX + CGFloat(leftInset),
+                y: source.extent.maxY - CGFloat(topInset + validHeight),
+                width: min(CGFloat(width), source.extent.width - CGFloat(leftInset)),
                 height: CGFloat(validHeight))
             let destinationBottom = height - top - validHeight
             let placed = source

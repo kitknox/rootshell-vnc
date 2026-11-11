@@ -213,8 +213,13 @@ public enum AppleMediaVideoMode {
             "ROOTSHELL_VNC_TILES_PER_FRAME"] != nil {
             return negotiatedTilesPerFrame
         }
-        guard totalLumaSamples > 0 else { return 4 }
-        return totalLumaSamples <= level51MaximumLumaSamples ? 1 : 4
+        return fitsOnePicture(totalLumaSamples: totalLumaSamples) ? 1 : 4
+    }
+
+    /// Whether one 60-fps level-5.1 picture covers the capture; false while
+    /// the size is unknown.
+    static func fitsOnePicture(totalLumaSamples: Int) -> Bool {
+        totalLumaSamples > 0 && totalLumaSamples <= level51MaximumLumaSamples
     }
 
     /// Number of sources requested from and expected from the server.
