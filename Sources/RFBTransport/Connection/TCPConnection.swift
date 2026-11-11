@@ -65,6 +65,12 @@ public actor TCPConnection: RFBConnection {
     /// connect time for the same reason.
     private var lastKnownRemoteEndpoint: String?
 
+    /// Picks the system SOCKS proxy for each dial; injectable for tests.
+    private let socksProxyResolver: @Sendable (String, UInt16) -> SOCKS5ProxyEndpoint?
+
+    /// Proxy carrying the live connection. Its peer and path are the proxy's.
+    private var socksProxy: SOCKS5ProxyEndpoint?
+
     /// User-space read buffer. RFB parsing does many small field-sized reads,
     /// so a single channel read is shared across subsequent parser requests.
     private var receiveBuffer = Data()
@@ -133,7 +139,10 @@ public actor TCPConnection: RFBConnection {
         maxDialAttempts: Int,
         dialRetryBackoffNanos: UInt64,
         connectTimeoutSeconds: Int,
-        keepalive: KeepaliveSettings = KeepaliveSettings()
+        keepalive: KeepaliveSettings = KeepaliveSettings(),
+        socksProxyResolver: @escaping @Sendable (String, UInt16) -> SOCKS5ProxyEndpoint? = {
+            SystemSOCKSProxy.endpoint(forHost: $0, port: $1)
+        }
     ) {
         self.host = host
         self.port = port
@@ -141,6 +150,7 @@ public actor TCPConnection: RFBConnection {
         self.dialRetryBackoffNanos = dialRetryBackoffNanos
         self.connectTimeoutSeconds = max(1, connectTimeoutSeconds)
         self.keepalive = keepalive
+        self.socksProxyResolver = socksProxyResolver
     }
 
     public func connect() async throws {
@@ -182,6 +192,24 @@ public actor TCPConnection: RFBConnection {
     }
 
     private func dialOnce() async throws {
+        guard let proxy = socksProxyResolver(host, port) else {
+            return try await dial(through: nil)
+        }
+        do {
+            try await dial(through: proxy)
+        } catch SOCKS5Handshake.Failure.noAcceptableMethod {
+            // Network.framework can use the proxy's saved credentials; we can't.
+            log.warning(
+                "SOCKS5 proxy \(proxy.host):\(proxy.port) requires authentication; "
+                    + "leaving \(host):\(port) to the system proxy handling")
+            try await dial(through: nil)
+        }
+    }
+
+    /// Network.framework's own SOCKS client can withhold the server bytes that
+    /// share a read with the CONNECT reply (kitknox/rootshell#738), so a proxied
+    /// dial turns it off and negotiates through `receiveBuffer` instead.
+    private func dial(through proxy: SOCKS5ProxyEndpoint?) async throws {
         let handler = InboundByteStreamHandler { [weak self] error in
             Task { await self?.notifyUnexpectedDisconnect(error) }
         }
@@ -202,43 +230,102 @@ public actor TCPConnection: RFBConnection {
             // a paused renderer also stops draining the kernel socket.
             .channelOption(ChannelOptions.autoRead, value: false)
             .channelOption(NIOTSChannelOptions.allowLocalEndpointReuse, value: true)
-            .configureNWParameters { parameters in
+            .configureNWParameters { [bypassesSystemProxy = proxy != nil] parameters in
                 parameters.serviceClass = .responsiveData
+                if bypassesSystemProxy { parameters.preferNoProxies = true }
             }
             .channelInitializer { channel in
                 channel.pipeline.addHandler(handler)
             }
 
-        log.info("Connecting to \(host):\(port)")
+        let route = proxy.map { " via SOCKS5 proxy \($0.host):\($0.port)" } ?? ""
+        log.info("Connecting to \(host):\(port)\(route)")
+        let connectedChannel: Channel
         do {
-            let connectedChannel = try await bootstrap
-                .connect(host: host, port: Int(port))
+            connectedChannel = try await bootstrap
+                .connect(host: proxy?.host ?? host, port: Int(proxy?.port ?? port))
                 .get()
-            channel = connectedChannel
-            inboundHandler = handler
-            inboundQueue = handler.queue
-            connected = true
-            // Both of these populate the caches above as a side effect, which
-            // is the point: the teardown summary runs after the channel is
-            // dead and needs a value captured while it was not.
-            let pathDescription = await pathCharacteristics()
-                .map { String(describing: $0.interface) } ?? "unknown"
-            let peerDescription = await remoteEndpointHost() ?? "unknown"
-            log.info(
-                "Connected to \(host):\(port) "
-                    + "(keepalive idle=\(keepalive.idleSeconds)s "
-                    + "interval=\(keepalive.intervalSeconds)s "
-                    + "count=\(keepalive.probeCount), "
-                    + "dead-peer verdict after ~\(keepalive.deadPeerDetectionSeconds)s of silence)")
-            // Peer and interface on the record at connect time. Which of the
-            // server's addresses Happy Eyeballs picked for a Bonjour name is
-            // otherwise only inferable from the media path's own log line.
-            log.info("Selected peer \(peerDescription) over \(pathDescription)")
         } catch {
             let protocolError = VNCProtocolError.ioError(
                 "Connection failed: \(error.localizedDescription)")
             handler.finish(throwing: protocolError)
             throw protocolError
+        }
+        channel = connectedChannel
+        inboundHandler = handler
+        inboundQueue = handler.queue
+        socksProxy = proxy
+        if let proxy {
+            do {
+                try await negotiateSOCKS5(on: connectedChannel, handler: handler)
+            } catch {
+                handler.stopReportingDisconnect()
+                try? await connectedChannel.close().get()
+                handler.finish()
+                channel = nil
+                inboundHandler = nil
+                inboundQueue = nil
+                socksProxy = nil
+                receiveBuffer.removeAll(keepingCapacity: true)
+                receiveOffset = 0
+                if case SOCKS5Handshake.Failure.noAcceptableMethod = error { throw error }
+                let reason = (error as? SOCKS5Handshake.Failure)?.reason
+                    ?? "handshake interrupted (\(error.localizedDescription))"
+                throw VNCProtocolError.ioError(
+                    "SOCKS5 proxy \(proxy.host):\(proxy.port): \(reason)")
+            }
+        }
+        connected = true
+        // Both of these populate the caches above as a side effect, which
+        // is the point: the teardown summary runs after the channel is
+        // dead and needs a value captured while it was not.
+        let pathDescription = await pathCharacteristics()
+            .map { String(describing: $0.interface) } ?? "unknown"
+        let peerDescription = await remoteEndpointHost() ?? "unknown"
+        log.info(
+            "Connected to \(host):\(port)\(route) "
+                + "(keepalive idle=\(keepalive.idleSeconds)s "
+                + "interval=\(keepalive.intervalSeconds)s "
+                + "count=\(keepalive.probeCount), "
+                + "dead-peer verdict after ~\(keepalive.deadPeerDetectionSeconds)s of silence)")
+        // Peer and interface on the record at connect time. Which of the
+        // server's addresses Happy Eyeballs picked for a Bonjour name is
+        // otherwise only inferable from the media path's own log line.
+        if proxy == nil {
+            log.info("Selected peer \(peerDescription) over \(pathDescription)")
+        }
+    }
+
+    /// Reads only the reply's own bytes, so any server data that arrived with
+    /// it stays buffered for the RFB handshake.
+    private func negotiateSOCKS5(
+        on channel: Channel,
+        handler: InboundByteStreamHandler
+    ) async throws {
+        let start = DispatchTime.now().uptimeNanoseconds
+        let timeoutSeconds = connectTimeoutSeconds
+        let deadline = channel.eventLoop.scheduleTask(in: .seconds(Int64(timeoutSeconds))) {
+            handler.stopReportingDisconnect()
+            channel.close(promise: nil)
+        }
+        defer { deadline.cancel() }
+        do {
+            try await send(SOCKS5Handshake.methodRequest)
+            try SOCKS5Handshake.checkMethodSelection(try await read(exactly: 2))
+            try await send(try SOCKS5Handshake.connectRequest(host: host, port: port))
+            switch try SOCKS5Handshake.boundAddress(afterReplyHeader: try await read(exactly: 4)) {
+            case .fixed(let count):
+                _ = try await read(exactly: count)
+            case .domain:
+                let length = try await read(exactly: 1)
+                _ = try await read(exactly: Int(length[length.startIndex]) + 2)
+            }
+        } catch {
+            let elapsed = DispatchTime.now().uptimeNanoseconds &- start
+            if elapsed >= UInt64(timeoutSeconds) * 1_000_000_000 {
+                throw SOCKS5Handshake.Failure.timedOut(seconds: timeoutSeconds)
+            }
+            throw error
         }
     }
 
@@ -329,6 +416,7 @@ public actor TCPConnection: RFBConnection {
         inboundHandler = nil
         inboundQueue = nil
         connected = false
+        socksProxy = nil
         receiveBuffer.removeAll()
         receiveOffset = 0
         // Callers that want these read them from the teardown summary, which
@@ -357,6 +445,8 @@ public actor TCPConnection: RFBConnection {
     /// been torn down, and "the interface this connection was actually using"
     /// is still the answer it needs.
     public func pathCharacteristics() async -> NetworkPathCharacteristics? {
+        // A local proxy would read as a 60 Mbps loopback bearer.
+        guard socksProxy == nil else { return nil }
         guard let channel else { return lastKnownPath }
         guard let path = try? await channel
             .getOption(NIOTSChannelOptions.currentPath)
@@ -388,6 +478,8 @@ public actor TCPConnection: RFBConnection {
     /// this preserves IPv6 for a dual-stack Bonjour name instead of asking the
     /// UDP media path to perform a second, potentially different resolution.
     public func remoteEndpointHost() async -> String? {
+        // The peer is the proxy, not the server Apple media UDP must reach.
+        guard socksProxy == nil else { return nil }
         guard let channel,
               let path = try? await channel
                 .getOption(NIOTSChannelOptions.currentPath)
@@ -579,6 +671,7 @@ private final class InboundByteStreamHandler: ChannelInboundHandler, @unchecked 
     private var tlsContinuation: CheckedContinuation<Void, Error>?
     private var tlsHandshakePending = false
     private var didFinish = false
+    private var reportsDisconnect = true
 
     init(disconnect: @escaping @Sendable (VNCProtocolError) -> Void) {
         self.disconnect = disconnect
@@ -617,7 +710,7 @@ private final class InboundByteStreamHandler: ChannelInboundHandler, @unchecked 
         let protocolError = VNCProtocolError.ioError(Self.describe(error))
         completeTLS(.failure(protocolError))
         finish(throwing: protocolError)
-        disconnect(protocolError)
+        reportDisconnect(protocolError)
         context.close(promise: nil)
     }
 
@@ -631,8 +724,23 @@ private final class InboundByteStreamHandler: ChannelInboundHandler, @unchecked 
         let error = VNCProtocolError.connectionClosed
         completeTLS(.failure(error))
         finish(throwing: error)
-        disconnect(error)
+        reportDisconnect(error)
         context.fireChannelInactive()
+    }
+
+    /// A channel dropped during connect fails `connect()` instead; the session's
+    /// disconnect handler is already installed and must not see it.
+    func stopReportingDisconnect() {
+        lock.lock()
+        reportsDisconnect = false
+        lock.unlock()
+    }
+
+    private func reportDisconnect(_ error: VNCProtocolError) {
+        lock.lock()
+        let armed = reportsDisconnect
+        lock.unlock()
+        if armed { disconnect(error) }
     }
 
     func waitForTLSHandshake() async throws {
