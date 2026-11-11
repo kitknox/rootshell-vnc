@@ -7,7 +7,7 @@ enum RemoteMenuShortcut: String, CaseIterable, Identifiable {
     case switchApp, switchAppBackward, switchWindow, hide, hideOthers, minimize
     case closeWindow, quit, fullScreen, spotlight, settings
     case newDocument, open, save, print, newTab, reopenTab, previousTab, nextTab
-    case escape, tab, backTab, enter, backspace, forwardDelete
+    case escape, tab, backTab, controlSpace, enter, backspace, forwardDelete
 
     var id: Self { self }
 
@@ -17,7 +17,7 @@ enum RemoteMenuShortcut: String, CaseIterable, Identifiable {
         .minimize, .fullScreen, .spotlight, .settings, .closeWindow, .quit,
     ]
     static let documents: [Self] = [.newDocument, .open, .save, .print, .newTab, .reopenTab, .previousTab, .nextTab]
-    static let keys: [Self] = [.escape, .tab, .backTab, .enter, .backspace, .forwardDelete]
+    static let keys: [Self] = [.escape, .tab, .backTab, .controlSpace, .enter, .backspace, .forwardDelete]
 
     var title: String {
         switch self {
@@ -51,6 +51,7 @@ enum RemoteMenuShortcut: String, CaseIterable, Identifiable {
         case .escape: String(localized: "Escape", bundle: .module)
         case .tab: String(localized: "Tab", bundle: .module)
         case .backTab: String(localized: "Shift-Tab", bundle: .module)
+        case .controlSpace: String(localized: "Control-Space", bundle: .module)
         case .enter: String(localized: "Return", bundle: .module)
         case .backspace: String(localized: "Backspace", bundle: .module)
         case .forwardDelete: String(localized: "Forward Delete", bundle: .module)
@@ -71,7 +72,7 @@ enum RemoteMenuShortcut: String, CaseIterable, Identifiable {
         case .minimize: "m"
         case .closeWindow: "w"
         case .quit: "q"
-        case .spotlight: " "
+        case .spotlight, .controlSpace: " "
         case .settings: ","
         case .newDocument: "n"
         case .open: "o"
@@ -91,6 +92,7 @@ enum RemoteMenuShortcut: String, CaseIterable, Identifiable {
         switch self {
         case .escape, .tab, .enter, .backspace, .forwardDelete: []
         case .backTab: [.shift]
+        case .controlSpace: [.control]
         case .redo, .switchAppBackward, .reopenTab, .previousTab, .nextTab: [.command, .shift]
         case .pasteAndMatchStyle: [.command, .option, .shift]
         case .hideOthers: [.command, .option]
