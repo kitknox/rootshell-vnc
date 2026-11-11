@@ -76,6 +76,8 @@ struct LoginPasswordSendStabilityGate {
     }
 
     private(set) var isPending = false
+    /// Part of the user's approval: whether the queued send ends with Return.
+    private(set) var pendingPressesReturn = true
     private(set) var displayRevision: UInt64 = 0
     private(set) var stableCandidate: Token?
     private(set) var isTransportSettled = false
@@ -84,8 +86,9 @@ struct LoginPasswordSendStabilityGate {
     /// revalidated by generation instead of discarded by arrival order.
     private(set) var latestEligibleFrameGeneration: UInt64?
 
-    mutating func requestSend() -> Token? {
+    mutating func requestSend(pressingReturn: Bool = true) -> Token? {
         isPending = true
+        pendingPressesReturn = pressingReturn
         return isTransportSettled ? stableCandidate : nil
     }
 
@@ -163,6 +166,7 @@ struct LoginPasswordSendStabilityGate {
     mutating func reset(preservePendingSend: Bool = false) {
         if !preservePendingSend {
             isPending = false
+            pendingPressesReturn = true
         }
         isTransportSettled = false
         displayRevision &+= 1
@@ -1529,19 +1533,22 @@ public final class VNCSession {
         return true
     }
 
-    /// Type the active connection's password and press Return. This mirrors
-    /// the behavior of remote-desktop clients' “Type User Password” action.
+    /// Type the active connection's password, then press Return unless
+    /// `pressingReturn` is false. Type-only sends click and clear the field
+    /// only while the server reports the Login Window; otherwise they type
+    /// into the current focus.
     /// Callers should obtain confirmation before invoking this method.
-    public func sendLoginPassword() {
+    public func sendLoginPassword(pressingReturn: Bool = true) {
         guard canSendLoginPassword, let password = activeCredentials?.password else { return }
 
         guard shouldDeferLoginPasswordForMatchClientStability else {
-            sendLoginPasswordNow(password)
+            sendLoginPasswordNow(password, pressingReturn: pressingReturn)
             return
         }
 
         let wasPending = loginPasswordSendGate.isPending
-        let token = loginPasswordSendGate.requestSend()
+        let token = loginPasswordSendGate.requestSend(
+            pressingReturn: pressingReturn)
         if let token {
             scheduleLoginPasswordSendAfterStability(token: token)
         } else {
@@ -1553,14 +1560,29 @@ public final class VNCSession {
         }
     }
 
-    private func sendLoginPasswordNow(_ password: String) {
-        logger.info("Sending approved login password input")
+    private func sendLoginPasswordNow(
+        _ password: String,
+        pressingReturn: Bool
+    ) {
+        // Live server state only: lock-screen OCR stays latched for the
+        // connection and outlives an unlock no announcement reports.
+        let focusesField = Self.loginPasswordFocusesField(
+            pressingReturn: pressingReturn,
+            serverReportsLoginWindow: appleLoginPromptTracker.isLoginActive)
+        logger.info(
+            "Sending approved login password input: "
+                + "pressReturn=\(pressingReturn) focusField=\(focusesField)")
         lastLoginPasswordDeliveryNanos = DispatchTime.now().uptimeNanoseconds
 
         let focusX = UInt16(clamping: framebufferWidth / 2)
         let focusY = UInt16(clamping: framebufferHeight / 2)
-        let events = Self.loginPasswordFocusInputEvents(x: focusX, y: focusY)
-            + Self.loginPasswordInputEvents(password: password)
+        let focusEvents = focusesField
+            ? Self.loginPasswordFocusInputEvents(x: focusX, y: focusY)
+            : []
+        let events = focusEvents
+            + Self.loginPasswordInputEvents(
+                password: password,
+                pressingReturn: pressingReturn)
         for event in events {
             switch event {
             case .key(let downFlag, let keysym):
@@ -1574,6 +1596,15 @@ public final class VNCSession {
                 assertionFailure("Unexpected event in login password sequence")
             }
         }
+    }
+
+    /// The focus click and field clear suit the Login Window only. Elsewhere
+    /// a type-only send must keep the field the user chose, and its contents.
+    nonisolated static func loginPasswordFocusesField(
+        pressingReturn: Bool,
+        serverReportsLoginWindow: Bool
+    ) -> Bool {
+        pressingReturn || serverReportsLoginWindow
     }
 
     /// Focus macOS Login Window before typing. Pointer events and the pause
@@ -1602,12 +1633,14 @@ public final class VNCSession {
     }
 
     /// Construct the exact ordered input sequence used by
-    /// ``sendLoginPassword()``. Modifier releases prevent a locally held or
-    /// remotely latched modifier from changing the password, while a small
-    /// delay after each complete key tap gives login windows time to process
-    /// secure text input without separating a key-down from its key-up.
+    /// ``sendLoginPassword(pressingReturn:)``. Modifier releases prevent a
+    /// locally held or remotely latched modifier from changing the password,
+    /// while a small delay after each complete key tap gives login windows
+    /// time to process secure text input without separating a key-down from
+    /// its key-up.
     nonisolated static func loginPasswordInputEvents(
-        password: String
+        password: String,
+        pressingReturn: Bool = true
     ) -> [SessionInputEvent] {
         let modifierKeysyms: [UInt32] = [
             KeyboardInputHandler.keysymCapsLock,
@@ -1635,7 +1668,9 @@ public final class VNCSession {
         for character in password {
             appendKeyTap(KeyboardInputHandler.keysymForCharacter(character))
         }
-        appendKeyTap(KeyboardInputHandler.keysymReturn)
+        if pressingReturn {
+            appendKeyTap(KeyboardInputHandler.keysymReturn)
+        }
         return events
     }
 
@@ -3291,7 +3326,9 @@ public final class VNCSession {
             self.logger.warning(
                 "Stability signals never converged after resize; sending "
                     + "login password now")
-            self.sendLoginPasswordNow(password)
+            self.sendLoginPasswordNow(
+                password,
+                pressingReturn: self.loginPasswordSendGate.pendingPressesReturn)
         }
     }
 
@@ -3347,7 +3384,9 @@ public final class VNCSession {
                 return
             }
             self.cancelLoginPasswordSendWatchdog()
-            self.sendLoginPasswordNow(password)
+            self.sendLoginPasswordNow(
+                password,
+                pressingReturn: self.loginPasswordSendGate.pendingPressesReturn)
         }
     }
 

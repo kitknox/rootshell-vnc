@@ -284,9 +284,12 @@ public struct RemoteDesktopView: View {
                     Button(String(localized: "Type Password and Log In", bundle: .module)) {
                         session.sendLoginPassword()
                     }
+                    Button(String(localized: "Type Password Only", bundle: .module)) {
+                        session.sendLoginPassword(pressingReturn: false)
+                    }
                     Button(String(localized: "Cancel", bundle: .module), role: .cancel) {}
                 } message: {
-                    Text(String(localized: "The password will be typed into the remote computer, followed by Return.", bundle: .module))
+                    Text(String(localized: "The password will be typed into the remote computer. Type Password Only skips Return so you can submit it yourself.", bundle: .module))
                 }
                 .onChange(of: geometry.size) { _, newSize in
                     viewport.clampOffset(

@@ -29,6 +29,33 @@ final class LoginPasswordInputTests: XCTestCase {
         ])
     }
 
+    func testTypeOnlySequenceOmitsReturn() {
+        let submitting = VNCSession.loginPasswordInputEvents(password: "Aé")
+        let typeOnly = VNCSession.loginPasswordInputEvents(
+            password: "Aé",
+            pressingReturn: false)
+
+        XCTAssertEqual(typeOnly, Array(submitting.dropLast(3)))
+        XCTAssertEqual(Array(typeOnly.suffix(3)), [
+            .key(downFlag: true, keysym: 0xE9),
+            .key(downFlag: false, keysym: 0xE9),
+            .pause(nanoseconds: 5_000_000),
+        ])
+        XCTAssertFalse(typeOnly.contains(
+            .key(downFlag: true, keysym: KeyboardInputHandler.keysymReturn)))
+    }
+
+    func testFocusClickOnlyForSubmitOrServerReportedLoginWindow() {
+        XCTAssertTrue(VNCSession.loginPasswordFocusesField(
+            pressingReturn: true, serverReportsLoginWindow: true))
+        XCTAssertTrue(VNCSession.loginPasswordFocusesField(
+            pressingReturn: true, serverReportsLoginWindow: false))
+        XCTAssertTrue(VNCSession.loginPasswordFocusesField(
+            pressingReturn: false, serverReportsLoginWindow: true))
+        XCTAssertFalse(VNCSession.loginPasswordFocusesField(
+            pressingReturn: false, serverReportsLoginWindow: false))
+    }
+
     func testPasswordFocusClickClearsFieldBeforeTypingBarrier() {
         XCTAssertEqual(
             VNCSession.loginPasswordFocusInputEvents(x: 800, y: 600),
@@ -210,6 +237,25 @@ final class LoginPasswordInputTests: XCTestCase {
         let token = gate.noteEligibleFrame(mediaGeneration: 1)
         XCTAssertNotNil(token)
         XCTAssertTrue(gate.consume(token!))
+    }
+
+    func testStabilityGateKeepsTypeOnlyChoiceAcrossReconnect() {
+        var gate = LoginPasswordSendStabilityGate()
+        XCTAssertTrue(gate.pendingPressesReturn)
+
+        _ = gate.requestSend(pressingReturn: false)
+        gate.reset(preservePendingSend: true)
+        XCTAssertTrue(gate.isPending)
+        XCTAssertFalse(gate.pendingPressesReturn)
+
+        // The latest approval wins while a send is still queued.
+        _ = gate.requestSend()
+        XCTAssertTrue(gate.pendingPressesReturn)
+        _ = gate.requestSend(pressingReturn: false)
+
+        gate.reset()
+        XCTAssertFalse(gate.isPending)
+        XCTAssertTrue(gate.pendingPressesReturn)
     }
 
     func testResetWithoutPreservationDropsPendingSend() {
