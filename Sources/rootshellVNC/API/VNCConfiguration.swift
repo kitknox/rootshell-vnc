@@ -155,8 +155,8 @@ public struct VNCConfiguration: Sendable {
                 videoQualityMode = .standard
             }
             if videoQualityMode != .adaptive,
-               displaySizingMode == .matchClient {
-                displaySizingMode = .remoteDisplay
+               displayMode == .twoVirtualDisplays {
+                displayMode = .oneDisplay
             }
         }
     }
@@ -208,11 +208,6 @@ public struct VNCConfiguration: Sendable {
     /// Whether a capable server should render at the client viewport size.
     public var displaySizingMode: DisplaySizingMode {
         didSet {
-            if videoQualityMode != .adaptive,
-               displaySizingMode == .matchClient {
-                displaySizingMode = .remoteDisplay
-                return
-            }
             guard oldValue != displaySizingMode else { return }
             if displaySizingMode == .matchClient,
                displayMode == .allDisplaysCombined {
@@ -374,12 +369,14 @@ public struct VNCConfiguration: Sendable {
     ///     transport; clamps `.adaptive` quality to `.standard` unless
     ///     `datagramProvider` is also given.
     ///   - datagramProvider: Optional UDP media path for the tunnel.
+    ///   - displaySizingMode: `nil` picks Match Client for High Performance
+    ///     and Remote Display otherwise.
     public init(
         preferredPixelFormat: PixelFormat? = nil,
         preferredEncodings: [Encoding] = [.copyRect, .raw],
         enableHighPerformanceMode: Bool = true,
         videoQualityMode: VideoQualityMode = .adaptive,
-        displaySizingMode: DisplaySizingMode = .matchClient,
+        displaySizingMode: DisplaySizingMode? = nil,
         displayCount: Int = 1,
         displayMode: DisplayMode? = nil,
         enableRemoteAudio: Bool = true,
@@ -422,7 +419,8 @@ public struct VNCConfiguration: Sendable {
         case .allDisplaysCombined: .remoteDisplay
         case .twoVirtualDisplays: .matchClient
         case .oneDisplay:
-            videoQualityMode == .adaptive ? displaySizingMode : .remoteDisplay
+            displaySizingMode
+                ?? (videoQualityMode == .adaptive ? .matchClient : .remoteDisplay)
         }
         self.displayMode = resolvedDisplayMode
         self.enableRemoteAudio = enableRemoteAudio

@@ -248,8 +248,8 @@ final class VNCConfigurationTransportTests: XCTestCase {
         configuration.transportProvider = Self.stubProvider
 
         XCTAssertEqual(configuration.videoQualityMode, .standard)
-        // The quality clamp must run the existing mode couplings too.
-        XCTAssertEqual(configuration.displaySizingMode, .remoteDisplay)
+        // Match Client works over the TCP channel, so the clamp keeps it.
+        XCTAssertEqual(configuration.displaySizingMode, .matchClient)
     }
 
     func testSelectingAdaptiveRevertsWhileProviderInstalled() {

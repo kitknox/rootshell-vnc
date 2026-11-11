@@ -323,6 +323,259 @@ final class TransportSessionScriptedTests: XCTestCase {
         XCTAssertEqual(states.snapshot(), [true, false])
     }
 
+    /// Standard Match Client on a Mac: command 29 goes out right after
+    /// ServerInit, a newer size waits for DisplayInfo2, and the announced
+    /// display becomes a DesktopSize followed by a full-frame request.
+    func testAppleStandardMatchClientAdoptsVirtualDisplayFromDisplayInfo2() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.appleServerInitMessage(
+            width: 6,
+            height: 4,
+            name: "Standard Mac",
+            flags: 0x52,
+            serverCommands: [AppleServerCapabilities.displayConfigurationCommand]))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "standard-match.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.raw],
+            requestsVirtualDisplays: true,
+            connection: connection)
+        let staged = try await session.requestRemoteDisplaySize(
+            pixelWidth: 4, pixelHeight: 2, pointWidth: 2, pointHeight: 1)
+        XCTAssertEqual(staged, .waitingForServerSupport)
+        try await session.connect()
+
+        let displayName = Data("rootshell Virtual Display".utf8)
+        var sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: displayName, in: sent), 1)
+        let settledAfterSend = await session.isAppleRemoteDisplayResizeSettled
+        XCTAssertFalse(settledAfterSend)
+
+        let queued = try await session.requestRemoteDisplaySize(
+            pixelWidth: 8, pixelHeight: 4, pointWidth: 4, pointHeight: 2)
+        XCTAssertEqual(queued, .appleVirtualDisplay)
+        sent = await connection.sentBytes()
+        XCTAssertEqual(
+            Self.occurrenceCount(of: displayName, in: sent), 1,
+            "A newer size must wait for the in-flight display change")
+
+        let updateTask = Task { () -> [FramebufferRect]? in
+            for await event in session.events {
+                guard case .framebufferUpdate(let rects) = event else { continue }
+                try? await session.finishFramebufferUpdate()
+                return rects.map(\.0)
+            }
+            return nil
+        }
+        let virtualDisplay = AppleDisplayInfo(
+            displayIndex: 32, originX: 0, originY: 0,
+            width: 4, height: 2, flags: 0)
+        await connection.enqueueServerBytes(Self.framebufferUpdate([(
+            Self.rectangleHeader(x: 0, y: 0, width: 0, height: 0, encoding: 1105),
+            appleDisplayInfo2TestPayload(displays: [virtualDisplay])
+        )]))
+        let rects = await Self.withTimeout(seconds: 2) {
+            await updateTask.value
+        } ?? nil
+
+        XCTAssertEqual(
+            rects?.last,
+            FramebufferRect(x: 0, y: 0, width: 4, height: 2, encoding: .desktopSize))
+        let fullFrame = ClientMessage.framebufferUpdateRequest(
+            incremental: false, x: 0, y: 0, width: 4, height: 2).serialize()
+        let sentQueuedAndFullFrame = await Self.waitUntil {
+            let bytes = await connection.sentBytes()
+            return Self.occurrenceCount(of: displayName, in: bytes) == 2
+                && Self.occurrenceCount(of: fullFrame, in: bytes) == 1
+        }
+        XCTAssertTrue(sentQueuedAndFullFrame)
+        var setDisplay = Data([0x0d, 0x00, 0x00, 0x00])
+        setDisplay.append(Self.uint32Bytes(virtualDisplay.displayIndex))
+        sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: setDisplay, in: sent), 0)
+        await session.disconnect()
+    }
+
+    /// A resize that reaches the actor while the previous command 29 is still
+    /// being written must queue, not send a second command.
+    func testAppleStandardMatchClientQueuesResizeDuringSuspendedWrite() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.appleServerInitMessage(
+            width: 6,
+            height: 4,
+            name: "Standard Mac",
+            flags: 0x52,
+            serverCommands: [AppleServerCapabilities.displayConfigurationCommand]))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "standard-reentrancy.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.raw],
+            requestsVirtualDisplays: true,
+            connection: connection)
+        try await session.connect()
+
+        await connection.holdSends()
+        let first = Task {
+            try await session.requestRemoteDisplaySize(
+                pixelWidth: 4, pixelHeight: 2, pointWidth: 2, pointHeight: 1)
+        }
+        let firstWriteHeld = await Self.waitUntil {
+            await connection.heldSendCount == 1
+        }
+        XCTAssertTrue(firstWriteHeld)
+
+        let second = Task {
+            try await session.requestRemoteDisplaySize(
+                pixelWidth: 8, pixelHeight: 4, pointWidth: 4, pointHeight: 2)
+        }
+        let secondWriteStarted = await Self.waitUntil(timeout: .milliseconds(300)) {
+            await connection.heldSendCount > 1
+        }
+        XCTAssertFalse(secondWriteStarted, "The second size must queue behind the first")
+
+        await connection.releaseSends()
+        _ = try await first.value
+        let secondDisposition = try await second.value
+        XCTAssertEqual(secondDisposition, .appleVirtualDisplay)
+        let displayName = Data("rootshell Virtual Display".utf8)
+        var sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: displayName, in: sent), 1)
+
+        let firstDisplay = AppleDisplayInfo(
+            displayIndex: 32, originX: 0, originY: 0,
+            width: 4, height: 2, flags: 0)
+        await connection.enqueueServerBytes(Self.framebufferUpdate([(
+            Self.rectangleHeader(x: 0, y: 0, width: 0, height: 0, encoding: 1105),
+            appleDisplayInfo2TestPayload(displays: [firstDisplay])
+        )]))
+        let sentQueued = await Self.waitUntil {
+            Self.occurrenceCount(
+                of: displayName, in: await connection.sentBytes()) == 2
+        }
+        XCTAssertTrue(sentQueued)
+        sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: displayName, in: sent), 2)
+        await session.disconnect()
+    }
+
+    /// The unanswered-request timeout starts only once the write completes:
+    /// a write held past it must not let the queued size overlap it.
+    func testAppleStandardMatchClientTimeoutWaitsForSlowWrite() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.appleServerInitMessage(
+            width: 6,
+            height: 4,
+            name: "Standard Mac",
+            flags: 0x52,
+            serverCommands: [AppleServerCapabilities.displayConfigurationCommand]))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "standard-slow-write.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.raw],
+            requestsVirtualDisplays: true,
+            connection: connection)
+        await session.setStandardVirtualDisplayTimeout(.milliseconds(50))
+        try await session.connect()
+
+        await connection.holdSends()
+        let first = Task {
+            try await session.requestRemoteDisplaySize(
+                pixelWidth: 4, pixelHeight: 2, pointWidth: 2, pointHeight: 1)
+        }
+        let firstWriteHeld = await Self.waitUntil {
+            await connection.heldSendCount == 1
+        }
+        XCTAssertTrue(firstWriteHeld)
+        let queued = try await session.requestRemoteDisplaySize(
+            pixelWidth: 8, pixelHeight: 4, pointWidth: 4, pointHeight: 2)
+        XCTAssertEqual(queued, .appleVirtualDisplay)
+
+        let overlapped = await Self.waitUntil(timeout: .milliseconds(400)) {
+            await connection.heldSendCount > 1
+        }
+        XCTAssertFalse(overlapped, "A held write must not time out")
+
+        await connection.releaseSends()
+        _ = try await first.value
+        let displayName = Data("rootshell Virtual Display".utf8)
+        // No DisplayInfo2 arrives, so the timeout armed after the write
+        // releases the queued size.
+        let sentQueued = await Self.waitUntil {
+            Self.occurrenceCount(
+                of: displayName, in: await connection.sentBytes()) == 2
+        }
+        XCTAssertTrue(sentQueued)
+        await session.disconnect()
+    }
+
+    /// Without Apple's capability bitmap, Match Client is SetDesktopSize only,
+    /// and only after the server announces ExtendedDesktopSize.
+    func testConventionalServerMatchClientNeverSendsAppleDisplayCommand() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.v3_8.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(width: 6, height: 4, name: "conventional"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "conventional-match.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.raw],
+            requestsVirtualDisplays: true,
+            connection: connection)
+        let staged = try await session.requestRemoteDisplaySize(
+            pixelWidth: 4, pixelHeight: 2, pointWidth: 2, pointHeight: 1)
+        XCTAssertEqual(staged, .waitingForServerSupport)
+        try await session.connect()
+
+        let setDesktopSize = ClientMessage.setDesktopSize(SetDesktopSizeRequest(
+            width: 4, height: 2,
+            screens: [SetDesktopSizeScreen(id: 7, width: 4, height: 2)])).serialize()
+        var sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: setDesktopSize, in: sent), 0)
+
+        var layout = Data([1, 0, 0, 0])
+        layout.append(Self.uint32Bytes(7))
+        layout.append(contentsOf: [0, 0, 0, 0, 0, 6, 0, 4])
+        layout.append(Self.uint32Bytes(0))
+        await connection.enqueueServerBytes(Self.framebufferUpdate([(
+            Self.rectangleHeader(
+                x: 0, y: 0, width: 6, height: 4,
+                encoding: Encoding.extendedDesktopSize.rawValue),
+            layout
+        )]))
+
+        let sentSetDesktopSize = await Self.waitUntil {
+            Self.occurrenceCount(
+                of: setDesktopSize, in: await connection.sentBytes()) == 1
+        }
+        XCTAssertTrue(sentSetDesktopSize)
+        sent = await connection.sentBytes()
+        XCTAssertEqual(
+            Self.occurrenceCount(of: Data("rootshell Virtual Display".utf8), in: sent), 0)
+        await session.disconnect()
+    }
+
     /// `portableEncodings` rewrites the list for conventional servers rather
     /// than adding to it, so it has to honour the server-rendered choice too.
     /// Asserting the whole byte stream proves nothing else shifted with it.

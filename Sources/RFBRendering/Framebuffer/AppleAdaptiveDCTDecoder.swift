@@ -490,9 +490,8 @@ final class AppleAdaptiveDCTDecoder {
         let count = ((width + 7) / 8) * ((height + 7) / 8)
         tileStates = TileStorage(count: count)
         baseUpdateGeneration = 0
-        coefficientCache = Array(repeating: nil, count: 254)
-        cacheWriteIndex = 0
-        cacheReadIndex = 0
+        // The coefficient cache stays: the Mac keeps its cache keys across
+        // display size changes within a connection.
     }
 
     private func store(_ state: CachedTile, at index: Int) {

@@ -798,6 +798,16 @@ public actor TransportSession {
     private var standardDesktopLayout: ExtendedDesktopSizePayload?
     private var pendingRemoteDisplaySize: PendingRemoteDisplaySize?
     private var lastSentRemoteDisplaySize: PendingRemoteDisplaySize?
+    /// Standard-mode command 29 not yet answered by DisplayInfo2. The Mac
+    /// applies display changes one at a time, so newer sizes queue behind it.
+    private var awaitedStandardVirtualDisplay: PendingRemoteDisplaySize?
+    private var standardVirtualDisplayTimeoutTask: Task<Void, Never>?
+    /// How long a written command 29 may go unanswered. Armed only after the
+    /// write completes, so a backed-up connection never overlaps two.
+    private(set) var standardVirtualDisplayTimeout = Duration.seconds(5)
+    /// The Mac pushes no full frame after a later display change, so the next
+    /// request after an adopted virtual-display resize is non-incremental.
+    private var fullFramebufferRequestPending = false
     /// Command 29 starts a complete AVC generation. Sending another command
     /// before every expected RTP source from that generation is live makes the
     /// server retire its capture graph mid-startup. Keep only the newest drag
@@ -1004,6 +1014,12 @@ public actor TransportSession {
         try await performHandshake()
         handshakeComplete = true
         connectionEstablishedNanos = DispatchTime.now().uptimeNanoseconds
+        // Standard has no media graph to wait for: ask for the virtual
+        // display before the first update so it arrives at the right size.
+        if usesAppleVirtualDisplays, !requestAppleMediaStream,
+           let pendingRemoteDisplaySize {
+            try await sendAppleVirtualDisplaySize(pendingRemoteDisplaySize)
+        }
 
         // Start the message read loop
         readTask = Task { [weak self] in
@@ -1516,6 +1532,8 @@ public actor TransportSession {
     private func sendOneShotFramebufferUpdateRequest(
         incremental: Bool
     ) async throws {
+        let incremental = incremental && !fullFramebufferRequestPending
+        fullFramebufferRequestPending = false
         let msg = ClientMessage.framebufferUpdateRequest(
             incremental: incremental,
             x: 0, y: 0,
@@ -1598,12 +1616,11 @@ public actor TransportSession {
         try await requestFramebufferUpdate(incremental: true)
     }
 
-    /// Dynamic Resolution belongs to High Performance. Standard sessions keep
-    /// SetDesktopSize even when ServerInit advertises virtual displays.
+    /// Only servers whose ServerInit bitmap lists command 29 get it; every
+    /// other server keeps SetDesktopSize.
     private var usesAppleVirtualDisplays: Bool {
-        requestAppleMediaStream
-            && appleServerCapabilities?.supportsServerCommand(
-                AppleServerCapabilities.displayConfigurationCommand) == true
+        appleServerCapabilities?.supportsServerCommand(
+            AppleServerCapabilities.displayConfigurationCommand) == true
     }
 
     /// Request one remote display matching the client viewport. Apple servers
@@ -1622,6 +1639,8 @@ public actor TransportSession {
             pointWidth: pointWidth,
             pointHeight: pointHeight)
         guard requested != lastSentRemoteDisplaySize else {
+            // Returning to the size already sent drops a queued newer one.
+            pendingRemoteDisplaySize = nil
             emitAppleRemoteDisplayResizeSettled()
             return usesAppleVirtualDisplays
                 ? .appleVirtualDisplay
@@ -1630,6 +1649,19 @@ public actor TransportSession {
 
         pendingRemoteDisplaySize = requested
         emitAppleRemoteDisplayResizeSettled()
+        if usesAppleVirtualDisplays, !requestAppleMediaStream {
+            if !handshakeComplete {
+                return .appleVirtualDisplay
+            }
+            if awaitedStandardVirtualDisplay != nil {
+                log.info(
+                    "Coalescing virtual display \(pixelWidth)x\(pixelHeight) "
+                        + "while the previous display change is in flight")
+                return .appleVirtualDisplay
+            }
+            try await sendAppleVirtualDisplaySize(requested)
+            return .appleVirtualDisplay
+        }
         if usesAppleVirtualDisplays {
             if !completedInitialAppleMediaNegotiation {
                 log.info(
@@ -1666,6 +1698,8 @@ public actor TransportSession {
         readTask = nil
         appleAutoUpdateRefreshTask?.cancel()
         appleAutoUpdateRefreshTask = nil
+        standardVirtualDisplayTimeoutTask?.cancel()
+        standardVirtualDisplayTimeoutTask = nil
         framebufferCreditWaiter?.resume()
         framebufferCreditWaiter = nil
         appleMediaGenerationSink = nil
@@ -2607,7 +2641,10 @@ public actor TransportSession {
                     let displayInfos = appleDisplayInfo2Records(payload)
                     completeAppleDisplayLayout = displayInfos
                     emitAppleDisplayInfoCompatibilityEvents(displayInfos)
-                    if let firstDisplay = displayInfos.first {
+                    if await noteStandardVirtualDisplayLayout(displayInfos) {
+                        // The virtual display replaced every physical one.
+                        sentAppleMediaInitialSetDisplay = true
+                    } else if let firstDisplay = displayInfos.first {
                         try await sendAppleStandardDisplaySelectionIfNeeded(
                             display: firstDisplay,
                             announcedDisplayCount: displayInfos.count)
@@ -2684,6 +2721,11 @@ public actor TransportSession {
         if let resize = pendingResize {
             usesDeferredAppleDisplayLayout = false
             try await acceptFramebufferResize(width: resize.width, height: resize.height)
+            if fullFramebufferRequestPending, appleAutoUpdateActive {
+                // As at bootstrap: the renewed subscription only covers
+                // changes, so one type-3 request fills the new display.
+                try await sendOneShotFramebufferUpdateRequest(incremental: false)
+            }
         }
 
         if let completeAppleDisplayLayout,
@@ -3938,9 +3980,10 @@ public actor TransportSession {
             pointHeight: UInt32(requested.pointHeight))
         // These are fixed capability maxima, not the active mode or an active
         // resolution cap. The requested pixel/point pair below selects 2×.
-        let displays = (0..<requestedDisplayCount).map { index in
+        let displayCount = requestAppleMediaStream ? requestedDisplayCount : 1
+        let displays = (0..<displayCount).map { index in
             AppleVirtualDisplay(
-                name: requestedDisplayCount == 1
+                name: displayCount == 1
                     ? "rootshell Virtual Display"
                     : "rootshell Virtual Display \(index + 1)",
                 widthInMillimeters: Float(requested.pointWidth) * millimetersPerPoint,
@@ -3950,6 +3993,40 @@ public actor TransportSession {
                 originX: UInt16(Int(requested.pixelWidth) * index),
                 identifier: UInt32(7 + index),
                 modes: [mode])
+        }
+        let message = ClientMessage.appleDisplayConfiguration(
+            AppleDisplayConfiguration(displays: displays))
+        guard requestAppleMediaStream else {
+            // The framebuffer keeps its size until DisplayInfo2 announces the
+            // new display. Mark the change in flight before the write
+            // suspends, or a resize arriving meanwhile sends a second one.
+            let previousSent = lastSentRemoteDisplaySize
+            lastSentRemoteDisplaySize = requested
+            pendingRemoteDisplaySize = nil
+            beginStandardVirtualDisplayChange(requested)
+            do {
+                try await sendClientPayload(message.serialize())
+            } catch {
+                if lastSentRemoteDisplaySize == requested {
+                    lastSentRemoteDisplaySize = previousSent
+                }
+                if pendingRemoteDisplaySize == nil {
+                    pendingRemoteDisplaySize = requested
+                }
+                if awaitedStandardVirtualDisplay == requested {
+                    awaitedStandardVirtualDisplay = nil
+                    standardVirtualDisplayTimeoutTask?.cancel()
+                    standardVirtualDisplayTimeoutTask = nil
+                }
+                emitAppleRemoteDisplayResizeSettled()
+                throw error
+            }
+            armStandardVirtualDisplayTimeout(for: requested)
+            log.info(
+                "Requested Standard virtual display \(requested.pixelWidth)x"
+                    + "\(requested.pixelHeight) pixels (\(requested.pointWidth)x"
+                    + "\(requested.pointHeight) points)")
+            return
         }
         let previousCaptureLumaSamples = appleMediaActiveCaptureLumaSamples
         let previousTilesPerFrame = activeAppleMediaTilesPerFrame
@@ -3962,8 +4039,6 @@ public actor TransportSession {
         activeAppleMediaTilesPerFrame = selectedAppleMediaTilesPerFrame(
             pixelWidth: Int(requested.pixelWidth),
             pixelHeight: Int(requested.pixelHeight))
-        let message = ClientMessage.appleDisplayConfiguration(
-            AppleDisplayConfiguration(displays: displays))
         // The Apple media re-offer that follows command 29 is generated from
         // these session dimensions. ServerInit is not repeated for a virtual
         // display change, so retaining the physical framebuffer here would
@@ -4013,6 +4088,101 @@ public actor TransportSession {
     public var isAppleRemoteDisplayResizeSettled: Bool {
         pendingRemoteDisplaySize == nil
             && appleDisplayReconfigurationGeneration == nil
+            && awaitedStandardVirtualDisplay == nil
+    }
+
+    func setStandardVirtualDisplayTimeout(_ timeout: Duration) {
+        standardVirtualDisplayTimeout = timeout
+    }
+
+    private func beginStandardVirtualDisplayChange(_ requested: PendingRemoteDisplaySize) {
+        awaitedStandardVirtualDisplay = requested
+        standardVirtualDisplayTimeoutTask?.cancel()
+        standardVirtualDisplayTimeoutTask = nil
+        emitAppleRemoteDisplayResizeSettled()
+    }
+
+    private func armStandardVirtualDisplayTimeout(for requested: PendingRemoteDisplaySize) {
+        guard awaitedStandardVirtualDisplay == requested else { return }
+        let timeout = standardVirtualDisplayTimeout
+        standardVirtualDisplayTimeoutTask?.cancel()
+        standardVirtualDisplayTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: timeout)
+            guard !Task.isCancelled else { return }
+            await self?.timeOutStandardVirtualDisplayChange(requested)
+        }
+    }
+
+    private func timeOutStandardVirtualDisplayChange(
+        _ requested: PendingRemoteDisplaySize
+    ) async {
+        guard awaitedStandardVirtualDisplay == requested else { return }
+        // This task may send the queued size; drop the handle so nothing
+        // cancels the task that is writing it.
+        standardVirtualDisplayTimeoutTask = nil
+        await finishStandardVirtualDisplayChange(timedOut: true)
+    }
+
+    /// Ends the in-flight Standard display change and sends the newest
+    /// queued size, if any.
+    private func finishStandardVirtualDisplayChange(timedOut: Bool) async {
+        guard let awaited = awaitedStandardVirtualDisplay else { return }
+        if timedOut {
+            log.warning(
+                "No DisplayInfo2 for virtual display \(awaited.pixelWidth)x"
+                    + "\(awaited.pixelHeight); continuing")
+        }
+        awaitedStandardVirtualDisplay = nil
+        standardVirtualDisplayTimeoutTask?.cancel()
+        standardVirtualDisplayTimeoutTask = nil
+        guard !isDisconnecting,
+              let pendingRemoteDisplaySize,
+              pendingRemoteDisplaySize != lastSentRemoteDisplaySize else {
+            pendingRemoteDisplaySize = nil
+            emitAppleRemoteDisplayResizeSettled()
+            return
+        }
+        do {
+            try await sendAppleVirtualDisplaySize(pendingRemoteDisplaySize)
+        } catch {
+            log.error(
+                "Could not apply queued virtual display: "
+                    + error.localizedDescription)
+        }
+    }
+
+    /// AppleVNCServer reports a Standard session's new virtual display only in
+    /// DisplayInfo2, never with DesktopSize, so synthesize the resize from it.
+    /// Returns whether the layout belongs to a requested virtual display.
+    private func noteStandardVirtualDisplayLayout(
+        _ displays: [AppleDisplayInfo]
+    ) async -> Bool {
+        guard !requestAppleMediaStream,
+              usesAppleVirtualDisplays,
+              let requested = lastSentRemoteDisplaySize else { return false }
+        let matching = displays.first {
+            $0.width == UInt32(requested.pixelWidth)
+                && $0.height == UInt32(requested.pixelHeight)
+        }
+        guard let display = matching ?? (displays.count == 1 ? displays.first : nil),
+              display.width > 0, display.height > 0,
+              display.width <= UInt32(UInt16.max),
+              display.height <= UInt32(UInt16.max) else { return true }
+        let width = UInt16(display.width)
+        let height = UInt16(display.height)
+        if width != fbWidth || height != fbHeight {
+            pendingSelectedDisplayResize = FramebufferRect(
+                x: 0, y: 0, width: width, height: height,
+                encoding: .desktopSize)
+            fullFramebufferRequestPending = true
+            log.info(
+                "Adopting virtual display geometry \(width)x\(height) "
+                    + "in place of \(fbWidth)x\(fbHeight)")
+        }
+        if matching != nil, awaitedStandardVirtualDisplay == requested {
+            await finishStandardVirtualDisplayChange(timedOut: false)
+        }
+        return true
     }
 
     private func emitAppleRemoteDisplayResizeSettled() {

@@ -208,18 +208,29 @@ final class AppleDCTPerformanceTests: XCTestCase {
         }
     }
 
-    func testResizeDiscardsCoefficientAndCacheSnapshots() throws {
-        let decoder = AppleAdaptiveDCTDecoder()
-        let framebuffer = Framebuffer(width: 16, height: 8, pixelFormat: .bgra8888)
+    /// The Mac keeps cache keys across display size changes within a
+    /// connection; only per-tile coefficient state belongs to one size.
+    func testResizeKeepsCacheKeysButDiscardsTileCoefficients() throws {
         let rect = FramebufferRect(
             x: 0, y: 0, width: 16, height: 8,
             encoding: .appleMultiVariantScreenshare)
+        let expected = Framebuffer(width: 24, height: 8, pixelFormat: .bgra8888)
+        let reference = AppleAdaptiveDCTDecoder()
+        try reference.render(rect: rect, payload: base(tiles: 2, kind: "fresh"), to: expected)
+        try reference.render(rect: rect, payload: refinement(tiles: 2), to: expected)
+        try reference.render(rect: rect, payload: cache(tiles: 2), to: expected)
+
+        let decoder = AppleAdaptiveDCTDecoder()
+        let framebuffer = Framebuffer(width: 16, height: 8, pixelFormat: .bgra8888)
         try decoder.render(rect: rect, payload: base(tiles: 2, kind: "fresh"), to: framebuffer)
         try decoder.render(rect: rect, payload: refinement(tiles: 2), to: framebuffer)
         framebuffer.resize(width: 24, height: 8)
         try decoder.render(rect: rect, payload: cache(tiles: 2), to: framebuffer)
+        XCTAssertEqual(
+            framebuffer.getPixels(x: 0, y: 0, width: 16, height: 8),
+            expected.getPixels(x: 0, y: 0, width: 16, height: 8))
         let gray = Data((0..<(16 * 8)).flatMap { _ in [UInt8(128), 128, 128, 255] })
-        XCTAssertEqual(framebuffer.getPixels(x: 0, y: 0, width: 16, height: 8), gray)
+        XCTAssertNotEqual(framebuffer.getPixels(x: 0, y: 0, width: 16, height: 8), gray)
         XCTAssertThrowsError(try decoder.render(rect: rect, payload: refinement(tiles: 2), to: framebuffer))
     }
 

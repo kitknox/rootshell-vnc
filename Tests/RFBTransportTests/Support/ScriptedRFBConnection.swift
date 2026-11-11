@@ -19,6 +19,8 @@ actor ScriptedRFBConnection: RFBConnection {
     private var sent = Data()
     private var disconnectHandler: (@Sendable (VNCProtocolError) -> Void)?
     private var readWaiters: [CheckedContinuation<Void, Never>] = []
+    private var sendsHeld = false
+    private var heldSendWaiters: [CheckedContinuation<Void, Never>] = []
     private var onSend: (@Sendable (Data) -> Data?)?
     private var tlsUpgradeEndpoint: (String, UInt16)?
     private var totalBytesRead = 0
@@ -48,6 +50,23 @@ actor ScriptedRFBConnection: RFBConnection {
     /// Everything the client has sent, concatenated in order.
     func sentBytes() -> Data {
         sent
+    }
+
+    /// Suspend client sends until `releaseSends()`, so a test can enter the
+    /// session actor while one of its writes is in flight.
+    func holdSends() {
+        sendsHeld = true
+    }
+
+    func releaseSends() {
+        sendsHeld = false
+        let waiters = heldSendWaiters
+        heldSendWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    var heldSendCount: Int {
+        heldSendWaiters.count
     }
 
     func upgradedTLSEndpoint() -> (String, UInt16)? {
@@ -92,6 +111,9 @@ actor ScriptedRFBConnection: RFBConnection {
     }
 
     func send(_ data: Data) async throws {
+        while sendsHeld {
+            await withCheckedContinuation { heldSendWaiters.append($0) }
+        }
         if closed { throw VNCProtocolError.connectionClosed }
         sent.append(data)
         if let response = onSend?(data) {

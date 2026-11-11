@@ -283,8 +283,7 @@ public struct ConnectionView: View {
 
     private var displaySizingSection: some View {
         Section(String(localized: "Remote Display Size", bundle: .module)) {
-            if connectionMode.wrappedValue == .highPerformance,
-               session.configuration.displaySizingMode == .matchClient {
+            if session.configuration.displaySizingMode == .matchClient {
                 LabeledContent(
                     String(localized: "Display Mode", bundle: .module),
                     value: String(localized: "One Virtual Display", bundle: .module))
@@ -305,18 +304,16 @@ public struct ConnectionView: View {
                     .foregroundStyle(.secondary)
             }
 
-            if connectionMode.wrappedValue == .highPerformance {
-                Picker(String(localized: "Sizing", bundle: .module), selection: $session.configuration.displaySizingMode) {
-                    ForEach(VNCConfiguration.DisplaySizingMode.allCases) { mode in
-                        Text(mode.title).tag(mode)
-                    }
+            Picker(String(localized: "Sizing", bundle: .module), selection: $session.configuration.displaySizingMode) {
+                ForEach(VNCConfiguration.DisplaySizingMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
                 }
-                .pickerStyle(.segmented)
-
-                Text(session.configuration.displaySizingMode.explanation)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
+            .pickerStyle(.segmented)
+
+            Text(session.configuration.displaySizingMode.explanation)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 

@@ -601,22 +601,29 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertTrue(config.enableProtocolTrace)
     }
 
-    func testStandardModesRejectMatchClientSizing() {
+    func testStandardModesKeepExplicitMatchClientSizing() {
         for qualityMode in [
             VNCConfiguration.VideoQualityMode.standard,
             .fullQuality,
         ] {
+            XCTAssertEqual(
+                VNCConfiguration(videoQualityMode: qualityMode).displaySizingMode,
+                .remoteDisplay,
+                "Standard defaults must not start resizing existing servers")
+
             var config = VNCConfiguration(
                 videoQualityMode: qualityMode,
                 displaySizingMode: .matchClient)
-            XCTAssertEqual(config.displaySizingMode, .remoteDisplay)
+            XCTAssertEqual(config.displaySizingMode, .matchClient)
+            XCTAssertEqual(config.displayMode, .oneDisplay)
 
+            config.displaySizingMode = .remoteDisplay
             config.displaySizingMode = .matchClient
-            XCTAssertEqual(config.displaySizingMode, .remoteDisplay)
+            XCTAssertEqual(config.displaySizingMode, .matchClient)
 
+            // Two independent virtual displays stay High Performance only.
             config.displayMode = .twoVirtualDisplays
             XCTAssertEqual(config.displayMode, .oneDisplay)
-            XCTAssertEqual(config.displaySizingMode, .remoteDisplay)
 
             let virtualDisplayConfig = VNCConfiguration(
                 videoQualityMode: qualityMode,
@@ -627,7 +634,12 @@ final class VNCConfigurationTests: XCTestCase {
 
         var config = VNCConfiguration(displaySizingMode: .matchClient)
         config.videoQualityMode = .standard
-        XCTAssertEqual(config.displaySizingMode, .remoteDisplay)
+        XCTAssertEqual(config.displaySizingMode, .matchClient)
+
+        var twoDisplays = VNCConfiguration(displayMode: .twoVirtualDisplays)
+        twoDisplays.videoQualityMode = .standard
+        XCTAssertEqual(twoDisplays.displayMode, .oneDisplay)
+        XCTAssertEqual(twoDisplays.displaySizingMode, .matchClient)
     }
 
     func testRemoteAudioIsEffectiveOnlyInHighPerformanceMatchClientMode() {

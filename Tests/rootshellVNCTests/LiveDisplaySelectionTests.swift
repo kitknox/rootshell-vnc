@@ -209,6 +209,99 @@ final class LiveDisplaySelectionTests: XCTestCase {
         }
     }
 
+    /// Standard (TCP) Match Client: the Mac must render a virtual display at
+    /// the viewport size and follow a later window resize.
+    @MainActor
+    func testStandardMatchClientFollowsViewport() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["VNC_TEST_STANDARD_MATCH_CLIENT"] == "1" else {
+            throw XCTSkip("Set VNC_TEST_STANDARD_MATCH_CLIENT=1 to run the Standard Match Client probe")
+        }
+        guard let host = environment["VNC_TEST_HOST"], !host.isEmpty,
+              let password = environment["VNC_TEST_PASSWORD"], !password.isEmpty else {
+            throw XCTSkip("Set VNC_TEST_HOST and VNC_TEST_PASSWORD")
+        }
+        let relaysLogs = environment["VNC_TEST_LOGS"] == "1"
+        if relaysLogs {
+            VNCLogRelay.install(minimumLevel: .debug) { level, category, message in
+                print("[\(level.name)] [\(category)] \(message)")
+            }
+        }
+        defer {
+            if relaysLogs {
+                VNCLogRelay.install(sink: nil)
+            }
+        }
+        let credentials = VNCCredentials(
+            host: host,
+            port: UInt16(environment["VNC_TEST_PORT"] ?? "5900") ?? 5900,
+            password: password,
+            username: environment["VNC_TEST_USERNAME"])
+        let quality: VNCConfiguration.VideoQualityMode =
+            environment["VNC_TEST_FULL_QUALITY"] == "1" ? .fullQuality : .standard
+        let session = VNCSession(configuration: VNCConfiguration(
+            videoQualityMode: quality,
+            displaySizingMode: .matchClient,
+            displayCount: 1,
+            enableRemoteAudio: false,
+            reconnectionPolicy: VNCReconnectionPolicy(
+                isEnabled: false,
+                maximumAttempts: 0)))
+        XCTAssertEqual(session.configuration.displaySizingMode, .matchClient)
+
+        // Each step is sent 150 ms apart; the last step is a drag-like burst
+        // that must settle on its final size.
+        let steps: [[CGSize]] = [
+            [CGSize(width: 1280, height: 800)],
+            [CGSize(width: 1100, height: 900)],
+            [CGSize(width: 1512, height: 982)],
+            [
+                CGSize(width: 1000, height: 700),
+                CGSize(width: 1200, height: 750),
+                CGSize(width: 1400, height: 850),
+                CGSize(width: 1300, height: 820),
+            ],
+        ]
+        session.updateRemoteDisplaySize(viewSize: steps[0][0], displayScale: 2)
+        try await session.connect(credentials: credentials)
+        defer { session.disconnect() }
+
+        let timeout = TimeInterval(environment["VNC_TEST_STANDARD_TIMEOUT"] ?? "20") ?? 20
+        for (index, sizes) in steps.enumerated() {
+            let viewSize = try XCTUnwrap(sizes.last)
+            let expected = try XCTUnwrap(RemoteDisplaySize.matching(viewSize: viewSize))
+            let started = Date()
+            if index > 0 {
+                for size in sizes {
+                    session.updateRemoteDisplaySize(viewSize: size, displayScale: 2)
+                    try await Task.sleep(for: .milliseconds(150))
+                }
+            }
+            var matched = false
+            while Date().timeIntervalSince(started) < timeout {
+                if session.framebufferWidth == Int(expected.pixelWidth),
+                   session.framebufferHeight == Int(expected.pixelHeight),
+                   let image = session.currentImage,
+                   image.width == Int(expected.pixelWidth),
+                   Self.containsNonBlackPixel(image) {
+                    matched = true
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            print(
+                "STANDARD MATCH CLIENT step=\(index) view=\(viewSize) "
+                    + "expected=\(expected.pixelWidth)x\(expected.pixelHeight) "
+                    + "framebuffer=\(session.framebufferWidth)x\(session.framebufferHeight) "
+                    + "image=\(session.currentImage.map { "\($0.width)x\($0.height)" } ?? "none") "
+                    + "elapsed=\(String(format: "%.2f", Date().timeIntervalSince(started)))s")
+            XCTAssertTrue(
+                matched,
+                "Standard Match Client step \(index) did not render "
+                    + "\(expected.pixelWidth)x\(expected.pixelHeight)")
+        }
+    }
+
     @MainActor
     private func standardGeometry(
         displayCount: Int,
