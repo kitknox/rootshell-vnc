@@ -4356,8 +4356,11 @@ final class DirectTouchGestureRecognizer: UIGestureRecognizer {
 /// Several fingers that land together and stay still for `holdDuration`
 /// hold a remote button. Motion before then fails the gesture so pinch, pan,
 /// scroll and swipes keep their fingers; lifting first leaves a tap.
+///
+/// Public so a host recognizer that shares these fingers can tell a hold
+/// apart and decline to recognize alongside it.
 @MainActor
-final class MultiFingerHoldGestureRecognizer: UIGestureRecognizer {
+public final class MultiFingerHoldGestureRecognizer: UIGestureRecognizer {
     let fingerCount: Int
     var holdDuration = RemoteTouchGestureConfiguration.defaultHoldDuration
     /// Mean location of the held fingers.
@@ -4380,7 +4383,7 @@ final class MultiFingerHoldGestureRecognizer: UIGestureRecognizer {
         super.init(target: target, action: action)
     }
 
-    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+    public override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
         super.touchesBegan(touches, with: event)
         guard state == .possible else {
             // A finger added mid-drag does not change the press.
@@ -4406,7 +4409,7 @@ final class MultiFingerHoldGestureRecognizer: UIGestureRecognizer {
         scheduleHoldTimer()
     }
 
-    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+    public override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
         super.touchesMoved(touches, with: event)
         guard trackedTouches.count == fingerCount else { return }
         centroid = currentCentroid()
@@ -4425,7 +4428,7 @@ final class MultiFingerHoldGestureRecognizer: UIGestureRecognizer {
         }
     }
 
-    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+    public override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
         super.touchesEnded(touches, with: event)
         guard touches.contains(where: isTracked) else { return }
         switch state {
@@ -4439,7 +4442,7 @@ final class MultiFingerHoldGestureRecognizer: UIGestureRecognizer {
         }
     }
 
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+    public override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
         super.touchesCancelled(touches, with: event)
         switch state {
         case .possible:
@@ -4451,7 +4454,7 @@ final class MultiFingerHoldGestureRecognizer: UIGestureRecognizer {
         }
     }
 
-    override func reset() {
+    public override func reset() {
         super.reset()
         invalidateHoldTimer()
         trackedTouches.removeAll()
