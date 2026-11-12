@@ -808,6 +808,16 @@ public actor TransportSession {
     /// How long a written command 29 may go unanswered. Armed only after the
     /// write completes, so a backed-up connection never overlaps two.
     private(set) var standardVirtualDisplayTimeout = Duration.seconds(5)
+    /// Absolute control held across command 29 so the Mac's post-change input
+    /// window drops nothing; released once every queued change has settled.
+    private var absoluteControlActive = false
+    private var absoluteControlGeneration: UInt64 = 0
+    private var absoluteControlReleaseTask: Task<Void, Never>?
+    private var absoluteControlDeadlineNanos: UInt64 = 0
+    /// Covers the Mac's 2 s window, which starts at or before DisplayInfo2.
+    private(set) var absoluteControlReleaseDelay = Duration.seconds(3)
+    /// Bounds the Mac's local input lockout when a change never settles.
+    private(set) var absoluteControlMaximumHold = Duration.seconds(20)
     /// The Mac pushes no full frame after a later display change, so the next
     /// request after an adopted virtual-display resize is non-incremental.
     private var fullFramebufferRequestPending = false
@@ -1711,6 +1721,10 @@ public actor TransportSession {
         appleAutoUpdateRefreshTask = nil
         standardVirtualDisplayTimeoutTask?.cancel()
         standardVirtualDisplayTimeoutTask = nil
+        // The Mac drops absolute control itself when the viewer leaves.
+        absoluteControlActive = false
+        absoluteControlReleaseTask?.cancel()
+        absoluteControlReleaseTask = nil
         framebufferCreditWaiter?.resume()
         framebufferCreditWaiter = nil
         appleMediaGenerationSink = nil
@@ -2387,6 +2401,9 @@ public actor TransportSession {
         readTask?.cancel()
         appleAutoUpdateRefreshTask?.cancel()
         appleAutoUpdateRefreshTask = nil
+        absoluteControlActive = false
+        absoluteControlReleaseTask?.cancel()
+        absoluteControlReleaseTask = nil
         framebufferCreditWaiter?.resume()
         framebufferCreditWaiter = nil
         _ = stateMachine.handle(event: .connectionLost(error))
@@ -4015,8 +4032,9 @@ public actor TransportSession {
             lastSentRemoteDisplaySize = requested
             pendingRemoteDisplaySize = nil
             beginStandardVirtualDisplayChange(requested)
+            let controlPrefix = holdAbsoluteControlForDisplayChange()
             do {
-                try await sendClientPayload(message.serialize())
+                try await sendClientPayload(controlPrefix + message.serialize())
             } catch {
                 if lastSentRemoteDisplaySize == requested {
                     lastSentRemoteDisplaySize = previousSent
@@ -4065,8 +4083,9 @@ public actor TransportSession {
                 appleMediaGenerationTracker.generation &+ 1
             sentAppleMediaReconfigurationRequest = false
         }
+        let controlPrefix = holdAbsoluteControlForDisplayChange()
         do {
-            try await sendClientPayload(message.serialize())
+            try await sendClientPayload(controlPrefix + message.serialize())
         } catch {
             fbWidth = previousWidth
             fbHeight = previousHeight
@@ -4093,9 +4112,8 @@ public actor TransportSession {
                 + "tiles=\(activeAppleMediaTilesPerFrame)")
     }
 
-    /// Public so a client with a queued input intent can query the
-    /// authoritative answer on demand; sink emissions can race their
-    /// main-actor delivery.
+    /// Whether no display change is queued or in flight. Sink emissions can
+    /// race their main-actor delivery; this is the authoritative answer.
     public var isAppleRemoteDisplayResizeSettled: Bool {
         pendingRemoteDisplaySize == nil
             && appleDisplayReconfigurationGeneration == nil
@@ -4197,8 +4215,80 @@ public actor TransportSession {
     }
 
     private func emitAppleRemoteDisplayResizeSettled() {
+        scheduleAbsoluteControlRelease()
         appleRemoteDisplayResizeSettledSink?(
             isAppleRemoteDisplayResizeSettled)
+    }
+
+    /// Returns the control-mode prefix for a command 29 write: empty when
+    /// absolute control is already held or this viewer may not take it.
+    /// Every change, including each queued one, pushes the release out.
+    private func holdAbsoluteControlForDisplayChange() -> Data {
+        guard appleServerCapabilities?.allowsAbsoluteControl == true else {
+            return Data()
+        }
+        absoluteControlDeadlineNanos = DispatchTime.now().uptimeNanoseconds
+            &+ Self.nanoseconds(absoluteControlMaximumHold)
+        let entering = !absoluteControlActive
+        absoluteControlActive = true
+        scheduleAbsoluteControlRelease()
+        guard entering else { return Data() }
+        log.info("Taking absolute control for the display change")
+        return AppleControlModeProtocol.setModeMessage(.absoluteControl)
+    }
+
+    /// Release 3 s after the last change settles, or at the hold cap.
+    private func scheduleAbsoluteControlRelease() {
+        guard absoluteControlActive else { return }
+        absoluteControlGeneration &+= 1
+        let generation = absoluteControlGeneration
+        let now = DispatchTime.now().uptimeNanoseconds
+        let capDelay = absoluteControlDeadlineNanos > now
+            ? absoluteControlDeadlineNanos - now
+            : 0
+        let delay = isAppleRemoteDisplayResizeSettled
+            ? min(Self.nanoseconds(absoluteControlReleaseDelay), capDelay)
+            : capDelay
+        absoluteControlReleaseTask?.cancel()
+        absoluteControlReleaseTask = Task { [weak self] in
+            try? await Task.sleep(for: .nanoseconds(Int64(clamping: delay)))
+            guard !Task.isCancelled else { return }
+            await self?.releaseAbsoluteControl(generation: generation)
+        }
+    }
+
+    private func releaseAbsoluteControl(generation: UInt64) async {
+        guard absoluteControlActive,
+              generation == absoluteControlGeneration,
+              !isDisconnecting else { return }
+        absoluteControlActive = false
+        absoluteControlReleaseTask = nil
+        let settled = isAppleRemoteDisplayResizeSettled
+        do {
+            try await sendClientPayload(
+                AppleControlModeProtocol.setModeMessage(.control))
+            log.info("Returned to normal control (settled=\(settled))")
+        } catch {
+            log.warning(
+                "Could not return to normal control: "
+                    + error.localizedDescription)
+        }
+        // A change that began during the write must not end up in mode 1.
+        if absoluteControlActive {
+            try? await sendClientPayload(
+                AppleControlModeProtocol.setModeMessage(.absoluteControl))
+        }
+    }
+
+    func setAbsoluteControlTiming(release: Duration, maximumHold: Duration) {
+        absoluteControlReleaseDelay = release
+        absoluteControlMaximumHold = maximumHold
+    }
+
+    private static func nanoseconds(_ duration: Duration) -> UInt64 {
+        let components = duration.components
+        return UInt64(max(0, components.seconds)) * 1_000_000_000
+            + UInt64(max(0, components.attoseconds / 1_000_000_000))
     }
 
     private nonisolated func appleMediaServerControl(_ payload: Data) -> (encoding: UInt16, body: Data)? {

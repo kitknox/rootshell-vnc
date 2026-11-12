@@ -402,6 +402,117 @@ final class TransportSessionScriptedTests: XCTestCase {
         await session.disconnect()
     }
 
+    /// Absolute control rides ahead of the first command 29, stays held while
+    /// a queued change follows, and is released once after the last settles.
+    func testAppleMatchClientHoldsAbsoluteControlAcrossBackToBackChanges() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.appleServerInitMessage(
+            width: 6,
+            height: 4,
+            name: "Standard Mac",
+            flags: 0x52,
+            serverCommands: [AppleServerCapabilities.displayConfigurationCommand]))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "absolute-control.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.raw],
+            requestsVirtualDisplays: true,
+            connection: connection)
+        await session.setAbsoluteControlTiming(
+            release: .milliseconds(100), maximumHold: .seconds(10))
+        _ = try await session.requestRemoteDisplaySize(
+            pixelWidth: 4, pixelHeight: 2, pointWidth: 2, pointHeight: 1)
+        try await session.connect()
+
+        let absolute = Data([10, 0, 0, 2])
+        let control = Data([10, 0, 0, 1])
+        let displayName = Data("rootshell Virtual Display".utf8)
+        var sent = await connection.sentBytes()
+        let modeIndex = try XCTUnwrap(sent.firstRange(of: absolute)?.lowerBound)
+        let displayIndex = try XCTUnwrap(sent.firstRange(of: displayName)?.lowerBound)
+        XCTAssertLessThan(modeIndex, displayIndex)
+
+        _ = try await session.requestRemoteDisplaySize(
+            pixelWidth: 8, pixelHeight: 4, pointWidth: 4, pointHeight: 2)
+        let updates = Task {
+            for await event in session.events {
+                guard case .framebufferUpdate = event else { continue }
+                try? await session.finishFramebufferUpdate()
+            }
+        }
+        defer { updates.cancel() }
+        await connection.enqueueServerBytes(Self.framebufferUpdate([(
+            Self.rectangleHeader(x: 0, y: 0, width: 0, height: 0, encoding: 1105),
+            appleDisplayInfo2TestPayload(displays: [AppleDisplayInfo(
+                displayIndex: 32, originX: 0, originY: 0,
+                width: 4, height: 2, flags: 0)])
+        )]))
+        let sentQueued = await Self.waitUntil {
+            Self.occurrenceCount(of: displayName, in: await connection.sentBytes()) == 2
+        }
+        XCTAssertTrue(sentQueued)
+        try await Task.sleep(for: .milliseconds(300))
+        sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: absolute, in: sent), 1)
+        XCTAssertEqual(
+            Self.occurrenceCount(of: control, in: sent), 0,
+            "Control must stay absolute while the queued change is in flight")
+
+        await connection.enqueueServerBytes(Self.framebufferUpdate([(
+            Self.rectangleHeader(x: 0, y: 0, width: 0, height: 0, encoding: 1105),
+            appleDisplayInfo2TestPayload(displays: [AppleDisplayInfo(
+                displayIndex: 32, originX: 0, originY: 0,
+                width: 8, height: 4, flags: 0)])
+        )]))
+        let released = await Self.waitUntil {
+            Self.occurrenceCount(of: control, in: await connection.sentBytes()) == 1
+        }
+        XCTAssertTrue(released)
+        try await Task.sleep(for: .milliseconds(200))
+        sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: absolute, in: sent), 1)
+        XCTAssertEqual(Self.occurrenceCount(of: control, in: sent), 1)
+        await session.disconnect()
+    }
+
+    /// Without the ServerInit absolute-control flag no control mode is sent.
+    func testAppleMatchClientSkipsAbsoluteControlWithoutPermission() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.appleServerInitMessage(
+            width: 6,
+            height: 4,
+            name: "Standard Mac",
+            flags: 0x50,
+            serverCommands: [AppleServerCapabilities.displayConfigurationCommand]))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "no-absolute-control.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.raw],
+            requestsVirtualDisplays: true,
+            connection: connection)
+        _ = try await session.requestRemoteDisplaySize(
+            pixelWidth: 4, pixelHeight: 2, pointWidth: 2, pointHeight: 1)
+        try await session.connect()
+
+        let sent = await connection.sentBytes()
+        XCTAssertEqual(
+            Self.occurrenceCount(of: Data("rootshell Virtual Display".utf8), in: sent), 1)
+        XCTAssertEqual(Self.occurrenceCount(of: Data([10, 0, 0, 2]), in: sent), 0)
+        await session.disconnect()
+    }
+
     /// A resize that reaches the actor while the previous command 29 is still
     /// being written must queue, not send a second command.
     func testAppleStandardMatchClientQueuesResizeDuringSuspendedWrite() async throws {

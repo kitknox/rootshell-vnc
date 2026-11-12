@@ -25,6 +25,12 @@ public struct AppleServerCapabilities: Sendable, Equatable {
     /// Server flag announcing a session-selection exchange after ServerInit.
     public static let sessionSelectionFlag: UInt32 = 0x04
 
+    /// Server flag: this viewer may only observe.
+    public static let observeOnlyFlag: UInt32 = 0x01
+
+    /// Server flag: this viewer may take absolute control (control mode 2).
+    public static let absoluteControlFlag: UInt32 = 0x02
+
     public let serverFlags: UInt32
     public let serverCommandBitmap: Data
 
@@ -55,6 +61,11 @@ public struct AppleServerCapabilities: Sendable, Equatable {
 
     public var announcesSessionSelection: Bool {
         serverFlags & Self.sessionSelectionFlag != 0
+    }
+
+    public var allowsAbsoluteControl: Bool {
+        serverFlags & Self.absoluteControlFlag != 0
+            && serverFlags & Self.observeOnlyFlag == 0
     }
 
     public func supportsServerCommand(_ command: UInt8) -> Bool {
