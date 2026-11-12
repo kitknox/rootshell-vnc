@@ -496,6 +496,54 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         XCTAssertEqual(sent, ["hi"], "Applying remote content must not send it back")
     }
 
+    func testRepeatedRemoteDeliveryIsAppliedOnce() {
+        let clipboard = FakeClipboard()
+        let synchronizer = makeSynchronizer(clipboard: clipboard) { _ in }
+        var transfers: [String] = []
+        synchronizer.onTransfer = { transfers.append($1) }
+        synchronizer.sharedClipboardEnabled = true
+
+        synchronizer.receiveRemoteClipboardText("remote")
+        synchronizer.receiveRemoteClipboardText("remote")
+        synchronizer.receiveRemoteClipboardText("remote")
+        XCTAssertEqual(clipboard.changeCount, 1)
+        XCTAssertEqual(transfers, ["remote"])
+
+        synchronizer.receiveRemoteClipboardText("changed")
+        XCTAssertEqual(clipboard.text, "changed")
+        XCTAssertEqual(clipboard.changeCount, 2)
+
+        // A local copy in between means the device no longer holds it.
+        clipboard.copyOnDevice("local")
+        synchronizer.receiveRemoteClipboardText("changed")
+        XCTAssertEqual(clipboard.text, "changed")
+    }
+
+    func testRemoteEchoOfSentContentIsNotRewritten() {
+        let clipboard = FakeClipboard()
+        var sent: [String] = []
+        let synchronizer = makeSynchronizer(clipboard: clipboard) { sent.append($0) }
+        synchronizer.sharedClipboardEnabled = true
+
+        clipboard.copyOnDevice("hi")
+        synchronizer.localClipboardDidChange()
+        synchronizer.receiveRemoteClipboardText("hi")
+
+        XCTAssertEqual(sent, ["hi"])
+        XCTAssertEqual(clipboard.changeCount, 1)
+    }
+
+    func testManualGetRewritesUnchangedRemoteContent() {
+        let clipboard = FakeClipboard()
+        let synchronizer = makeSynchronizer(clipboard: clipboard) { _ in }
+        synchronizer.sharedClipboardEnabled = true
+
+        synchronizer.receiveRemoteClipboardText("remote")
+        synchronizer.getClipboard()
+
+        XCTAssertEqual(clipboard.changeCount, 2)
+    }
+
     func testPendingSharedImageApplyIsDroppedWhenThePaneStopsSharing() async throws {
         let tiff = VNCClipboardContent.Representation(
             type: ClipboardType.tiff, data: try Self.imageData(type: "public.tiff"))

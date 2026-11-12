@@ -281,6 +281,10 @@ public final class VNCClipboardSynchronizer {
     /// that grows later (ExtendedClipboard caps) resends it.
     @ObservationIgnored
     private var automaticFlush: (changeCount: Int, support: VNCClipboardContentSupport)?
+    /// What the device clipboard held as of a change count, as last applied
+    /// from or sent to the remote. Servers repeat unchanged deliveries.
+    @ObservationIgnored
+    private var syncedLocalContent: (content: VNCClipboardContent, changeCount: Int)?
     @ObservationIgnored
     private var observedLocalChangeCount: Int
     @ObservationIgnored
@@ -418,6 +422,7 @@ public final class VNCClipboardSynchronizer {
         guard !invalidated, canSend(),
               let content = clipboard.readContent(for: contentSupport()) else { return }
         observedLocalChangeCount = clipboard.changeCount
+        syncedLocalContent = (content, clipboard.changeCount)
         transmit(content)
     }
 
@@ -594,6 +599,7 @@ public final class VNCClipboardSynchronizer {
         observedLocalChangeCount = clipboard.changeCount
         automaticFlush = (clipboard.changeCount, support)
         guard let content = clipboard.readContent(for: support) else { return }
+        syncedLocalContent = (content, clipboard.changeCount)
         transmit(content)
     }
 
@@ -613,13 +619,18 @@ public final class VNCClipboardSynchronizer {
 
     /// Items with only TIFF or BMP images get a PNG first, built off the main
     /// actor. The write is dropped if a newer apply or a local copy wins, or,
-    /// for shared-mode applies, once this pane stops being eligible.
+    /// for shared-mode applies, once this pane stops being eligible. Shared
+    /// mode skips content the device clipboard already holds.
     private func applyRemoteContent(_ content: VNCClipboardContent, automatic: Bool) {
         applyGeneration &+= 1
         normalizationTask?.cancel()
         normalizationTask = nil
+        if automatic, let synced = syncedLocalContent,
+           synced.changeCount == clipboard.changeCount, synced.content == content {
+            return
+        }
         guard VNCClipboardImageNormalizer.needsNormalization(content) else {
-            writeRemoteContent(content)
+            writeRemoteContent(content, original: content)
             return
         }
 
@@ -636,7 +647,7 @@ public final class VNCClipboardSynchronizer {
                   !automatic || (self.sharedClipboardEnabled && self.isEligible)
             else { return }
             self.normalizationTask = nil
-            self.writeRemoteContent(normalized)
+            self.writeRemoteContent(normalized, original: content)
         }
     }
 
@@ -647,10 +658,11 @@ public final class VNCClipboardSynchronizer {
         applyGeneration &+= 1
     }
 
-    private func writeRemoteContent(_ content: VNCClipboardContent) {
+    private func writeRemoteContent(_ content: VNCClipboardContent, original: VNCClipboardContent) {
         isApplyingRemoteContent = true
         clipboard.write(content)
         observedLocalChangeCount = clipboard.changeCount
+        syncedLocalContent = (original, clipboard.changeCount)
         isApplyingRemoteContent = false
         if let text = content.plainText {
             onTransfer?(.remoteToDevice, text)
