@@ -46,6 +46,8 @@ public struct RemoteDesktopView: View {
     @Environment(\.displayScale) private var displayScale
 
     @State private var viewport = RemoteViewportState()
+    /// Height at the bottom that a docked HUD bar keeps clear of the fitted screen.
+    @State private var hudReserve: CGFloat = 0
     @State private var viewportPanningMode: RemoteViewportPanningMode
     @State private var pointerMode: RemotePointerMode
     @State private var keyboardActive = false
@@ -68,6 +70,9 @@ public struct RemoteDesktopView: View {
     private let isFullScreen: Bool
     private let toggleFullScreen: (() -> Void)?
     private let hudMenuExtras: AnyView?
+    #if canImport(UIKit)
+    private var hudAccessory: HUDAccessory?
+    #endif
     private let keyboardAvoidanceMode: VNCKeyboardAvoidanceMode
     /// Edges whose safe area the HUD keeps clear of. A host that covers a
     /// system region (a full-screen takeover over a side rail) drops its edge.
@@ -241,34 +246,65 @@ public struct RemoteDesktopView: View {
             })
     }
 
+    #if canImport(UIKit)
+    /// Adds host content to the HUD, inside its glass: `beside` the menu
+    /// button, taking the button style to match, and `behind` the buttons
+    /// across the whole bar, taking the width it may use. `buttonStyle` sizes
+    /// every button from that width. `docksToBottom` pins the bar along the bottom and fits the
+    /// screen above it, though zoomed content still shows through underneath.
+    public func hudAccessory<Behind: View, Beside: View>(
+        isEnabled: Bool = true,
+        docksToBottom: Bool = false,
+        buttonStyle: @escaping (_ availableWidth: CGFloat) -> VNCHUDButtonStyle,
+        @ViewBuilder behind: @escaping (_ availableWidth: CGFloat) -> Behind,
+        @ViewBuilder beside: @escaping (_ buttonStyle: VNCHUDButtonStyle) -> Beside
+    ) -> Self {
+        guard isEnabled else { return self }
+        var copy = self
+        copy.hudAccessory = HUDAccessory(
+            docksToBottom: docksToBottom,
+            buttonStyle: buttonStyle,
+            behind: { AnyView(behind($0)) },
+            beside: { AnyView(beside($0)) })
+        return copy
+    }
+    #endif
+
     public var body: some View {
         VStack(spacing: 0) {
             GeometryReader { geometry in
                 let framebufferSize = session.presentedFramebufferSize
                 let framebufferOrigin = session.presentedFramebufferRegion?.origin ?? .zero
+                // The fitted screen stops above a docked HUD bar. Zoomed in, it
+                // still draws underneath: only the ZStack clips.
+                let contentSize = CGSize(
+                    width: geometry.size.width,
+                    height: max(1, geometry.size.height - hudReserve))
 
                 ZStack {
                     Color.black
                         .ignoresSafeArea()
 
-                    desktopContent(in: geometry.size)
+                    desktopContent(in: contentSize)
                         .scaleEffect(viewport.scale)
                         .offset(viewport.offset)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
 
                     if session.connectionState.isConnected,
                        framebufferSize.width > 0,
                        framebufferSize.height > 0 {
                         interactionLayer(
-                            viewSize: geometry.size,
+                            viewSize: contentSize,
                             framebufferSize: framebufferSize,
                             framebufferOrigin: framebufferOrigin)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     }
 
                     viewportControls
 
                     #if canImport(UIKit)
                     fileTransferOverlay(
-                        viewSize: geometry.size,
+                        viewSize: contentSize,
                         framebufferSize: framebufferSize,
                         framebufferOrigin: framebufferOrigin)
                     #endif
@@ -302,7 +338,7 @@ public struct RemoteDesktopView: View {
                 }
                 .onChange(of: geometry.size) { _, newSize in
                     viewport.clampOffset(
-                        viewSize: newSize,
+                        viewSize: CGSize(width: newSize.width, height: max(1, newSize.height - hudReserve)),
                         framebufferSize: framebufferSize)
                     #if !canImport(UIKit)
                     updateRemoteDisplaySize(for: newSize)
@@ -310,8 +346,16 @@ public struct RemoteDesktopView: View {
                 }
                 .onChange(of: framebufferSize) { _, newSize in
                     viewport.clampOffset(
-                        viewSize: geometry.size,
+                        viewSize: contentSize,
                         framebufferSize: newSize)
+                }
+                .onChange(of: hudReserve) { _, reserve in
+                    viewport.clampOffset(
+                        viewSize: CGSize(width: geometry.size.width, height: max(1, geometry.size.height - reserve)),
+                        framebufferSize: framebufferSize)
+                    #if canImport(UIKit)
+                    updateRemoteDisplaySizeFromMeasuredContainer()
+                    #endif
                 }
                 .onAppear {
                     presentPendingLoginPasswordPrompt()
@@ -480,8 +524,24 @@ public struct RemoteDesktopView: View {
     @ViewBuilder
     private var viewportControls: some View {
         #if canImport(UIKit)
-        DraggableHUDOverlay(safeAreaEdges: hudSafeAreaEdges) {
-            hudMenu
+        GeometryReader { proxy in
+            let margin = HUDBar<EmptyView>.margin(for: hudAccessory)
+            let available = HUDBar<EmptyView>.availableWidth(
+                containerWidth: proxy.size.width,
+                safeArea: proxy.safeAreaInsets,
+                safeAreaEdges: hudSafeAreaEdges,
+                margin: margin)
+            DraggableHUDOverlay(
+                inset: margin,
+                safeAreaEdges: hudSafeAreaEdges,
+                pinnedRowHeight: hudAccessory?.docksToBottom == true
+                    ? hudAccessory?.buttonStyle(available).size.height : nil,
+                onReserveChange: { hudReserve = $0 }
+            ) {
+                HUDBar(accessory: hudAccessory, availableWidth: available) {
+                    hudMenu
+                }
+            }
         }
         #else
         VStack {
@@ -667,10 +727,14 @@ public struct RemoteDesktopView: View {
                 Label(String(localized: "Close Connection", bundle: .module), systemImage: "xmark.circle")
             }
         } label: {
+            #if canImport(UIKit)
+            HUDMenuButtonLabel()
+            #else
             Image(systemName: "line.3.horizontal")
                 .font(.body.weight(.bold))
                 .frame(width: 46, height: 46)
                 .modifier(HUDButtonChromeModifier())
+            #endif
         }
         .buttonStyle(.plain)
         .foregroundStyle(.primary)
@@ -963,8 +1027,9 @@ public struct RemoteDesktopView: View {
             ? keyboardViewportMetrics.availableSize(
                 reservingObstruction: shouldReserveKeyboardInset)
             : keyboardViewportMetrics.containerSize
-        guard size.width > 0, size.height > 0 else { return }
-        updateRemoteDisplaySize(for: size)
+        guard size.width > 0, size.height > hudReserve else { return }
+        // Match Client fills the area above a docked HUD bar.
+        updateRemoteDisplaySize(for: CGSize(width: size.width, height: size.height - hudReserve))
     }
     #endif
 
@@ -1299,7 +1364,16 @@ final class DockedKeyboardInsetView: UIView {
 /// Deliberately not host-tinted — the button floats over live desktop
 /// content, where adaptive glass fits better than theme colors.
 struct HUDButtonChromeModifier: ViewModifier {
+    /// False while the button sits inside a HUD bar, which draws the glass.
+    var isEnabled = true
+
+    @ViewBuilder
     func body(content: Content) -> some View {
+        if isEnabled { chrome(content) } else { content }
+    }
+
+    @ViewBuilder
+    private func chrome(_ content: Content) -> some View {
         #if os(visionOS)
         content.background(.ultraThinMaterial, in: Circle())
         #else

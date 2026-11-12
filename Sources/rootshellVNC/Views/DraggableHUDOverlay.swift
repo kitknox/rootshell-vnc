@@ -169,17 +169,42 @@ import UIKit
 /// hosting view. This pan gets the same direct-drag behavior as a UIButton:
 /// it stays possible during a tap, but once movement recognizes it cannot be
 /// preempted and cancels the Menu interaction.
-private final class HUDDragPanGestureRecognizer: UIPanGestureRecognizer {
-    override func canPrevent(
+public class HUDDragPanGestureRecognizer: UIPanGestureRecognizer {
+    public override func canPrevent(
         _ preventedGestureRecognizer: UIGestureRecognizer
     ) -> Bool {
         true
     }
 
-    override func canBePrevented(
+    public override func canBePrevented(
         by preventingGestureRecognizer: UIGestureRecognizer
     ) -> Bool {
         false
+    }
+}
+
+/// Drags the HUD it sits in. `VNCHUDInteractiveContent` adds one to itself and
+/// filters its touches through the recognizer's delegate.
+public final class VNCHUDDragGestureRecognizer: HUDDragPanGestureRecognizer {
+    public init() {
+        super.init(target: nil, action: nil)
+        addTarget(self, action: #selector(drag))
+        minimumNumberOfTouches = 1
+        maximumNumberOfTouches = 1
+        cancelsTouchesInView = true
+        delaysTouchesBegan = false
+        delaysTouchesEnded = true
+    }
+
+    @objc private func drag() {
+        var ancestor = view?.superview
+        while let current = ancestor {
+            if let overlay = current as? DraggableHUDOverlayHostView {
+                overlay.handlePan(self)
+                return
+            }
+            ancestor = current.superview
+        }
     }
 }
 
@@ -190,14 +215,21 @@ struct DraggableHUDOverlay<Content: View>: UIViewRepresentable {
     var inset: CGFloat = 12
     /// Edges whose safe area the HUD keeps clear of.
     var safeAreaEdges: Edge.Set = .all
+    /// Set to pin the HUD along the bottom instead of letting it float: the
+    /// height of its bottom row, which is what the screen is kept clear of.
+    var pinnedRowHeight: CGFloat?
+    /// Height at the bottom that a pinned HUD occupies; 0 while it floats.
+    var onReserveChange: ((CGFloat) -> Void)?
     @ViewBuilder var content: () -> Content
 
     func makeUIView(context: Context) -> DraggableHUDOverlayHostView {
         let view = DraggableHUDOverlayHostView()
         view.inset = inset
         view.safeAreaEdges = safeAreaEdges
+        view.pinnedRowHeight = pinnedRowHeight
+        view.onReserveChange = onReserveChange
 
-        let host = UIHostingController(rootView: AnyView(content()))
+        let host = UIHostingController(rootView: Self.sized(content(), in: view))
         host.view.backgroundColor = .clear
         // The overlay places the HUD itself. Left on, the button's own host
         // insets its content for a keyboard or safe area it happens to sit
@@ -218,9 +250,11 @@ struct DraggableHUDOverlay<Content: View>: UIViewRepresentable {
     func updateUIView(_ uiView: DraggableHUDOverlayHostView, context: Context) {
         // Keep the hosted SwiftUI view in sync. The HUD's position lives on
         // the UIView and is untouched by content updates.
-        context.coordinator.host?.rootView = AnyView(content())
+        context.coordinator.host?.rootView = Self.sized(content(), in: uiView)
         uiView.inset = inset
         uiView.safeAreaEdges = safeAreaEdges
+        uiView.pinnedRowHeight = pinnedRowHeight
+        uiView.onReserveChange = onReserveChange
         uiView.setNeedsLayout()
     }
 
@@ -236,6 +270,20 @@ struct DraggableHUDOverlay<Content: View>: UIViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
+    /// The HUD keeps its ideal size whatever frame it currently has, and asks
+    /// to be placed again when that size changes (an accessory opening).
+    private static func sized(
+        _ content: Content,
+        in view: DraggableHUDOverlayHostView
+    ) -> AnyView {
+        AnyView(
+            content
+                .fixedSize()
+                .onGeometryChange(for: CGSize.self) { $0.size } action: { [weak view] _ in
+                    view?.setNeedsLayout()
+                })
+    }
+
     // Erased to UIHostingController<AnyView> (not <Content>) and given an
     // explicit deinit: the swift-frontend optimizer crashes in EarlyPerfInliner
     // while inlining the synthesized deinit of a coordinator holding a generic
@@ -250,6 +298,21 @@ struct DraggableHUDOverlay<Content: View>: UIViewRepresentable {
     }
 }
 
+// Host content that tracks its own touches is not a drag handle.
+extension DraggableHUDOverlayHostView: UIGestureRecognizerDelegate {
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldReceive touch: UITouch
+    ) -> Bool {
+        var view = touch.view
+        while let current = view, current !== self {
+            if current is VNCHUDInteractiveContent { return false }
+            view = current.superview
+        }
+        return true
+    }
+}
+
 /// Non-generic host so the pan handler can be an `@objc` selector target
 /// (a generic UIView cannot expose `@objc` members to the Obj-C runtime).
 @MainActor
@@ -258,6 +321,9 @@ final class DraggableHUDOverlayHostView: UIView {
     weak var hostedView: UIView?
     var inset: CGFloat = 12
     var safeAreaEdges: Edge.Set = .all
+    var pinnedRowHeight: CGFloat?
+    var onReserveChange: ((CGFloat) -> Void)?
+    private var reportedReserve: CGFloat = 0
 
     /// Edge-relative state, rather than an absolute center, prevents a HUD
     /// clamped above the software keyboard from staying in the middle after
@@ -300,11 +366,13 @@ final class DraggableHUDOverlayHostView: UIView {
         pan.cancelsTouchesInView = true
         pan.delaysTouchesBegan = false
         pan.delaysTouchesEnded = true
+        pan.delegate = self
         bar.addGestureRecognizer(pan)
     }
 
-    @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
-        guard let bar = hostedView else { return }
+    @objc func handlePan(_ gesture: UIPanGestureRecognizer) {
+        // A pinned HUD stays put.
+        guard pinnedRowHeight == nil, let bar = hostedView else { return }
         let translation = gesture.translation(in: self)
         let nextCenter = HUDDockPosition.clamp(
             CGPoint(
@@ -392,6 +460,16 @@ final class DraggableHUDOverlayHostView: UIView {
     }
 
     private func layoutDockedBar(_ bar: UIView, size: CGSize) {
+        if let pinnedRowHeight {
+            isDragging = false
+            let allowed = allowedCenterRect(for: size)
+            bar.bounds = CGRect(origin: .zero, size: size)
+            bar.center = CGPoint(x: allowed.midX, y: allowed.maxY)
+            // Only the bottom row: rows that open above it float over the screen.
+            reportReserve(bounds.maxY - bar.frame.maxY + pinnedRowHeight + 6)
+            return
+        }
+        reportReserve(0)
         if isDragging {
             let center = bar.center
             bar.bounds = CGRect(origin: .zero, size: size)
@@ -403,10 +481,21 @@ final class DraggableHUDOverlayHostView: UIView {
         }
     }
 
+    /// Deferred: this runs during layout, and the receiver changes view state.
+    private func reportReserve(_ reserve: CGFloat) {
+        guard abs(reserve - reportedReserve) > 0.5 else { return }
+        reportedReserve = reserve
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.onReserveChange?(self.reportedReserve)
+        }
+    }
+
     // MARK: Layout
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        if pinnedRowHeight == nil { reportReserve(0) }
         guard let bar = hostedView, bounds.width > 0, bounds.height > 0 else { return }
 
         // Ask the hosting controller for the SwiftUI content's ideal size

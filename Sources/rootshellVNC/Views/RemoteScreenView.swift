@@ -49,10 +49,15 @@ public struct RemoteScreenView: View {
     private let brightnessGain: Double
     private let disconnect: () -> Void
     private let hudMenuExtras: AnyView?
+    #if canImport(UIKit)
+    private var hudAccessory: HUDAccessory?
+    #endif
     private let touchHandler: TouchInputHandler
     private let keyboardHandler: KeyboardInputHandler
 
     @State private var viewport = RemoteViewportState()
+    /// Height at the bottom that a docked HUD bar keeps clear of the fitted screen.
+    @State private var hudReserve: CGFloat = 0
     @State private var viewportPanningMode: RemoteViewportPanningMode
     @State private var pointerMode: RemotePointerMode
     @State private var keyboardActive = false
@@ -117,17 +122,54 @@ public struct RemoteScreenView: View {
         keyboardActive || keyboardCapture.inputViews.accessory != nil
     }
 
+    #if canImport(UIKit)
+    /// Adds host content to the HUD, inside its glass: `beside` the menu
+    /// button, taking the button style to match, and `behind` the buttons
+    /// across the whole bar, taking the width it may use. `buttonStyle` sizes
+    /// every button from that width. `docksToBottom` pins the bar along the bottom and fits the
+    /// screen above it, though zoomed content still shows through underneath.
+    public func hudAccessory<Behind: View, Beside: View>(
+        isEnabled: Bool = true,
+        docksToBottom: Bool = false,
+        buttonStyle: @escaping (_ availableWidth: CGFloat) -> VNCHUDButtonStyle,
+        @ViewBuilder behind: @escaping (_ availableWidth: CGFloat) -> Behind,
+        @ViewBuilder beside: @escaping (_ buttonStyle: VNCHUDButtonStyle) -> Beside
+    ) -> Self {
+        guard isEnabled else { return self }
+        var copy = self
+        copy.hudAccessory = HUDAccessory(
+            docksToBottom: docksToBottom,
+            buttonStyle: buttonStyle,
+            behind: { AnyView(behind($0)) },
+            beside: { AnyView(beside($0)) })
+        return copy
+    }
+    #endif
+
     public var body: some View {
         VStack(spacing: 0) {
             GeometryReader { geometry in
+                // The fitted screen stops above a docked HUD bar. Zoomed in, it
+                // still draws underneath: only the ZStack clips.
+                let contentSize = CGSize(
+                    width: geometry.size.width,
+                    height: max(1, geometry.size.height - hudReserve))
+                let hudMargin = HUDBar<EmptyView>.margin(for: hudAccessory)
+                let hudWidth = HUDBar<EmptyView>.availableWidth(
+                    containerWidth: geometry.size.width,
+                    safeArea: geometry.safeAreaInsets,
+                    safeAreaEdges: hudSafeAreaEdges,
+                    margin: hudMargin)
+
                 ZStack {
                     Color.black
                         .ignoresSafeArea()
 
                     VideoBandView(renderer: renderer, brightnessGain: brightnessGain)
-                        .frame(width: geometry.size.width, height: geometry.size.height)
+                        .frame(width: contentSize.width, height: contentSize.height)
                         .scaleEffect(viewport.scale)
                         .offset(viewport.offset)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
 
                     if isInteractive,
                        framebufferSize.width > 0,
@@ -155,20 +197,36 @@ public struct RemoteScreenView: View {
                             disconnect: disconnect,
                             remoteCursor: nil,
                             remoteCursorPresence: .undescribed)
-                            .frame(width: geometry.size.width, height: geometry.size.height)
+                            .frame(width: contentSize.width, height: contentSize.height)
                             .contentShape(Rectangle())
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     }
 
-                    DraggableHUDOverlay(safeAreaEdges: hudSafeAreaEdges) {
-                        hudMenu
+                    DraggableHUDOverlay(
+                        inset: hudMargin,
+                        safeAreaEdges: hudSafeAreaEdges,
+                        pinnedRowHeight: hudAccessory?.docksToBottom == true
+                            ? hudAccessory?.buttonStyle(hudWidth).size.height : nil,
+                        onReserveChange: { hudReserve = $0 }
+                    ) {
+                        HUDBar(accessory: hudAccessory, availableWidth: hudWidth) {
+                            hudMenu
+                        }
                     }
                 }
                 .clipped()
                 .onChange(of: geometry.size) { _, newSize in
-                    viewport.clampOffset(viewSize: newSize, framebufferSize: framebufferSize)
+                    viewport.clampOffset(
+                        viewSize: CGSize(width: newSize.width, height: max(1, newSize.height - hudReserve)),
+                        framebufferSize: framebufferSize)
                 }
                 .onChange(of: framebufferSize) { _, newSize in
-                    viewport.clampOffset(viewSize: geometry.size, framebufferSize: newSize)
+                    viewport.clampOffset(viewSize: contentSize, framebufferSize: newSize)
+                }
+                .onChange(of: hudReserve) { _, reserve in
+                    viewport.clampOffset(
+                        viewSize: CGSize(width: geometry.size.width, height: max(1, geometry.size.height - reserve)),
+                        framebufferSize: framebufferSize)
                 }
             }
 
@@ -243,10 +301,7 @@ public struct RemoteScreenView: View {
                 Label(String(localized: "Close Connection", bundle: .module), systemImage: "xmark.circle")
             }
         } label: {
-            Image(systemName: "line.3.horizontal")
-                .font(.body.weight(.bold))
-                .frame(width: 46, height: 46)
-                .modifier(HUDButtonChromeModifier())
+            HUDMenuButtonLabel()
         }
         .buttonStyle(.plain)
         .foregroundStyle(.primary)
