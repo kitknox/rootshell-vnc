@@ -338,10 +338,12 @@ public final class VideoBandLayerRenderer {
     public func layout() {
         guard screenWidth > 0, screenHeight > 0, viewBounds.width > 0, viewBounds.height > 0 else { return }
 
-        // Aspect-fit the native screen into the view.
-        let scale = min(viewBounds.width / screenWidth, viewBounds.height / screenHeight)
-        let fitWidth = screenWidth * scale
-        let fitHeight = screenHeight * scale
+        // Aspect-fit the native screen into the view, filling on a near-match.
+        let scale = RemoteViewportState.fitScale(
+            content: CGSize(width: screenWidth, height: screenHeight),
+            into: viewBounds.size)
+        let fitWidth = screenWidth * scale.width
+        let fitHeight = screenHeight * scale.height
         let originX = viewBounds.minX + (viewBounds.width - fitWidth) / 2
         let originY = viewBounds.minY + (viewBounds.height - fitHeight) / 2
 

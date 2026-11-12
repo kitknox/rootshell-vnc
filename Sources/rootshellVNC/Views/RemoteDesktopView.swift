@@ -419,7 +419,8 @@ public struct RemoteDesktopView: View {
             StandardFramebufferContent(
                 session: session,
                 showsWaitingCard: !hostOwnsRecoveryChrome,
-                brightnessGain: brightnessGain)
+                brightnessGain: brightnessGain,
+                viewSize: viewSize)
                 .frame(width: viewSize.width, height: viewSize.height)
         }
     }
@@ -1318,14 +1319,21 @@ private struct StandardFramebufferContent: View {
     /// False when the host renders its own connected-but-no-frame prompt.
     let showsWaitingCard: Bool
     let brightnessGain: Double
+    let viewSize: CGSize
 
     var body: some View {
         if let image = session.currentImage {
             let displayedImage = cropped(image) ?? image
+            let imageSize = CGSize(
+                width: displayedImage.width,
+                height: displayedImage.height)
+            let fit = RemoteViewportState.fitScale(content: imageSize, into: viewSize)
             Image(decorative: displayedImage, scale: 1)
                 .interpolation(.high)
                 .resizable()
-                .aspectRatio(contentMode: .fit)
+                .frame(
+                    width: imageSize.width * fit.width,
+                    height: imageSize.height * fit.height)
                 .overlay {
                     #if canImport(UIKit) || canImport(AppKit)
                     VNCEDRImageView(
@@ -1372,12 +1380,14 @@ private struct AdaptiveDisplayView: View {
                 ? [CGRect(origin: .zero, size: geometry.size)]
                 : displayRegions
             let union = regions.dropFirst().reduce(regions[0]) { $0.union($1) }
-            let scale = min(
-                geometry.size.width / max(1, union.width),
-                geometry.size.height / max(1, union.height))
+            let scale = RemoteViewportState.fitScale(
+                content: CGSize(
+                    width: max(1, union.width),
+                    height: max(1, union.height)),
+                into: geometry.size)
             let origin = CGPoint(
-                x: (geometry.size.width - union.width * scale) / 2,
-                y: (geometry.size.height - union.height * scale) / 2)
+                x: (geometry.size.width - union.width * scale.width) / 2,
+                y: (geometry.size.height - union.height * scale.height) / 2)
 
             ZStack(alignment: .topLeading) {
                 videoDisplay(
@@ -1400,18 +1410,18 @@ private struct AdaptiveDisplayView: View {
     private func videoDisplay(
         renderer: VideoBandLayerRenderer,
         region: CGRect,
-        scale: CGFloat,
+        scale: CGSize,
         origin: CGPoint
     ) -> some View {
         VideoBandView(
             renderer: renderer,
             brightnessGain: brightnessGain)
             .frame(
-                width: region.width * scale,
-                height: region.height * scale)
+                width: region.width * scale.width,
+                height: region.height * scale.height)
             .offset(
-                x: origin.x + region.minX * scale,
-                y: origin.y + region.minY * scale)
+                x: origin.x + region.minX * scale.width,
+                y: origin.y + region.minY * scale.height)
     }
 }
 #endif
@@ -1434,7 +1444,7 @@ private struct VNCEDRImageView: UIViewRepresentable {
 
 @MainActor
 private final class VNCEDRImageHostView: UIView {
-    private let presenter = VNCBrightnessPresenter(contentsGravity: .resizeAspect)
+    private let presenter = VNCBrightnessPresenter(contentsGravity: .resize)
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -1476,7 +1486,7 @@ private struct VNCEDRImageView: NSViewRepresentable {
 
 @MainActor
 private final class VNCEDRImageHostView: NSView {
-    private let presenter = VNCBrightnessPresenter(contentsGravity: .resizeAspect)
+    private let presenter = VNCBrightnessPresenter(contentsGravity: .resize)
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)

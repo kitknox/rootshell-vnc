@@ -29,6 +29,64 @@ final class RemoteViewportStateTests: XCTestCase {
             framebufferSize: framebufferSize))
     }
 
+    func testNearMatchFillsTheViewExactly() throws {
+        // Match Client rounds 1371×1022 points to 1368×1024 on its 8-point grid.
+        let view = CGSize(width: 1371, height: 1022)
+        let framebuffer = CGSize(width: 2736, height: 2048)
+        let viewport = RemoteViewportState()
+        let frame = try XCTUnwrap(viewport.displayedFrame(
+            viewSize: view,
+            framebufferSize: framebuffer))
+        XCTAssertEqual(frame.minX, 0, accuracy: 0.001)
+        XCTAssertEqual(frame.minY, 0, accuracy: 0.001)
+        XCTAssertEqual(frame.width, view.width, accuracy: 0.001)
+        XCTAssertEqual(frame.height, view.height, accuracy: 0.001)
+
+        let topLeft = try XCTUnwrap(viewport.framebufferPoint(
+            for: .zero,
+            viewSize: view,
+            framebufferSize: framebuffer))
+        XCTAssertEqual(topLeft.x, 0, accuracy: 0.001)
+        XCTAssertEqual(topLeft.y, 0, accuracy: 0.001)
+        let bottomRight = try XCTUnwrap(viewport.framebufferPoint(
+            for: CGPoint(x: view.width - 0.01, y: view.height - 0.01),
+            viewSize: view,
+            framebufferSize: framebuffer))
+        XCTAssertEqual(bottomRight.x, framebuffer.width, accuracy: 0.1)
+        XCTAssertEqual(bottomRight.y, framebuffer.height, accuracy: 0.1)
+    }
+
+    func testRealAspectMismatchStillLetterboxes() {
+        // 16:10 desktop in a 4:3 pane.
+        let scale = RemoteViewportState.fitScale(
+            content: CGSize(width: 2560, height: 1600),
+            into: CGSize(width: 1024, height: 768))
+        XCTAssertEqual(scale.width, scale.height)
+        XCTAssertEqual(scale.width, 0.4, accuracy: 0.0001)
+    }
+
+    func testNearMatchZoomRoundTrips() throws {
+        let view = CGSize(width: 1371, height: 1022)
+        let framebuffer = CGSize(width: 2736, height: 2048)
+        var viewport = RemoteViewportState()
+        viewport.zoom(
+            by: 3,
+            around: CGPoint(x: 400, y: 300),
+            viewSize: view,
+            framebufferSize: framebuffer)
+        let remote = CGPoint(x: 1000, y: 700)
+        let viewPoint = try XCTUnwrap(viewport.viewPoint(
+            forFramebufferPoint: remote,
+            viewSize: view,
+            framebufferSize: framebuffer))
+        let back = try XCTUnwrap(viewport.framebufferPoint(
+            for: viewPoint,
+            viewSize: view,
+            framebufferSize: framebuffer))
+        XCTAssertEqual(back.x, remote.x, accuracy: 0.001)
+        XCTAssertEqual(back.y, remote.y, accuracy: 0.001)
+    }
+
     func testNearestVisiblePointStaysOnTheDesktop() throws {
         let viewport = RemoteViewportState()
         // Right of the view, and below the letterboxed desktop.

@@ -322,6 +322,24 @@ struct RemoteViewportState: Equatable, Sendable {
             height: revealed.offset.height - offset.height)
     }
 
+    /// Match Client sizes land on an 8-point codec grid, so a near-match is
+    /// stretched to fill the view rather than letterboxed by a few points.
+    static let fillAspectTolerance: CGFloat = 0.02
+
+    /// Per-axis scale that aspect-fits `content`, or fills `view` exactly
+    /// when the aspect ratios differ by at most `fillAspectTolerance`.
+    static func fitScale(content: CGSize, into view: CGSize) -> CGSize {
+        guard content.width > 0, content.height > 0,
+              view.width > 0, view.height > 0 else { return CGSize(width: 1, height: 1) }
+        let scaleX = view.width / content.width
+        let scaleY = view.height / content.height
+        if abs(scaleX / scaleY - 1) <= fillAspectTolerance {
+            return CGSize(width: scaleX, height: scaleY)
+        }
+        let fit = min(scaleX, scaleY)
+        return CGSize(width: fit, height: fit)
+    }
+
     func displayedFrame(
         viewSize: CGSize,
         framebufferSize: CGSize
@@ -331,12 +349,10 @@ struct RemoteViewportState: Equatable, Sendable {
             return nil
         }
 
-        let fit = min(
-            viewSize.width / framebufferSize.width,
-            viewSize.height / framebufferSize.height)
+        let fit = Self.fitScale(content: framebufferSize, into: viewSize)
         let size = CGSize(
-            width: framebufferSize.width * fit * scale,
-            height: framebufferSize.height * fit * scale)
+            width: framebufferSize.width * fit.width * scale,
+            height: framebufferSize.height * fit.height * scale)
         return CGRect(
             x: (viewSize.width - size.width) / 2 + offset.width,
             y: (viewSize.height - size.height) / 2 + offset.height,
