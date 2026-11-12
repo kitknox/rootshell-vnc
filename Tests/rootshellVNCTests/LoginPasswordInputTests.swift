@@ -54,6 +54,10 @@ final class LoginPasswordInputTests: XCTestCase {
             pressingReturn: false, serverReportsLoginWindow: true))
         XCTAssertFalse(VNCSession.loginPasswordFocusesField(
             pressingReturn: false, serverReportsLoginWindow: false))
+        XCTAssertFalse(VNCSession.loginPasswordFocusesField(
+            pressingReturn: true, keepingFocus: true, serverReportsLoginWindow: false))
+        XCTAssertTrue(VNCSession.loginPasswordFocusesField(
+            pressingReturn: true, keepingFocus: true, serverReportsLoginWindow: true))
     }
 
     func testPasswordFocusClickClearsFieldBeforeTypingBarrier() {
