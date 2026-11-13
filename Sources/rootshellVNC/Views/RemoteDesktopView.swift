@@ -50,6 +50,9 @@ public struct RemoteDesktopView: View {
     @State private var hudReserve: CGFloat = 0
     @State private var viewportPanningMode: RemoteViewportPanningMode
     @State private var pointerMode: RemotePointerMode
+    /// The user's pointer mode before an external screen took the picture,
+    /// restored when it hands the picture back.
+    @State private var pointerModeBeforeExternalDisplay: RemotePointerMode?
     @State private var keyboardActive = false
     @State private var confirmPasswordSend = false
     @State private var curtainPromptPresented = false
@@ -359,9 +362,15 @@ public struct RemoteDesktopView: View {
                 }
                 .onAppear {
                     presentPendingLoginPasswordPrompt()
+                    if session.externalDisplayViewSize != nil {
+                        applyExternalDisplayPointerMode(true)
+                    }
                     #if !canImport(UIKit)
                     updateRemoteDisplaySize(for: geometry.size)
                     #endif
+                }
+                .onChange(of: session.externalDisplayViewSize != nil) { _, external in
+                    applyExternalDisplayPointerMode(external)
                 }
                 .onChange(of: session.loginPasswordPromptPending) { _, pending in
                     if pending {
@@ -447,7 +456,12 @@ public struct RemoteDesktopView: View {
 
     @ViewBuilder
     private func desktopContent(in viewSize: CGSize) -> some View {
-        if session.isHighPerformanceMode {
+        if session.externalDisplayViewSize != nil {
+            // The picture is on the external screen; this surface is the
+            // trackpad that drives it.
+            ExternalDisplayHandoffPlaceholder()
+                .frame(width: viewSize.width, height: viewSize.height)
+        } else if session.isHighPerformanceMode {
             #if canImport(UIKit)
             AdaptiveDisplayView(
                 primaryRenderer: session.videoBandRenderer,
@@ -966,6 +980,21 @@ public struct RemoteDesktopView: View {
         }
     }
 
+    /// Direct touch maps a finger onto the picture under it, which is on
+    /// another screen while an external display presents the desktop; only
+    /// relative trackpad motion still makes sense on the device.
+    private func applyExternalDisplayPointerMode(_ external: Bool) {
+        if external {
+            guard pointerModeBeforeExternalDisplay == nil else { return }
+            pointerModeBeforeExternalDisplay = pointerMode
+            pointerMode = .trackpad
+            viewport = RemoteViewportState()
+        } else if let previous = pointerModeBeforeExternalDisplay {
+            pointerModeBeforeExternalDisplay = nil
+            pointerMode = previous
+        }
+    }
+
     private func pointerModeTitle(_ mode: RemotePointerMode) -> String {
         switch mode {
         case .direct:
@@ -1388,7 +1417,7 @@ struct HUDButtonChromeModifier: ViewModifier {
 
 /// Owns the hot standard-framebuffer observation so publishing a new image
 /// does not invalidate the parent view that owns the HUD Menu.
-private struct StandardFramebufferContent: View {
+struct StandardFramebufferContent: View {
     @Bindable var session: VNCSession
     /// False when the host renders its own connected-but-no-frame prompt.
     let showsWaitingCard: Bool
@@ -1442,7 +1471,7 @@ private struct StandardFramebufferContent: View {
 #if canImport(UIKit)
 /// Keeps each display in its own decoder-backed renderer and positions it in
 /// the server's normalized desktop coordinate space.
-private struct AdaptiveDisplayView: View {
+struct AdaptiveDisplayView: View {
     let primaryRenderer: VideoBandLayerRenderer
     let secondaryRenderer: VideoBandLayerRenderer
     let displayRegions: [CGRect]

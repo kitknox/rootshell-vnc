@@ -811,6 +811,34 @@ public final class VNCSession {
         }
     }
 
+    /// Size, in points, of an external screen presenting this session.
+    ///
+    /// While set, Match Client sizes the remote display to this screen rather
+    /// than to the hosting view, and ``RemoteDesktopView`` hands the picture
+    /// over (the Apple media renderer owns one layer, which can only be
+    /// attached to one screen) and drives the pointer as a trackpad. Present
+    /// the desktop on that screen with ``ExternalDisplayDesktopView``.
+    /// Clearing it restores the hosting view's size.
+    public var externalDisplayViewSize: CGSize? {
+        didSet {
+            guard oldValue != externalDisplayViewSize else { return }
+            if let host = hostDisplaySizeInput {
+                updateRemoteDisplaySize(
+                    viewSize: host.viewSize,
+                    displayScale: host.displayScale)
+            } else if let externalDisplayViewSize {
+                updateRemoteDisplaySize(
+                    viewSize: externalDisplayViewSize,
+                    displayScale: 2)
+            }
+        }
+    }
+
+    /// Last pointer position sent to the server, in framebuffer pixels. An
+    /// external presentation draws its local pointer here, since the input
+    /// surface that tracks the pointer stays on the device.
+    public private(set) var lastPointerLocation: CGPoint?
+
     /// While `true`, decoded frames are not presented: the Apple media band
     /// renderers stop committing to their display layers and the classic path
     /// stops publishing framebuffer snapshots. Container apps set this while
@@ -916,10 +944,14 @@ public final class VNCSession {
     /// a multi-megabyte reference picture before it can request its virtual
     /// display.
     @ObservationIgnored
-    private var preparedClientDisplaySize: RemoteDisplaySize?
+    private(set) var preparedClientDisplaySize: RemoteDisplaySize?
     /// Latest viewport reported while size updates were suspended.
     @ObservationIgnored
     private var deferredDisplaySizeUpdate: (viewSize: CGSize, displayScale: CGFloat)?
+    /// Latest viewport the hosting view reported, kept so clearing
+    /// ``externalDisplayViewSize`` can hand Match Client back to it.
+    @ObservationIgnored
+    private var hostDisplaySizeInput: (viewSize: CGSize, displayScale: CGFloat)?
     /// Single drain task for the ordered input queue. Gesture callbacks are
     /// synchronous, but transport writes are async; one pump prevents a release
     /// from overtaking its press while coalescing stale movement samples.
@@ -1551,6 +1583,11 @@ public final class VNCSession {
         }
 
         enqueueInput(.pointer(buttonMask: buttonMask, x: x, y: y))
+        // Only an external presentation reads this; skip the observation
+        // churn of pointer-rate updates otherwise.
+        if externalDisplayViewSize != nil {
+            lastPointerLocation = CGPoint(x: Int(x), y: Int(y))
+        }
     }
 
     /// Send one continuous scroll sample. Apple servers that advertise precise
@@ -1740,6 +1777,10 @@ public final class VNCSession {
             deferredDisplaySizeUpdate = (viewSize, displayScale)
             return
         }
+        hostDisplaySizeInput = (viewSize, displayScale)
+        // The hosting view keeps reporting its own geometry on every layout;
+        // while an external screen presents the desktop, that screen decides.
+        let viewSize = externalDisplayViewSize ?? viewSize
         guard let requested = matchingClientDisplaySize(
             viewSize: viewSize,
             displayScale: displayScale) else { return }
@@ -2212,6 +2253,17 @@ public final class VNCSession {
             framebufferSize: CGSize(
                 width: framebufferWidth,
                 height: framebufferHeight))
+    }
+
+    /// Framebuffer pixels per remote desktop point. Match Client asks for a
+    /// HiDPI virtual display (2x); every other mode presents the desktop's
+    /// pixels as they come, so treat them as 1x.
+    var presentedBackingScale: CGFloat {
+        guard isHighPerformanceMode,
+              configuration.displaySizingMode == .matchClient,
+              let size = preparedClientDisplaySize,
+              size.pointWidth > 0 else { return 1 }
+        return CGFloat(size.pixelWidth) / CGFloat(size.pointWidth)
     }
 
     var presentedFramebufferSize: CGSize {

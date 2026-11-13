@@ -26513,6 +26513,38 @@
           }
         }
       }
+    },
+    "Showing on External Display" : {
+      "localizations" : {
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在外接顯示器上顯示"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在外接显示器上显示"
+          }
+        }
+      }
+    },
+    "Use this screen as a trackpad." : {
+      "localizations" : {
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "將此螢幕當作觸控板使用。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "将此屏幕当作触控板使用。"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"
