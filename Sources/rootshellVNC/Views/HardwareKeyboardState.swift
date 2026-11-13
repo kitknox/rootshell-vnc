@@ -262,9 +262,12 @@ struct CommandModifierState: Sendable {
         return reconcile()
     }
 
+    /// `inferMissing` false only lifts modifiers absent from `modifiers`, for
+    /// sources that can report a modifier as held after its key-up.
     mutating func synchronize(
         modifiers: VNCKeyboardModifiers,
-        optionKeysym: UInt32
+        optionKeysym: UInt32,
+        inferMissing: Bool = true
     ) -> [HardwareKeyboardTransition] {
         let groups: [(VNCKeyboardModifiers, UInt32, UInt32, UInt32)] = [
             (.control, 0xE0, 0xE4, KeyboardInputHandler.keysymControlL),
@@ -278,7 +281,7 @@ struct CommandModifierState: Sendable {
                 physical.removeValue(forKey: right)
                 inferredUsages.remove(left)
                 inferredUsages.remove(right)
-            } else if physical[left] == nil && physical[right] == nil {
+            } else if inferMissing, physical[left] == nil && physical[right] == nil {
                 physical[left] = keysym
                 inferredUsages.insert(left)
             }
@@ -387,12 +390,13 @@ final class HardwareKeyboardController {
         commandModifiers.releaseAll().forEach(sendModifier)
     }
 
-    func synchronizeModifiers(_ modifiers: VNCKeyboardModifiers) {
+    func synchronizeModifiers(_ modifiers: VNCKeyboardModifiers, inferMissing: Bool = true) {
         guard controlOptionAsCommand else { return }
         commandModifiers.synchronize(
             modifiers: modifiers,
             optionKeysym: KeyboardInputHandler.optionLeftKeysym(
-                appleModifierConvention: keyboardHandler.usesAppleModifierMapping)
+                appleModifierConvention: keyboardHandler.usesAppleModifierMapping),
+            inferMissing: inferMissing
         ).forEach(sendModifier)
     }
 

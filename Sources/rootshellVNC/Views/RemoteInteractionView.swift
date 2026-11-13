@@ -488,8 +488,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         _ = hardwareKeyboard.press(usage: usage, keysym: keysym)
     }
 
-    private func synchronizeUniversalModifiers(_ flags: UIKeyModifierFlags) {
-        hardwareKeyboard.synchronizeModifiers(Self.keyboardModifiers(flags))
+    private func synchronizeUniversalModifiers(_ flags: UIKeyModifierFlags, inferMissing: Bool = true) {
+        hardwareKeyboard.synchronizeModifiers(Self.keyboardModifiers(flags), inferMissing: inferMissing)
         clearPendingTapsIfChordEnded()
     }
 
@@ -1450,26 +1450,22 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
 
     /// Recover modifier/key releases that UIKit may omit for intercepted
     /// commands. Printable input still uses UIKit's keyboard-layout result.
+    /// Edges hop through the main queue, which keeps a quick press and
+    /// release in order; separate Tasks need not run in order.
     private func configureHardwareKeyboardMonitor(for keyboard: GCKeyboard?) {
         let input = keyboard?.keyboardInput
         monitoredCatalystKeyboardInput?.keyChangedHandler = nil
         monitoredCatalystKeyboardInput = input
         input?.keyChangedHandler = { [weak self] keyboard, _, keyCode, pressed in
-            var flags: UIKeyModifierFlags = []
-            if keyboard.button(forKeyCode: .leftControl)?.isPressed == true
-                || keyboard.button(forKeyCode: .rightControl)?.isPressed == true { flags.insert(.control) }
-            if keyboard.button(forKeyCode: .leftAlt)?.isPressed == true
-                || keyboard.button(forKeyCode: .rightAlt)?.isPressed == true { flags.insert(.alternate) }
-            if keyboard.button(forKeyCode: .leftShift)?.isPressed == true
-                || keyboard.button(forKeyCode: .rightShift)?.isPressed == true { flags.insert(.shift) }
-            if keyboard.button(forKeyCode: .leftGUI)?.isPressed == true
-                || keyboard.button(forKeyCode: .rightGUI)?.isPressed == true { flags.insert(.command) }
-            let snapshot = flags
+            let snapshot = Self.gameControllerModifierFlags(keyboard)
             let usage = UInt32(keyCode.rawValue)
-            Task { @MainActor [weak self] in
-                self?.handleMonitoredUniversalKey(usage: usage, pressed: pressed, flags: snapshot)
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated {
+                    self?.handleMonitoredUniversalKey(usage: usage, pressed: pressed, flags: snapshot)
+                }
             }
             #if targetEnvironment(macCatalyst)
+            let held = Self.liveModifierFlags
             // Option/Command+arrow chords: Catalyst consumes these as its own
             // cursor movement and never delivers them via pressesBegan or a
             // UIKeyCommand, so read them straight from GameController — the same
@@ -1484,24 +1480,22 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             default: arrowUsage = nil
             }
             if let arrowUsage {
-                let control = keyboard.button(forKeyCode: .leftControl)?.isPressed == true
-                    || keyboard.button(forKeyCode: .rightControl)?.isPressed == true
-                let option = keyboard.button(forKeyCode: .leftAlt)?.isPressed == true
-                    || keyboard.button(forKeyCode: .rightAlt)?.isPressed == true
-                let command = keyboard.button(forKeyCode: .leftGUI)?.isPressed == true
-                    || keyboard.button(forKeyCode: .rightGUI)?.isPressed == true
-                let shift = keyboard.button(forKeyCode: .leftShift)?.isPressed == true
-                    || keyboard.button(forKeyCode: .rightShift)?.isPressed == true
+                let control = held.contains(.control)
+                let option = held.contains(.alternate)
+                let command = held.contains(.command)
+                let shift = held.contains(.shift)
                 // Control(+Option)+arrow is the Spaces/Mission Control shortcut
                 // owned by the standard remote commands; leave it alone.
                 guard (option || command), !control else { return }
-                Task { @MainActor [weak self] in
-                    self?.handleCatalystModifiedArrow(
-                        usage: arrowUsage,
-                        pressed: pressed,
-                        option: option,
-                        command: command,
-                        shift: shift)
+                DispatchQueue.main.async { [weak self] in
+                    MainActor.assumeIsolated {
+                        self?.handleCatalystModifiedArrow(
+                            usage: arrowUsage,
+                            pressed: pressed,
+                            option: option,
+                            command: command,
+                            shift: shift)
+                    }
                 }
                 return
             }
@@ -1514,26 +1508,51 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             }
             guard let alias else { return }
 
-            let controlDown = keyboard.button(forKeyCode: .leftControl)?.isPressed == true
-                || keyboard.button(forKeyCode: .rightControl)?.isPressed == true
-            let optionDown = keyboard.button(forKeyCode: .leftAlt)?.isPressed == true
-                || keyboard.button(forKeyCode: .rightAlt)?.isPressed == true
-            let shiftDown = keyboard.button(forKeyCode: .leftShift)?.isPressed == true
-                || keyboard.button(forKeyCode: .rightShift)?.isPressed == true
-            let commandDown = keyboard.button(forKeyCode: .leftGUI)?.isPressed == true
-                || keyboard.button(forKeyCode: .rightGUI)?.isPressed == true
-            let isExactAlias = controlDown && optionDown && !shiftDown && !commandDown
+            let isExactAlias = held.intersection([.control, .alternate, .shift, .command])
+                == [.control, .alternate]
 
-            Task { @MainActor [weak self] in
-                self?.handleCatalystCommandCompatibilityAlias(
-                    usage: alias.usage,
-                    character: alias.character,
-                    pressed: pressed,
-                    isExactAlias: isExactAlias)
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated {
+                    self?.handleCatalystCommandCompatibilityAlias(
+                        usage: alias.usage,
+                        character: alias.character,
+                        pressed: pressed,
+                        isExactAlias: isExactAlias)
+                }
             }
             #endif
         }
     }
+
+    /// GameController keeps a modifier pressed when its key-up lands while
+    /// the app is inactive, so this can only be trusted to say a key is up.
+    private nonisolated static func gameControllerModifierFlags(
+        _ keyboard: GCKeyboardInput
+    ) -> UIKeyModifierFlags {
+        var flags: UIKeyModifierFlags = []
+        if keyboard.button(forKeyCode: .leftControl)?.isPressed == true
+            || keyboard.button(forKeyCode: .rightControl)?.isPressed == true { flags.insert(.control) }
+        if keyboard.button(forKeyCode: .leftAlt)?.isPressed == true
+            || keyboard.button(forKeyCode: .rightAlt)?.isPressed == true { flags.insert(.alternate) }
+        if keyboard.button(forKeyCode: .leftShift)?.isPressed == true
+            || keyboard.button(forKeyCode: .rightShift)?.isPressed == true { flags.insert(.shift) }
+        if keyboard.button(forKeyCode: .leftGUI)?.isPressed == true
+            || keyboard.button(forKeyCode: .rightGUI)?.isPressed == true { flags.insert(.command) }
+        return flags
+    }
+
+    #if targetEnvironment(macCatalyst)
+    /// Modifiers held right now, from the session's event state.
+    private nonisolated static var liveModifierFlags: UIKeyModifierFlags {
+        guard let flags = CGEvent(source: nil)?.flags else { return [] }
+        var modifiers: UIKeyModifierFlags = []
+        if flags.contains(.maskControl) { modifiers.insert(.control) }
+        if flags.contains(.maskAlternate) { modifiers.insert(.alternate) }
+        if flags.contains(.maskShift) { modifiers.insert(.shift) }
+        if flags.contains(.maskCommand) { modifiers.insert(.command) }
+        return modifiers
+    }
+    #endif
 
     private func handleMonitoredUniversalKey(usage: UInt32, pressed: Bool, flags: UIKeyModifierFlags) {
         guard acceptsHardwareInput, isFirstResponder, window?.isKeyWindow == true,
@@ -1546,7 +1565,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             } else {
                 _ = hardwareKeyboard.release(usage: usage)
             }
-            synchronizeUniversalModifiers(flags)
+            // A latched snapshot inferring a modifier would hold it on the
+            // remote with nothing left to release it (#747).
+            synchronizeUniversalModifiers(flags, inferMissing: false)
             return
         }
         if !pressed {
@@ -1556,12 +1577,14 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             }
             return
         }
-        guard Self.isControlOptionChord(flags) else { return }
+        // The chord comes from tracked presses, never the latching snapshot.
+        guard hardwareKeyboard.isControlOptionChordActive else { return }
         // Non-printable keys have layout-independent HID keysyms. In
         // particular, Catalyst can swallow mapped arrows before UIKit.
-        if (0x28...0x73).contains(usage),
-           KeyboardInputHandler.keysymForHIDUsage(usage, characters: "") != 0 {
-            pressUniversalKey(usage: usage, characters: "", flags: flags)
+        if (0x28...0x73).contains(usage) {
+            pressUniversalKeysym(
+                usage: usage,
+                keysym: KeyboardInputHandler.keysymForHIDUsage(usage, characters: ""))
         }
     }
 
@@ -1663,7 +1686,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     /// Whether the repeating arrow and at least one of its Option/Command
-    /// modifiers are still physically held, read live from GameController.
+    /// modifiers are still physically held: the arrow from GameController,
+    /// the modifiers from the session's live flags.
     private func catalystArrowChordStillHeld(usage: UInt32) -> Bool {
         guard let input = GCKeyboard.coalesced?.keyboardInput else { return false }
         let keyCode: GCKeyCode
@@ -1675,13 +1699,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         default: return false
         }
         guard input.button(forKeyCode: keyCode)?.isPressed == true else { return false }
-        let option = input.button(forKeyCode: .leftAlt)?.isPressed == true
-            || input.button(forKeyCode: .rightAlt)?.isPressed == true
-        let command = input.button(forKeyCode: .leftGUI)?.isPressed == true
-            || input.button(forKeyCode: .rightGUI)?.isPressed == true
-        let control = input.button(forKeyCode: .leftControl)?.isPressed == true
-            || input.button(forKeyCode: .rightControl)?.isPressed == true
-        return (option || command) && !control
+        let held = Self.liveModifierFlags
+        return !held.isDisjoint(with: [.alternate, .command]) && !held.contains(.control)
     }
 
     /// Send a Catalyst Delete word-editing chord (Option/Command ± Shift +

@@ -82,6 +82,20 @@ final class ControlOptionCommandTests: XCTestCase {
         XCTAssertTrue(state.contains(keysym: command))
     }
 
+    func testReleaseOnlySynchronizeNeverPressesALatchedModifier() {
+        var state = CommandModifierState()
+        _ = state.press(usage: 0xE1, keysym: KeyboardInputHandler.keysymShiftL)
+        // A snapshot still showing Command after its key-up (#747).
+        XCTAssertTrue(state.synchronize(
+            modifiers: [.shift, .command], optionKeysym: option, inferMissing: false).isEmpty)
+        XCTAssertFalse(state.contains(keysym: command))
+        XCTAssertEqual(state.synchronize(
+            modifiers: [.command], optionKeysym: option, inferMissing: false), [
+            event(false, KeyboardInputHandler.keysymShiftL),
+        ])
+        XCTAssertTrue(state.physical.isEmpty)
+    }
+
     @MainActor
     func testSessionDefaultsOnAndChoicesAreIndependent() {
         let first = VNCKeyboardCapture()
