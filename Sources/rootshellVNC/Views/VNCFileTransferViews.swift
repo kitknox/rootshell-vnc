@@ -95,15 +95,27 @@ struct VNCFileTransfersPanel: View {
     private var hint: String {
         switch (controller.canUpload, controller.canDownload) {
         case (true, true):
+            #if targetEnvironment(macCatalyst)
+            return String(
+                localized: "Drop files on the screen to copy them to the Mac. Drag files on the Mac out of the window to download them.",
+                bundle: .module)
+            #else
             return String(
                 localized: "Drop files on the screen to copy them to the Mac. Drag files on the Mac to the top of the screen to download them.",
                 bundle: .module)
+            #endif
         case (true, false):
             return String(localized: "Drop files on the screen to copy them to the Mac.", bundle: .module)
         case (false, true):
+            #if targetEnvironment(macCatalyst)
+            return String(
+                localized: "Drag files on the Mac out of the window to download them.",
+                bundle: .module)
+            #else
             return String(
                 localized: "Drag files on the Mac to the top of the screen to download them.",
                 bundle: .module)
+            #endif
         case (false, false):
             return String(localized: "This computer doesn't support file transfer.", bundle: .module)
         }

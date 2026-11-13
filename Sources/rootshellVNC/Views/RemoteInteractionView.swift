@@ -2567,6 +2567,32 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         return true
     }
 
+    /// A Mac file drag carried out of the window becomes a local drag of file
+    /// promises, so it can drop in Finder. Returns true once handed off.
+    private func handOffRemoteFileDrag(_ recognizer: UIGestureRecognizer) -> Bool {
+        guard pointerDragActive, let window, let fileTransfers,
+              fileTransfers.showsDragOutTarget,
+              !window.bounds.contains(recognizer.location(in: window)) else { return false }
+        let items = fileTransfers.remoteDraggedPaths.map { path in
+            CatalystFilePromiseDrag.Item(name: (path as NSString).lastPathComponent) {
+                [weak fileTransfers] url, completion in
+                guard let fileTransfers else {
+                    completion(CocoaError(.userCancelled))
+                    return
+                }
+                fileTransfers.download(path: path, to: url, completion: completion)
+            }
+        }
+        guard CatalystFilePromiseDrag.begin(items) else { return false }
+        fileTransfers.handOffRemoteDrag()
+        stopEdgeScrolling()
+        releasePointerDrag()
+        // AppKit's drag takes the mouse, so UIKit never ends this press.
+        recognizer.isEnabled = false
+        recognizer.isEnabled = true
+        return true
+    }
+
     private func handOffCatalystMouseButtons() {
         guard Self.catalystMouseButtonOwner === self,
               let next = Self.catalystMouseButtonNextOwner else { return }
@@ -2884,6 +2910,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         focusForHardwareKeyboardIfNeeded(recognizer)
         switch recognizer.state {
         case .began, .changed:
+            #if targetEnvironment(macCatalyst)
+            if handOffRemoteFileDrag(recognizer) { return }
+            #endif
             catchMomentumFlingIfActive()
             let location = recognizer.location(in: self)
             #if !targetEnvironment(macCatalyst)

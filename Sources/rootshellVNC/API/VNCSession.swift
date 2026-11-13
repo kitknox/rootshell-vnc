@@ -1265,6 +1265,8 @@ public final class VNCSession {
         remoteDisplayResizeTask = nil
         lastRequestedClientDisplaySize = nil
         invalidateInputQueue()
+        // Fails open transfers and Finder promises; local moves finish.
+        fileTransfers.transportDidEnd()
 
         // Close the transport
         if let transport = transportSession {

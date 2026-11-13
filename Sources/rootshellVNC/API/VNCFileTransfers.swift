@@ -62,6 +62,7 @@ public final class VNCFileTransferController {
     public private(set) var remoteDragInProgress = false
     /// Names of the files the Mac says are being dragged on its screen.
     public private(set) var remoteDraggedNames: [String] = []
+    @ObservationIgnored private(set) var remoteDraggedPaths: [String] = []
     /// The remote pointer is over ``dragOutTarget`` during that drag.
     public private(set) var remoteDragOverTarget = false
 
@@ -122,7 +123,7 @@ public final class VNCFileTransferController {
                 }
                 finishUpload(id, state: .cancelled)
             }
-        } else if let job = downloads[id] {
+        } else if let job = downloads[id], !job.moving {
             for session in job.openSessions {
                 send(AppleFileTransferProtocol.stopMessage(session: session))
             }
@@ -172,11 +173,14 @@ public final class VNCFileTransferController {
         activeUploadDrag = nil
         pendingDragOut = nil
         remoteDraggedNames = []
+        remoteDraggedPaths = []
         pressPoint = nil
         remoteDragInProgress = false
         remoteDragOverTarget = false
         let message = String(localized: "The connection closed.", bundle: .module)
         for transfer in transfers where transfer.isActive {
+            // A local move needs no connection; it finishes on its own.
+            if downloads[transfer.id]?.moving == true { continue }
             if let job = uploads[transfer.id] {
                 job.stagingTask?.cancel()
                 job.runTask?.cancel()
@@ -204,6 +208,7 @@ public final class VNCFileTransferController {
             remoteDragInProgress = false
             remoteDragOverTarget = false
             if !remoteDraggedNames.isEmpty { remoteDraggedNames = [] }
+            remoteDraggedPaths = []
             return
         }
         guard let press = pressPoint else {
@@ -239,6 +244,7 @@ public final class VNCFileTransferController {
         } else if pressPoint != nil {
             // Unasked, it announces a file drag that started on its screen.
             remoteDraggedNames = reply.paths.map { ($0 as NSString).lastPathComponent }
+            remoteDraggedPaths = reply.paths
         }
     }
 
@@ -496,6 +502,57 @@ public final class VNCFileTransferController {
 
     // MARK: - Download
 
+    /// A local drag took over the Mac's file drag: Escape cancels it on the
+    /// Mac before the caller releases the button.
+    func handOffRemoteDrag() {
+        pressPoint = nil
+        remoteDragInProgress = false
+        remoteDragOverTarget = false
+        remoteDraggedNames = []
+        remoteDraggedPaths = []
+        session?.sendKeyEvent(downFlag: true, key: Self.escapeKeysym)
+        session?.sendKeyEvent(downFlag: false, key: Self.escapeKeysym)
+    }
+
+    /// Downloads one item on the Mac to `destination`, for a file promise.
+    /// AppKit asks after the drop, so the connection may be gone by then.
+    func download(path: String, to destination: URL, completion: @escaping (Error?) -> Void) {
+        guard canDownload, session?.activeTransport != nil else {
+            completion(Self.promiseError(String(localized: "The connection closed.", bundle: .module)))
+            return
+        }
+        let id = startDownload(paths: [path], dragImage: nil)
+        downloads[id]?.promise = (destination, completion)
+    }
+
+    /// The job stays registered and active until the move ends, so neither
+    /// cancel nor Clear can delete its source mid-copy.
+    private func movePromisedDownload(_ job: DownloadJob, to destination: URL) {
+        guard let source = job.results.first else { return }
+        job.moving = true
+        Task {
+            let moved = await Task.detached {
+                Result { try FileManager.default.moveItem(at: source, to: destination) }
+            }.value
+            job.moving = false
+            switch moved {
+            case .success:
+                // Lets downloadWasSaved find and delete the emptied folder.
+                update(job.id) { $0.localURLs = job.results }
+                finishDownload(job.id, state: .completed)
+                downloadWasSaved(job.id)
+            case .failure(let error):
+                // The files are still in the panel to save another way.
+                update(job.id) { $0.localURLs = job.results }
+                finishDownload(job.id, state: .failed(error.localizedDescription))
+            }
+        }
+    }
+
+    private static func promiseError(_ message: String) -> Error {
+        CocoaError(.fileWriteUnknown, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
     private func requestDragOut() {
         let handle = makeHandle()
         pendingDragOut = .now
@@ -504,7 +561,8 @@ public final class VNCFileTransferController {
     }
 
     /// Downloads items on the Mac by path.
-    func startDownload(paths: [String], dragImage: Data?) {
+    @discardableResult
+    func startDownload(paths: [String], dragImage: Data?) -> UUID {
         let id = UUID()
         let folder = Self.temporaryFolder("Screen Sharing Downloads")
         var transfer = VNCFileTransfer(
@@ -529,6 +587,7 @@ public final class VNCFileTransferController {
             writer.addSession(session)
             send(AppleFileTransferProtocol.startDownloadMessage(session: session, path: path))
         }
+        return id
     }
 
     private func handleWriterEvent(_ event: DownloadWriter.Event, transfer id: UUID) {
@@ -549,6 +608,8 @@ public final class VNCFileTransferController {
                 job.writer.discard()
                 finishDownload(id, state: .failed(job.failure ?? String(
                     localized: "The Mac didn't send any files.", bundle: .module)))
+            } else if let promise = job.promise, job.failure == nil {
+                movePromisedDownload(job, to: promise.destination)
             } else {
                 // Keep what arrived; a partial failure still reports why.
                 update(id) { $0.localURLs = job.results }
@@ -563,6 +624,11 @@ public final class VNCFileTransferController {
         update(id) {
             $0.state = state
             if state == .completed { $0.completedBytes = max($0.completedBytes, $0.totalBytes) }
+        }
+        switch state {
+        case .completed: job.promise?.completion(nil)
+        case .failed(let message): job.promise?.completion(Self.promiseError(message))
+        default: job.promise?.completion(CocoaError(.userCancelled))
         }
     }
 
@@ -640,15 +706,20 @@ public final class VNCFileTransferController {
 
     /// The first file-backed type; text snippets without a name are skipped.
     nonisolated static func fileType(for provider: NSItemProvider) -> String? {
-        provider.registeredTypeIdentifiers.first { identifier in
+        // Finder names its items only at drop time; its node type marks a file.
+        let isFile = provider.suggestedName != nil
+            || provider.registeredTypeIdentifiers.contains(finderNodeType)
+        return provider.registeredTypeIdentifiers.first { identifier in
             guard let type = UTType(identifier) else { return false }
             if type.conforms(to: .directory) { return true }
             guard type.conforms(to: .data) || type.conforms(to: .package) else { return false }
             if type.conforms(to: .url) { return false }
-            if type.conforms(to: .text), provider.suggestedName == nil { return false }
+            if type.conforms(to: .text), !isFile { return false }
             return true
         }
     }
+
+    nonisolated static let finderNodeType = "com.apple.finder.node"
 
     struct StagingResult {
         var staged: [URL] = []
@@ -749,6 +820,10 @@ private final class DownloadJob {
     var pendingSessions: Set<UInt32> = []
     var results: [URL] = []
     var failure: String?
+    /// Set for a file promise: where the result goes and who waits for it.
+    var promise: (destination: URL, completion: (Error?) -> Void)?
+    /// Moving to the promise destination; cancel and disconnect wait it out.
+    var moving = false
 
     init(id: UUID, writer: DownloadWriter) {
         self.id = id
