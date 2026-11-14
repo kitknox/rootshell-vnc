@@ -151,6 +151,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     // The remote text is not readable, so nothing here may rewrite it.
     // Stored, not computed, so UIKit reads them during keyboard setup.
     var autocorrectionType: UITextAutocorrectionType = .no
+    var autocapitalizationType: UITextAutocapitalizationType = .none
     var spellCheckingType: UITextSpellCheckingType = .no
     var smartQuotesType: UITextSmartQuotesType = .no
     var smartDashesType: UITextSmartDashesType = .no
