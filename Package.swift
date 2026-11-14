@@ -8,6 +8,7 @@ let package = Package(
     platforms: [
         .iOS(.v18),
         .macOS(.v15),
+        .visionOS("26.0"),
     ],
     products: [
         .library(name: "rootshellVNC", targets: ["rootshellVNC"]),
