@@ -19,9 +19,18 @@ public enum VNCClipboardTransferDirection: Sendable {
     case remoteToDevice
 }
 
+/// The latest remote clipboard written to the device and the pane that
+/// wrote it, shared by every pane on the same pasteboard.
+@MainActor
+final class VNCClipboardRemoteWrites {
+    static let system = VNCClipboardRemoteWrites()
+    var latest: (changeCount: Int, writer: ObjectIdentifier)?
+}
+
 @MainActor
 protocol VNCClipboardProviding: AnyObject {
     var changeCount: Int { get }
+    var remoteWrites: VNCClipboardRemoteWrites { get }
 
     func hasTransferableContent(for support: VNCClipboardContentSupport) -> Bool
     func readContent(for support: VNCClipboardContentSupport) -> VNCClipboardContent?
@@ -60,6 +69,7 @@ private final class VNCSystemClipboard: VNCClipboardProviding {
     private let pasteboard = UIPasteboard.general
 
     var changeCount: Int { pasteboard.changeCount }
+    var remoteWrites: VNCClipboardRemoteWrites { .system }
 
     // Type and has* queries do not trigger the paste permission prompt.
     func hasTransferableContent(for support: VNCClipboardContentSupport) -> Bool {
@@ -113,6 +123,7 @@ private final class VNCSystemClipboard: VNCClipboardProviding {
     private let pasteboard = NSPasteboard.general
 
     var changeCount: Int { pasteboard.changeCount }
+    var remoteWrites: VNCClipboardRemoteWrites { .system }
 
     func hasTransferableContent(for support: VNCClipboardContentSupport) -> Bool {
         if pasteboard.canReadObject(forClasses: [NSString.self, NSURL.self], options: nil) {
@@ -301,6 +312,11 @@ public final class VNCClipboardSynchronizer {
     private var applicationIsActive = true
     @ObservationIgnored
     private var needsForegroundReconciliation = false
+    /// The device change count when the app came forward with this pane's
+    /// reconciliation still deferred. A later copy belongs to whichever
+    /// window was in front, not to the time away.
+    @ObservationIgnored
+    private var deferredForegroundChangeCount: Int?
     @ObservationIgnored
     private var invalidated = false
 
@@ -574,11 +590,15 @@ public final class VNCClipboardSynchronizer {
         backgroundLocalChangeCount = clipboard.changeCount
         backgroundRemoteGeneration = remoteGeneration
         needsForegroundReconciliation = true
+        deferredForegroundChangeCount = nil
     }
 
     func applicationDidBecomeActive() {
         applicationIsActive = true
         reconcileAfterForegroundIfPossible()
+        if needsForegroundReconciliation {
+            deferredForegroundChangeCount = clipboard.changeCount
+        }
     }
 
     private var isEligible: Bool {
@@ -662,6 +682,7 @@ public final class VNCClipboardSynchronizer {
         isApplyingRemoteContent = true
         clipboard.write(content)
         observedLocalChangeCount = clipboard.changeCount
+        clipboard.remoteWrites.latest = (clipboard.changeCount, ObjectIdentifier(self))
         syncedLocalContent = (original, clipboard.changeCount)
         isApplyingRemoteContent = false
         if let text = content.plainText {
@@ -686,6 +707,20 @@ public final class VNCClipboardSynchronizer {
         needsForegroundReconciliation = false
 
         let localChanged = clipboard.changeCount != backgroundLocalChangeCount
+        // Another window took the foreground first, and the clipboard moved
+        // since or gained what that window's server put there while away:
+        // a window switch, never bridged.
+        let heldByAnotherPane = clipboard.remoteWrites.latest.map {
+            $0.changeCount == clipboard.changeCount && $0.writer != ObjectIdentifier(self)
+        } ?? false
+        let movedSinceForeground = deferredForegroundChangeCount.map {
+            $0 != clipboard.changeCount
+        } ?? false
+        if movedSinceForeground || (localChanged && heldByAnotherPane) {
+            establishBaseline()
+            return
+        }
+
         let remoteChanged = remoteGeneration != backgroundRemoteGeneration
         if localChanged {
             if canSend() { flushLocalClipboard() }
@@ -753,46 +788,37 @@ public final class VNCClipboardSynchronizer {
     }
 
     private func installLifecycleObservers() {
-        #if canImport(UIKit)
+        #if targetEnvironment(macCatalyst)
+        // Switching Mac apps leaves the UIKit application active; only
+        // AppKit reports it.
         applicationIsActive = UIApplication.shared.applicationState == .active
-        lifecycleObservers.append(notificationCenter.addObserver(
-            forName: UIApplication.willResignActiveNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.applicationWillResignActive()
-            }
-        })
-        lifecycleObservers.append(notificationCenter.addObserver(
-            forName: UIApplication.didBecomeActiveNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.applicationDidBecomeActive()
-            }
-        })
+        let willResignActive = Notification.Name("NSApplicationWillResignActiveNotification")
+        let didBecomeActive = Notification.Name("NSApplicationDidBecomeActiveNotification")
+        #elseif canImport(UIKit)
+        applicationIsActive = UIApplication.shared.applicationState == .active
+        let willResignActive = UIApplication.willResignActiveNotification
+        let didBecomeActive = UIApplication.didBecomeActiveNotification
         #elseif canImport(AppKit)
         applicationIsActive = NSApplication.shared.isActive
-        lifecycleObservers.append(notificationCenter.addObserver(
-            forName: NSApplication.willResignActiveNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.applicationWillResignActive()
-            }
-        })
-        lifecycleObservers.append(notificationCenter.addObserver(
-            forName: NSApplication.didBecomeActiveNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.applicationDidBecomeActive()
-            }
-        })
+        let willResignActive = NSApplication.willResignActiveNotification
+        let didBecomeActive = NSApplication.didBecomeActiveNotification
         #endif
+        observeLifecycle(willResignActive) { $0.applicationWillResignActive() }
+        observeLifecycle(didBecomeActive) { $0.applicationDidBecomeActive() }
+    }
+
+    private func observeLifecycle(
+        _ name: Notification.Name,
+        _ handler: @escaping @MainActor (VNCClipboardSynchronizer) -> Void
+    ) {
+        lifecycleObservers.append(notificationCenter.addObserver(
+            forName: name,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                if let self { handler(self) }
+            }
+        })
     }
 }

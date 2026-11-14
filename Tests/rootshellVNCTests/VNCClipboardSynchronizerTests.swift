@@ -7,6 +7,7 @@ import XCTest
 final class VNCClipboardSynchronizerTests: XCTestCase {
     private final class FakeClipboard: VNCClipboardProviding {
         var changeCount = 0
+        let remoteWrites = VNCClipboardRemoteWrites()
         var content: VNCClipboardContent?
 
         var text: String? { content?.plainText }
@@ -307,6 +308,102 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         synchronizer.applicationDidBecomeActive()
 
         XCTAssertEqual(sent, ["latest background value"])
+    }
+
+    /// Mac app switch: the window can lose key before the app resigns, and
+    /// polling keeps running while the copy happens elsewhere.
+    func testCopyInAnotherMacAppIsSentOnReturn() {
+        let clipboard = FakeClipboard()
+        var sent: [String] = []
+        let synchronizer = makeSynchronizer(clipboard: clipboard) { sent.append($0) }
+        synchronizer.sharedClipboardEnabled = true
+
+        synchronizer.setHostWindowActive(false)
+        synchronizer.applicationWillResignActive()
+        clipboard.copyOnDevice("copied elsewhere")
+        synchronizer.localClipboardDidChange()
+        synchronizer.setHostWindowActive(true)
+        synchronizer.applicationDidBecomeActive()
+
+        XCTAssertEqual(sent, ["copied elsewhere"])
+    }
+
+    /// Two windows share with different servers. A copy made in the window
+    /// that came forward must not reach the other window's server later.
+    func testCopyAfterReturningToAnotherWindowIsNotBridged() {
+        let clipboard = FakeClipboard()
+        var sentA: [String] = []
+        var sentB: [String] = []
+        let windowA = makeSynchronizer(clipboard: clipboard) { sentA.append($0) }
+        let windowB = makeSynchronizer(clipboard: clipboard) { sentB.append($0) }
+        windowA.sharedClipboardEnabled = true
+        windowB.sharedClipboardEnabled = true
+        windowB.setHostWindowActive(false)
+
+        for window in [windowA, windowB] { window.applicationWillResignActive() }
+        for window in [windowA, windowB] { window.applicationDidBecomeActive() }
+
+        clipboard.copyOnDevice("copied in window A")
+        windowA.localClipboardDidChange()
+        windowB.localClipboardDidChange()
+        windowA.setHostWindowActive(false)
+        windowB.setHostWindowActive(true)
+
+        XCTAssertEqual(sentA, ["copied in window A"])
+        XCTAssertTrue(sentB.isEmpty)
+
+        clipboard.copyOnDevice("copied in window B")
+        windowB.localClipboardDidChange()
+        XCTAssertEqual(sentB, ["copied in window B"])
+    }
+
+    /// The front window applies its server's clipboard on return before the
+    /// other window hears the app came forward.
+    func testRemoteClipboardAppliedByAnotherWindowIsNotBridged() {
+        let clipboard = FakeClipboard()
+        var sentB: [String] = []
+        let windowA = makeSynchronizer(clipboard: clipboard) { _ in }
+        let windowB = makeSynchronizer(clipboard: clipboard) { sentB.append($0) }
+        windowA.sharedClipboardEnabled = true
+        windowB.sharedClipboardEnabled = true
+        windowB.setHostWindowActive(false)
+
+        for window in [windowA, windowB] { window.applicationWillResignActive() }
+        windowA.receiveRemoteClipboardText("from the first Mac")
+        windowA.applicationDidBecomeActive()
+        XCTAssertEqual(clipboard.text, "from the first Mac")
+        windowB.applicationDidBecomeActive()
+
+        windowA.setHostWindowActive(false)
+        windowB.setHostWindowActive(true)
+        XCTAssertTrue(sentB.isEmpty)
+
+        clipboard.copyOnDevice("copied in window B")
+        windowB.localClipboardDidChange()
+        XCTAssertEqual(sentB, ["copied in window B"])
+    }
+
+    /// A clipboard another window's server wrote before the app was left
+    /// does not block this window's own remote change on return.
+    func testEarlierWriteByAnotherWindowDoesNotBlockRemoteOnReturn() {
+        let clipboard = FakeClipboard()
+        var sentB: [String] = []
+        let windowA = makeSynchronizer(clipboard: clipboard) { _ in }
+        let windowB = makeSynchronizer(clipboard: clipboard) { sentB.append($0) }
+        windowA.sharedClipboardEnabled = true
+        windowB.sharedClipboardEnabled = true
+        windowB.setHostWindowActive(false)
+
+        windowA.receiveRemoteClipboardText("from the first Mac")
+        windowA.setHostWindowActive(false)
+        windowB.setHostWindowActive(true)
+
+        for window in [windowA, windowB] { window.applicationWillResignActive() }
+        windowB.receiveRemoteClipboardText("from the second Mac")
+        for window in [windowA, windowB] { window.applicationDidBecomeActive() }
+
+        XCTAssertEqual(clipboard.text, "from the second Mac")
+        XCTAssertTrue(sentB.isEmpty)
     }
 
     func testMonitoringDoesNotRetainSynchronizer() async {
