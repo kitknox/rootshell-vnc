@@ -327,9 +327,11 @@ public struct RemoteDesktopView: View {
                     titleVisibility: .visible
                 ) {
                     Button(String(localized: "Type Password and Log In", bundle: .module)) {
+                        keyboardCapture.noteExternalInput()
                         session.sendLoginPassword()
                     }
                     Button(String(localized: "Type Password Only", bundle: .module)) {
+                        keyboardCapture.noteExternalInput()
                         session.sendLoginPassword(pressingReturn: false)
                     }
                     Button(String(localized: "Cancel", bundle: .module), role: .cancel) {}
@@ -791,6 +793,7 @@ public struct RemoteDesktopView: View {
             Section(String(localized: "Mac Specific", bundle: .module)) {
                 ForEach(RemoteCommand.macSpecific) { command in
                     Button(command.title) {
+                        keyboardCapture.noteExternalInput()
                         keyboardHandler.handleRemoteCommand(command)
                     }
                 }
@@ -803,6 +806,7 @@ public struct RemoteDesktopView: View {
 
                 ForEach(RemoteCommand.otherCommands) { command in
                     Button(command.title) {
+                        keyboardCapture.noteExternalInput()
                         keyboardHandler.handleRemoteCommand(command)
                     }
                 }
@@ -817,6 +821,7 @@ public struct RemoteDesktopView: View {
     private func remoteShortcutButtons(_ shortcuts: [RemoteMenuShortcut]) -> some View {
         ForEach(shortcuts) { shortcut in
             Button(shortcut.menuTitle) {
+                keyboardCapture.noteExternalInput()
                 keyboardHandler.handleShortcutTap(shortcut.character, modifiers: shortcut.modifiers)
             }
         }

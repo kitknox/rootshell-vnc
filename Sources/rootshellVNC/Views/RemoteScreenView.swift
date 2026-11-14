@@ -355,6 +355,7 @@ public struct RemoteScreenView: View {
             Section(String(localized: "Mac Specific", bundle: .module)) {
                 ForEach(RemoteCommand.macSpecific) { command in
                     Button(command.title) {
+                        keyboardCapture.noteExternalInput()
                         keyboardHandler.handleRemoteCommand(command)
                     }
                 }
@@ -367,6 +368,7 @@ public struct RemoteScreenView: View {
 
                 ForEach(RemoteCommand.otherCommands) { command in
                     Button(command.title) {
+                        keyboardCapture.noteExternalInput()
                         keyboardHandler.handleRemoteCommand(command)
                     }
                 }
@@ -379,6 +381,7 @@ public struct RemoteScreenView: View {
     private func remoteShortcutButtons(_ shortcuts: [RemoteMenuShortcut]) -> some View {
         ForEach(shortcuts) { shortcut in
             Button(shortcut.menuTitle) {
+                keyboardCapture.noteExternalInput()
                 keyboardHandler.handleShortcutTap(shortcut.character, modifiers: shortcut.modifiers)
             }
         }

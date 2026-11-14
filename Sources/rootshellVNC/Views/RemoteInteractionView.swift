@@ -115,6 +115,12 @@ struct RemoteInteractionView: UIViewRepresentable {
     }
 }
 
+/// Lets the handlers built before `super.init` report back to the view.
+@MainActor
+private final class RemoteInputObserver {
+    var onInput: (() -> Void)?
+}
+
 @MainActor
 final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     UIPointerInteractionDelegate {
@@ -131,6 +137,28 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private let touchHandler: TouchInputHandler
     private let keyboardHandler: KeyboardInputHandler
     private let keyboardCapture: VNCKeyboardCapture
+
+    /// What the software keyboard thinks it is editing; see
+    /// `RemoteTextInputDocument`.
+    var textDocument = RemoteTextInputDocument()
+    /// True while this view types text, so its own keys do not count as
+    /// input that moved the remote caret.
+    private var isTypingText = false
+    #if !targetEnvironment(macCatalyst)
+    weak var inputDelegate: UITextInputDelegate?
+    var markedTextStyle: [NSAttributedString.Key: Any]?
+    lazy var tokenizer: UITextInputTokenizer = UITextInputStringTokenizer(textInput: self)
+    // The remote text is not readable, so nothing here may rewrite it.
+    // Stored, not computed, so UIKit reads them during keyboard setup.
+    var autocorrectionType: UITextAutocorrectionType = .no
+    var spellCheckingType: UITextSpellCheckingType = .no
+    var smartQuotesType: UITextSmartQuotesType = .no
+    var smartDashesType: UITextSmartDashesType = .no
+    var smartInsertDeleteType: UITextSmartInsertDeleteType = .no
+    var inlinePredictionType: UITextInlinePredictionType = .no
+    var mathExpressionCompletionType: UITextMathExpressionCompletionType = .no
+    var writingToolsBehavior: UIWritingToolsBehavior = .none
+    #endif
     private var requestPasswordSend: () -> Void
     private var requestDictation: () -> Void
     private var toggleFullScreen: (() -> Void)?
@@ -754,9 +782,11 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         toggleFullScreen: (() -> Void)?,
         disconnect: @escaping () -> Void
     ) {
-        self.touchHandler = touchHandler
+        let remoteInput = RemoteInputObserver()
+        self.touchHandler = touchHandler.notifyingButtonDown { remoteInput.onInput?() }
         self.keyboardHandler = keyboardHandler.notifyingKeyDown { [weak keyboardCapture] in
             keyboardCapture?.noteKeyboardInput()
+            remoteInput.onInput?()
         }
         self.keyboardCapture = keyboardCapture
         self.requestPasswordSend = requestPasswordSend
@@ -765,6 +795,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         self.disconnect = disconnect
         self.lastSeenInputViewsGeneration = keyboardCapture.inputViewsGeneration
         super.init(frame: .zero)
+        let discardTextDocument: @MainActor () -> Void = { [weak self] in
+            guard let self, !self.isTypingText else { return }
+            self.discardTextDocument()
+        }
+        remoteInput.onInput = discardTextDocument
+        keyboardCapture.onExternalInput = discardTextDocument
         hardwareKeyboard.controlOptionAsCommand = keyboardCapture.controlOptionAsCommand
         backgroundColor = .clear
         isMultipleTouchEnabled = true
@@ -806,6 +842,11 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             self,
             selector: #selector(windowDidResignKey),
             name: UIWindow.didResignKeyNotification,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(clearInputAssistants),
+            name: UITextInputMode.currentInputModeDidChangeNotification,
             object: nil)
         NotificationCenter.default.addObserver(
             self,
@@ -852,12 +893,39 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
 
     override func becomeFirstResponder() -> Bool {
         let became = super.becomeFirstResponder()
-        if became { configureHardwareKeyboardMonitor(for: GCKeyboard.coalesced) }
+        if became {
+            configureHardwareKeyboardMonitor(for: GCKeyboard.coalesced)
+            clearInputAssistants()
+        }
         return became
+    }
+
+    // A text input with a hardware keyboard attached gets the system
+    // shortcut bar (undo, redo, paste). Emptying its groups hides it.
+    override var inputAssistantItem: UITextInputAssistantItem {
+        let item = super.inputAssistantItem
+        #if !os(visionOS)
+        item.leadingBarButtonGroups = []
+        item.trailingBarButtonGroups = []
+        #endif
+        return item
+    }
+
+    @objc private func clearInputAssistants() {
+        #if !os(visionOS)
+        var pending: [UIView] = [self]
+        while let view = pending.popLast() {
+            let item = view === self ? super.inputAssistantItem : view.inputAssistantItem
+            item.leadingBarButtonGroups = []
+            item.trailingBarButtonGroups = []
+            pending.append(contentsOf: view.subviews)
+        }
+        #endif
     }
 
     override func resignFirstResponder() -> Bool {
         releaseAllPressedKeys()
+        discardTextDocument()
         return super.resignFirstResponder()
     }
 
@@ -1089,8 +1157,57 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
 
     func insertText(_ text: String) {
         let modifiers = keyboardCapture.supplementalModifiers
+        if modifiers.isEmpty {
+            if textDocument.committedLength > 4096 { discardTextDocument() }
+            textDocument.insert(text)
+        } else {
+            // A modifier chord is a shortcut, not text the keyboard can edit.
+            discardTextDocument()
+        }
+        typeText(text, modifiers: modifiers)
+    }
+
+    func deleteBackward() {
+        let modifiers = keyboardCapture.supplementalModifiers
+        if modifiers.isEmpty {
+            // Deleting inside a composition never reaches the remote desktop.
+            if textDocument.deleteBackward() { return }
+        } else {
+            discardTextDocument()
+        }
+        typeBackspace(modifiers: modifiers)
+    }
+
+    /// Sends text an input method committed from its composition.
+    func commitComposedText(_ text: String) {
+        let modifiers = keyboardCapture.supplementalModifiers
+        if !modifiers.isEmpty { discardTextDocument() }
+        typeText(text, modifiers: modifiers)
+    }
+
+    /// Retypes the end of the remote text after a keyboard replacement.
+    func applyTextEdit(_ edit: RemoteTextInputDocument.Edit) {
+        for _ in 0..<edit.backspaces { typeBackspace(modifiers: []) }
+        typeText(edit.text, modifiers: [])
+    }
+
+    /// Forgets the keyboard's document once the remote caret may have moved.
+    func discardTextDocument() {
+        guard !textDocument.isEmpty else { return }
+        #if !targetEnvironment(macCatalyst)
+        inputDelegate?.textWillChange(self)
+        #endif
+        textDocument.reset()
+        #if !targetEnvironment(macCatalyst)
+        inputDelegate?.textDidChange(self)
+        #endif
+    }
+
+    private func typeText(_ text: String, modifiers: VNCKeyboardModifiers) {
+        isTypingText = true
+        defer { isTypingText = false }
         var dispatched = false
-        for character in text {
+        for character in RemoteTextInputDocument.keyTaps(for: text) {
             dispatched = keyboardHandler.handleKeyTap(
                 character,
                 supplementalModifiers: modifiers) || dispatched
@@ -1098,10 +1215,13 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         if dispatched, !modifiers.isEmpty {
             keyboardCapture.onSupplementalModifiersConsumed?()
         }
+        // Return, Tab and the like end the field the keyboard was editing.
+        if RemoteTextInputDocument.movesRemoteCaret(text) { discardTextDocument() }
     }
 
-    func deleteBackward() {
-        let modifiers = keyboardCapture.supplementalModifiers
+    private func typeBackspace(modifiers: VNCKeyboardModifiers) {
+        isTypingText = true
+        defer { isTypingText = false }
         let dispatched = keyboardHandler.handleKeysymTap(
             KeyboardInputHandler.keysymBackspace,
             supplementalModifiers: modifiers)
@@ -1270,6 +1390,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     @objc private func handlePasswordCommand(_ command: UIKeyCommand) {
+        discardTextDocument()
         requestPasswordSend()
     }
 

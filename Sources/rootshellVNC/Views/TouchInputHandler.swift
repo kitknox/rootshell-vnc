@@ -47,7 +47,7 @@ public struct TouchInputHandler {
 
     // MARK: - Properties
 
-    private let sendPointerEvent: PointerEventHandler
+    private var sendPointerEvent: PointerEventHandler
     private let sendScrollEvent: ScrollEventHandler?
     private let sendGestureEvent: GestureEventHandler?
 
@@ -71,6 +71,17 @@ public struct TouchInputHandler {
         self.sendPointerEvent = sendPointerEvent
         self.sendScrollEvent = sendScrollEvent
         self.sendGestureEvent = sendGestureEvent
+    }
+
+    /// A copy that calls `onButtonDown` before every event with a button held.
+    func notifyingButtonDown(_ onButtonDown: @escaping @MainActor () -> Void) -> TouchInputHandler {
+        var copy = self
+        copy.sendPointerEvent = { [sendPointerEvent] buttonMask, x, y in
+            let buttons = Self.leftButton | Self.middleButton | Self.rightButton
+            if buttonMask & buttons != 0 { onButtonDown() }
+            sendPointerEvent(buttonMask, x, y)
+        }
+        return copy
     }
 
     // MARK: - Gesture Handlers

@@ -194,6 +194,17 @@ public final class VNCKeyboardCapture {
         keyboardInputGeneration &+= 1
     }
 
+    /// Tells the remote responder that something other than its own typing
+    /// reached the remote desktop. Hosts call this when they send keys,
+    /// paste, or type on the user's behalf, so the software keyboard drops
+    /// any composition and the text context it kept for that caret.
+    public func noteExternalInput() {
+        onExternalInput?()
+    }
+
+    @ObservationIgnored
+    var onExternalInput: (@MainActor () -> Void)?
+
     /// Whether the software keyboard should be shown for the remote desktop.
     ///
     /// Two-way synced with `RemoteDesktopView`'s internal keyboard state:
