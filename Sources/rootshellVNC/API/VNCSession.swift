@@ -4541,11 +4541,12 @@ public final class VNCSession {
             } else {
                 await transport.setAppleMediaSenderClockSink(nil)
             }
-            await transport.setAppleMediaGenerationSink { generation, numberOfTiles in
+            await transport.setAppleMediaGenerationSink {
+                [weak self, weak transport, sinkManager] generation, numberOfTiles in
                 playbackSynchronizer?.reset()
                 videoPacketCoalescer.discardPending()
                 secondaryVideoPacketCoalescer?.discardPending()
-                queue.async {
+                queue.async { [weak self, weak transport, sinkManager] in
                     sinkManager.prepareForStreamReconfiguration(
                         mediaGeneration: generation,
                         numberOfTiles: numberOfTiles)

@@ -1148,7 +1148,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         let inputViewsChanged = inputViewsGeneration != lastSeenInputViewsGeneration
         lastSeenInputViewsGeneration = inputViewsGeneration
         if keyboardCaptured {
-            if !isFirstResponder { becomeFirstResponder() }
+            if !isFirstResponder { _ = becomeFirstResponder() }
             if keyboardModeChanged || (inputViewsChanged && isFirstResponder) {
                 reloadInputViews()
             }
@@ -1372,7 +1372,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             releaseAllPressedKeys()
             reloadInputViews()
         } else {
-            becomeFirstResponder()
+            _ = becomeFirstResponder()
         }
     }
 
@@ -4559,7 +4559,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         }
         guard !isFirstResponder else { return }
         softwareKeyboardRequested = false
-        becomeFirstResponder()
+        _ = becomeFirstResponder()
     }
 
     private func dismissKeyboard() {
