@@ -96,7 +96,13 @@ public final class VNCFileTransferController {
     static let dragOutReplyWindow: Duration = .seconds(10)
     static let escapeKeysym: UInt32 = 0xff1b
 
-    init() {}
+    @ObservationIgnored private let downloadStore: VNCDownloadStore
+    @ObservationIgnored private var discardingFolders: Set<String> = []
+
+    init(downloadStore: VNCDownloadStore = .shared) {
+        self.downloadStore = downloadStore
+        downloadStore.register(self)
+    }
 
     public var hasActiveTransfers: Bool { transfers.contains(where: \.isActive) }
 
@@ -127,7 +133,7 @@ public final class VNCFileTransferController {
             for session in job.openSessions {
                 send(AppleFileTransferProtocol.stopMessage(session: session))
             }
-            job.writer.discard()
+            discard(job)
             finishDownload(id, state: .cancelled)
         }
     }
@@ -141,6 +147,7 @@ public final class VNCFileTransferController {
             for url in transfer.localURLs {
                 try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
             }
+            downloadStore.contentsDidChange()
         }
     }
 
@@ -157,6 +164,43 @@ public final class VNCFileTransferController {
         // Each download has its own folder; only leftovers remain after a move.
         if let folder = transfer.localURLs.first?.deletingLastPathComponent() {
             try? FileManager.default.removeItem(at: folder)
+        }
+        downloadStore.contentsDidChange()
+    }
+
+    // MARK: - Download store
+
+    /// Names of the folders that downloads in progress are writing to, or
+    /// that a cancelled download is still deleting.
+    var activeDownloadFolders: Set<String> {
+        discardingFolders.union(downloads.values.map { $0.folder.lastPathComponent })
+    }
+
+    /// The folder stays in use until the writer has deleted it, so the store
+    /// never lists files that are about to go.
+    private func discard(_ job: DownloadJob) {
+        let name = job.folder.lastPathComponent
+        let store = downloadStore
+        discardingFolders.insert(name)
+        job.writer.discard { [weak self] in
+            Task { @MainActor in
+                self?.discardingFolders.remove(name)
+                store.contentsDidChange()
+            }
+        }
+    }
+
+    /// Drops finished downloads whose files were deleted outside this session.
+    func pruneMissingDownloads() {
+        for transfer in transfers
+        where transfer.direction == .download && !transfer.isActive && !transfer.localURLs.isEmpty {
+            var info = stat()
+            let remaining = transfer.localURLs.filter { lstat($0.path, &info) == 0 }
+            if remaining.isEmpty {
+                transfers.removeAll { $0.id == transfer.id }
+            } else if remaining.count != transfer.localURLs.count {
+                update(transfer.id) { $0.localURLs = remaining }
+            }
         }
     }
 
@@ -187,7 +231,7 @@ public final class VNCFileTransferController {
                 job.timeout?.cancel()
                 finishUpload(transfer.id, state: .failed(message))
             } else if let job = downloads[transfer.id] {
-                job.writer.discard()
+                discard(job)
                 finishDownload(transfer.id, state: .failed(message))
             } else {
                 update(transfer.id) { $0.state = .failed(message) }
@@ -564,7 +608,7 @@ public final class VNCFileTransferController {
     @discardableResult
     func startDownload(paths: [String], dragImage: Data?) -> UUID {
         let id = UUID()
-        let folder = Self.temporaryFolder("Screen Sharing Downloads")
+        let folder = downloadStore.makeFolder()
         var transfer = VNCFileTransfer(
             id: id,
             direction: .download,
@@ -577,7 +621,7 @@ public final class VNCFileTransferController {
         let writer = DownloadWriter(folder: folder) { [weak self] event in
             self?.handleWriterEvent(event, transfer: id)
         }
-        let job = DownloadJob(id: id, writer: writer)
+        let job = DownloadJob(id: id, folder: folder, writer: writer)
         downloads[id] = job
         for path in paths {
             let session = makeSessionID()
@@ -605,7 +649,7 @@ public final class VNCFileTransferController {
             if let error, job.failure == nil { job.failure = error }
             guard job.pendingSessions.isEmpty else { return }
             if job.results.isEmpty {
-                job.writer.discard()
+                discard(job)
                 finishDownload(id, state: .failed(job.failure ?? String(
                     localized: "The Mac didn't send any files.", bundle: .module)))
             } else if let promise = job.promise, job.failure == nil {
@@ -630,6 +674,7 @@ public final class VNCFileTransferController {
         case .failed(let message): job.promise?.completion(Self.promiseError(message))
         default: job.promise?.completion(CocoaError(.userCancelled))
         }
+        downloadStore.contentsDidChange()
     }
 
     // MARK: - Helpers
@@ -813,6 +858,7 @@ private final class UploadJob {
 @MainActor
 private final class DownloadJob {
     let id: UUID
+    let folder: URL
     let writer: DownloadWriter
     /// Sessions the Mac may still send to (cancel stops these).
     var openSessions: Set<UInt32> = []
@@ -825,8 +871,9 @@ private final class DownloadJob {
     /// Moving to the promise destination; cancel and disconnect wait it out.
     var moving = false
 
-    init(id: UUID, writer: DownloadWriter) {
+    init(id: UUID, folder: URL, writer: DownloadWriter) {
         self.id = id
+        self.folder = folder
         self.writer = writer
     }
 }
@@ -1037,12 +1084,13 @@ final class DownloadWriter: @unchecked Sendable {
     }
 
     /// Stops writing and deletes everything received.
-    func discard() {
+    func discard(completion: @escaping @Sendable () -> Void = {}) {
         queue.async {
             self.discarded = true
             for stream in self.streams.values { try? stream.file?.close() }
             self.streams.removeAll()
             try? FileManager.default.removeItem(at: self.folder)
+            completion()
         }
     }
 
