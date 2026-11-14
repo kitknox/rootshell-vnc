@@ -428,7 +428,9 @@ public struct RemoteDesktopView: View {
         }
         #if canImport(UIKit)
         .background {
-            DockedKeyboardInsetReader(metrics: $keyboardViewportMetrics)
+            DockedKeyboardInsetReader(
+                metrics: $keyboardViewportMetrics,
+                onWindowSceneChange: { [session] in session.setHostScene($0) })
         }
         // UIKit's layout guide distinguishes a bottom-docked keyboard from
         // floating and split keyboards; SwiftUI's safe area does not.
@@ -1215,12 +1217,14 @@ private struct VNCClipboardMenu: View {
 /// UIKit collapses this guide for floating, split, and detached keyboards.
 struct DockedKeyboardInsetReader: UIViewRepresentable {
     @Binding var metrics: DockedKeyboardViewportMetrics
+    var onWindowSceneChange: ((UIWindowScene?) -> Void)?
 
     func makeUIView(context: Context) -> DockedKeyboardInsetView {
         let view = DockedKeyboardInsetView()
         view.onMetricsChange = { newMetrics in
             context.coordinator.setMetrics(newMetrics)
         }
+        view.onWindowSceneChange = onWindowSceneChange
         return view
     }
 
@@ -1229,6 +1233,7 @@ struct DockedKeyboardInsetReader: UIViewRepresentable {
         context: Context
     ) {
         context.coordinator.parent = self
+        uiView.onWindowSceneChange = onWindowSceneChange
         uiView.setNeedsLayout()
     }
 
@@ -1254,6 +1259,9 @@ struct DockedKeyboardInsetReader: UIViewRepresentable {
 @MainActor
 final class DockedKeyboardInsetView: UIView {
     var onMetricsChange: ((DockedKeyboardViewportMetrics) -> Void)?
+    var onWindowSceneChange: ((UIWindowScene?) -> Void)? {
+        didSet { onWindowSceneChange?(window?.windowScene) }
+    }
     private var lastReportedMetrics: DockedKeyboardViewportMetrics?
     private let keyboardTopProbe = UIView(frame: .zero)
     private var keyboardTransitionInProgress = false
@@ -1308,6 +1316,11 @@ final class DockedKeyboardInsetView: UIView {
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        onWindowSceneChange?(window?.windowScene)
     }
 
     override func layoutSubviews() {

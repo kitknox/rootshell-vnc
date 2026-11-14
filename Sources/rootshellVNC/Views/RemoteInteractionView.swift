@@ -4259,15 +4259,23 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     /// A host keyboard can shrink to nothing while it floats in the app, which
     /// UIKit reports as a hide. Only the system keyboard's hide is a dismissal.
     @objc private func softwareKeyboardWillHide() {
-        guard softwareKeyboardRequested, !keyboardCapture.inputViews.replacesSystemKeyboard else { return }
+        guard softwareKeyboardHideIsDismissal else { return }
         softwareKeyboardRequested = false
         onKeyboardActiveChange?(false)
     }
 
     @objc private func softwareKeyboardDidHide() {
-        guard softwareKeyboardRequested, !keyboardCapture.inputViews.replacesSystemKeyboard else { return }
+        guard softwareKeyboardHideIsDismissal else { return }
         softwareKeyboardRequested = false
         onKeyboardActiveChange?(false)
+    }
+
+    /// Leaving the app hides the system keyboard too; UIKit shows it again on
+    /// return as long as the request survives.
+    private var softwareKeyboardHideIsDismissal: Bool {
+        guard softwareKeyboardRequested,
+              !keyboardCapture.inputViews.replacesSystemKeyboard else { return false }
+        return window?.windowScene?.activationState == .foregroundActive
     }
 }
 

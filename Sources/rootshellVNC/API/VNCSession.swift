@@ -802,12 +802,8 @@ public final class VNCSession {
     @ObservationIgnored
     public var suspendsRemoteDisplaySizeUpdates: Bool = false {
         didSet {
-            guard oldValue, !suspendsRemoteDisplaySizeUpdates,
-                  let deferred = deferredDisplaySizeUpdate else { return }
-            deferredDisplaySizeUpdate = nil
-            updateRemoteDisplaySize(
-                viewSize: deferred.viewSize,
-                displayScale: deferred.displayScale)
+            guard oldValue, !suspendsRemoteDisplaySizeUpdates else { return }
+            applyDeferredDisplaySizeUpdate()
         }
     }
 
@@ -920,6 +916,24 @@ public final class VNCSession {
     /// Latest viewport reported while size updates were suspended.
     @ObservationIgnored
     private var deferredDisplaySizeUpdate: (viewSize: CGSize, displayScale: CGFloat)?
+    /// Set while the host scene is inactive. Leaving hides the software
+    /// keyboard and the pane grows behind the app switcher; sending that size
+    /// would leave a stale framebuffer on return and resize the Mac twice.
+    @ObservationIgnored
+    private var appInactiveSuspendsDisplaySizeUpdates = false
+
+    private var displaySizeUpdatesSuspended: Bool {
+        suspendsRemoteDisplaySizeUpdates || appInactiveSuspendsDisplaySizeUpdates
+    }
+
+    private func applyDeferredDisplaySizeUpdate() {
+        guard !displaySizeUpdatesSuspended,
+              let deferred = deferredDisplaySizeUpdate else { return }
+        deferredDisplaySizeUpdate = nil
+        updateRemoteDisplaySize(
+            viewSize: deferred.viewSize,
+            displayScale: deferred.displayScale)
+    }
     /// Single drain task for the ordered input queue. Gesture callbacks are
     /// synchronous, but transport writes are async; one pump prevents a release
     /// from overtaking its press while coalescing stale movement samples.
@@ -1055,6 +1069,13 @@ public final class VNCSession {
     @ObservationIgnored
     private var foregroundLifecycleTask: Task<Void, Never>?
     @ObservationIgnored
+    private nonisolated(unsafe) var sceneLifecycleObservers: [any NSObjectProtocol] = []
+    /// The scene showing this session; only its activation gates resizes.
+    @ObservationIgnored
+    private weak var hostScene: UIWindowScene?
+    @ObservationIgnored
+    private var displaySizeResumeTask: Task<Void, Never>?
+    @ObservationIgnored
     private var mediaWasBackgrounded = false
 
     /// Whether the session still had a live or recovering connection at the
@@ -1115,6 +1136,10 @@ public final class VNCSession {
         #if canImport(UIKit)
         backgroundLifecycleTask?.cancel()
         foregroundLifecycleTask?.cancel()
+        for observer in sceneLifecycleObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        displaySizeResumeTask?.cancel()
         #endif
     }
 
@@ -1736,7 +1761,7 @@ public final class VNCSession {
         viewSize: CGSize,
         displayScale: CGFloat
     ) {
-        if suspendsRemoteDisplaySizeUpdates {
+        if displaySizeUpdatesSuspended {
             deferredDisplaySizeUpdate = (viewSize, displayScale)
             return
         }
@@ -3814,7 +3839,65 @@ public final class VNCSession {
                 if wasLive { resumeReconnectIfTransportAlreadyLost() }
             }
         }
+        #if !targetEnvironment(macCatalyst)
+        // Synchronous, so no keyboard-driven layout lands before the gate.
+        sceneLifecycleObservers = [
+            NotificationCenter.default.addObserver(
+                forName: UIScene.willDeactivateNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] notification in
+                let sceneID = (notification.object as AnyObject?).map(ObjectIdentifier.init)
+                MainActor.assumeIsolated {
+                    guard let self, let sceneID,
+                          sceneID == self.hostScene.map(ObjectIdentifier.init) else { return }
+                    self.displaySizeResumeTask?.cancel()
+                    self.appInactiveSuspendsDisplaySizeUpdates = true
+                }
+            },
+            NotificationCenter.default.addObserver(
+                forName: UIScene.didActivateNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] notification in
+                let sceneID = (notification.object as AnyObject?).map(ObjectIdentifier.init)
+                MainActor.assumeIsolated {
+                    guard let self, let sceneID,
+                          sceneID == self.hostScene.map(ObjectIdentifier.init) else { return }
+                    self.resumeDisplaySizeUpdatesAfterActivation()
+                }
+            },
+        ]
+        #endif
     }
+
+    /// Called by the remote view as it moves between windows.
+    func setHostScene(_ scene: UIWindowScene?) {
+        #if !targetEnvironment(macCatalyst)
+        // Detaching keeps the last scene: only a move to another one counts.
+        guard let scene, scene !== hostScene else { return }
+        hostScene = scene
+        // The old scene's gate does not carry over to the new one.
+        guard appInactiveSuspendsDisplaySizeUpdates else { return }
+        displaySizeResumeTask?.cancel()
+        appInactiveSuspendsDisplaySizeUpdates = false
+        applyDeferredDisplaySizeUpdate()
+        #endif
+    }
+
+    #if !targetEnvironment(macCatalyst)
+    /// The returning keyboard restores the layout around activation; replaying
+    /// only the settled size dedupes against what the Mac already has.
+    private func resumeDisplaySizeUpdatesAfterActivation() {
+        displaySizeResumeTask?.cancel()
+        displaySizeResumeTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !Task.isCancelled, let self else { return }
+            appInactiveSuspendsDisplaySizeUpdates = false
+            applyDeferredDisplaySizeUpdate()
+        }
+    }
+    #endif
 
     /// Attribute the next connection loss to the suspension we just came back
     /// from. See ``suspensionResumeDeadlineNanos``.
