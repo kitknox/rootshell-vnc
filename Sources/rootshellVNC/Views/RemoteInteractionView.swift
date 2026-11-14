@@ -263,6 +263,15 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private var momentumCatchTimestamp: CFTimeInterval = 0
     private let suppressedInputView = UIView(frame: .zero)
     private var consumedRemoteAliasUsages: Set<UInt32> = []
+    #if targetEnvironment(macCatalyst)
+    private var catalystWindowChordUsages: Set<UInt32> = []
+    private var pendingCatalystWindowChords: [UInt32: UIKeyModifierFlags] = [:]
+    /// Modifiers the fallback pressed for a key still physically down.
+    private var catalystBorrowedModifiers: Set<UInt32> = []
+    /// Presses UIKit delivered itself, by time. A claim belongs to one
+    /// physical press and is retired when the monitor sees its release.
+    private var catalystWindowChordClaims: [UInt32: CFTimeInterval] = [:]
+    #endif
     private var universalKeys = UniversalCommandKeyState()
     /// Supplemental toolbar modifiers held around each physical key or pointer
     /// press until it ends. Reference counts keep overlapping presses from
@@ -807,6 +816,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         accessibilityLabel = String(localized: "Remote desktop input", bundle: .module)
         configureRecognizers()
         #if targetEnvironment(macCatalyst)
+        focusEffect = nil
         // Catalyst surfaces a trackpad secondary click as a touchless button
         // event that only the context-menu machinery consumes — it never
         // reaches touchesBegan or tap recognizers, even with buttonMaskRequired.
@@ -896,6 +906,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         if became {
             configureHardwareKeyboardMonitor(for: GCKeyboard.coalesced)
             clearInputAssistants()
+            keyboardCapture.setRemoteInputIsFirstResponder(true)
+            #if targetEnvironment(macCatalyst)
+            if keyboardCapture.isCaptured {
+                UIFocusSystem.focusSystem(for: self)?.requestFocusUpdate(to: self)
+            }
+            #endif
         }
         return became
     }
@@ -923,14 +939,57 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         #endif
     }
 
+    #if targetEnvironment(macCatalyst)
+    /// AppKit turns Control-Tab and Command-Tab into a move to the next
+    /// focusable view before UIKit sees the key, which would take the
+    /// keyboard from the remote screen. The hardware monitor sends the key.
+    /// A host that keeps its shortcuts may be switching tabs on this chord.
+    override var canResignFirstResponder: Bool {
+        guard keyboardCapture.isCaptured, window?.isKeyWindow == true,
+              keyboardCapture.routesReservedHostShortcutsToVNC || !keyboardCapture.hasReservedHostShortcuts,
+              heldCatalystFocusChord else {
+            return super.canResignFirstResponder
+        }
+        return false
+    }
+
+    /// Tab or Space is down in a chord the hardware monitor sends. AppKit
+    /// turns those into focus moves and activations of the focused view.
+    private var heldCatalystFocusChord: Bool {
+        let flags = Self.liveModifierFlags
+        return (CGEventSource.keyState(.combinedSessionState, key: 0x30)
+                && isCatalystWindowChord(usage: 0x2B, flags: flags))
+            || (CGEventSource.keyState(.combinedSessionState, key: 0x31)
+                && isCatalystWindowChord(usage: 0x2C, flags: flags))
+    }
+
+    /// Holding keyboard focus as well as the keyboard keeps a Tab chord
+    /// from parking focus on another control, which Space would then
+    /// activate.
+    override var canBecomeFocused: Bool { keyboardCapture.isCaptured }
+
+    override func shouldUpdateFocus(in context: UIFocusUpdateContext) -> Bool {
+        if context.previouslyFocusedItem === self, context.nextFocusedItem !== self,
+           !context.focusHeading.isEmpty, keyboardCapture.isCaptured, isFirstResponder {
+            return false
+        }
+        return super.shouldUpdateFocus(in: context)
+    }
+    #endif
+
     override func resignFirstResponder() -> Bool {
+        // A refused resign keeps the keyboard, so held keys stay held.
+        guard canResignFirstResponder else { return false }
         releaseAllPressedKeys()
         discardTextDocument()
-        return super.resignFirstResponder()
+        let resigned = super.resignFirstResponder()
+        if resigned { keyboardCapture.setRemoteInputIsFirstResponder(false) }
+        return resigned
     }
 
     override func willMove(toWindow newWindow: UIWindow?) {
         if newWindow == nil {
+            keyboardCapture.setRemoteInputIsFirstResponder(false)
             releasePointerDrag()
             releaseTouchHoldDrag()
             releasePhysicalButtonPress()
@@ -1273,6 +1332,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             if handleRemoteSystemAlias(key: key, usage: usage) {
                 continue
             }
+            #else
+            if isCatalystWindowChord(usage: usage, flags: key.modifierFlags) {
+                catalystWindowChordClaims[usage] = CACurrentMediaTime()
+            }
             #endif
             // Control/Command are represented by separate RFB modifier events.
             // UIKit may put an ASCII control byte in `characters` for those
@@ -1587,6 +1650,29 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             }
             #if targetEnvironment(macCatalyst)
             let held = Self.liveModifierFlags
+            if !pressed, (0xE0...0xE7).contains(usage) {
+                DispatchQueue.main.async { [weak self] in
+                    MainActor.assumeIsolated {
+                        self?.releaseCatalystBorrowedModifiers(stillDown: snapshot)
+                    }
+                }
+            }
+            let windowChordUsage: UInt32?
+            switch keyCode {
+            case .tab: windowChordUsage = 0x2B
+            case .spacebar: windowChordUsage = 0x2C
+            case .graveAccentAndTilde: windowChordUsage = 0x35
+            default: windowChordUsage = nil
+            }
+            if let windowChordUsage {
+                DispatchQueue.main.async { [weak self] in
+                    MainActor.assumeIsolated {
+                        self?.handleCatalystWindowChord(
+                            usage: windowChordUsage, pressed: pressed, held: held)
+                    }
+                }
+                return
+            }
             // Option/Command+arrow chords: Catalyst consumes these as its own
             // cursor movement and never delivers them via pressesBegan or a
             // UIKeyCommand, so read them straight from GameController — the same
@@ -1710,6 +1796,106 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     #if targetEnvironment(macCatalyst)
+    /// Control-Tab and Command-Grave: AppKit takes them for tab and window
+    /// cycling before UIKit sees a press, even with nothing to cycle to.
+    /// Space chords and Command-Tab: see `sendsSystemSpaceShortcuts` and
+    /// `sendsAppSwitcherShortcut`.
+    private func isCatalystWindowChord(usage: UInt32, flags: UIKeyModifierFlags) -> Bool {
+        switch usage {
+        case 0x2C: keyboardCapture.sendsSystemSpaceShortcuts
+            && !flags.isDisjoint(with: [.control, .command])
+        case 0x2B: flags.contains(.command)
+            ? keyboardCapture.sendsAppSwitcherShortcut && !flags.contains(.control)
+            : flags.contains(.control)
+        case 0x35: flags.contains(.command) && !flags.contains(.control)
+        default: false
+        }
+    }
+
+    /// UIKit's press carries the keyboard layout, so it gets first claim; a
+    /// second press of a held usage is dropped. This covers the presses
+    /// AppKit keeps, as a held key so remote switchers stay open.
+    private func handleCatalystWindowChord(usage: UInt32, pressed: Bool, held: UIKeyModifierFlags) {
+        guard pressed else {
+            pressPendingCatalystWindowChord(usage: usage)
+            if catalystWindowChordUsages.remove(usage) != nil {
+                _ = hardwareKeyboard.release(usage: usage)
+                endSupplementalModifiers(for: usage)
+            }
+            catalystWindowChordClaims[usage] = nil
+            return
+        }
+        // UIKit and the monitor report one press within moments of each
+        // other, in either order. An older claim is a release the monitor
+        // missed.
+        if let claimed = catalystWindowChordClaims[usage], CACurrentMediaTime() - claimed > 0.1 {
+            catalystWindowChordClaims[usage] = nil
+        }
+        // Control+Option chords belong to the Command translation.
+        guard acceptsHardwareInput, isFirstResponder, window?.isKeyWindow == true,
+              keyboardCapture.isCaptured,
+              !(keyboardCapture.controlOptionAsCommand && Self.isControlOptionChord(held)),
+              isCatalystWindowChord(usage: usage, flags: held) else { return }
+        pendingCatalystWindowChords[usage] = held
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
+            self?.pressPendingCatalystWindowChord(usage: usage)
+        }
+    }
+
+    private func pressPendingCatalystWindowChord(usage: UInt32) {
+        guard let held = pendingCatalystWindowChords.removeValue(forKey: usage),
+              isFirstResponder, keyboardCapture.isCaptured,
+              catalystWindowChordClaims[usage] == nil,
+              !hardwareKeyboard.contains(usage: usage) else { return }
+        let characters = switch usage {
+        case 0x35: CatalystKeyboardLayout.graveKeyCharacter ?? "`"
+        case 0x2C: " "
+        default: ""
+        }
+        let keysym = KeyboardInputHandler.keysymForHIDUsage(usage, characters: characters)
+        let modifierUsages: [UInt32] = Array(0xE0...0xE7)
+        let tracked = modifierUsages.filter { hardwareKeyboard.contains(usage: $0) }
+        ensureModifierKeys(for: held)
+        let borrowed = modifierUsages.filter {
+            hardwareKeyboard.contains(usage: $0) && !tracked.contains($0)
+        }
+        beginSupplementalModifiersIfNeeded(for: usage)
+        _ = hardwareKeyboard.press(usage: usage, keysym: keysym)
+        // UIKit can drop a held modifier when the system takes the chord.
+        // While the key is still down it stays pressed, so the remote app
+        // switcher stays open; the monitor releases it.
+        let live = Self.liveModifierFlags
+        let letGo = borrowed.filter { !live.contains(Self.modifierFlag(forUsage: $0)) }
+        catalystBorrowedModifiers.formUnion(borrowed.filter { !letGo.contains($0) })
+        guard !letGo.isEmpty else {
+            catalystWindowChordUsages.insert(usage)
+            return
+        }
+        // A modifier already let go has nothing left to release it, so the
+        // key goes out as a tap and only that modifier is released.
+        _ = hardwareKeyboard.release(usage: usage)
+        endSupplementalModifiers(for: usage)
+        letGo.forEach { _ = hardwareKeyboard.release(usage: $0) }
+    }
+
+    private static func modifierFlag(forUsage usage: UInt32) -> UIKeyModifierFlags {
+        switch usage {
+        case 0xE0, 0xE4: .control
+        case 0xE1, 0xE5: .shift
+        case 0xE2, 0xE6: .alternate
+        default: .command
+        }
+    }
+
+    /// The snapshot is only trusted to say a modifier is up.
+    private func releaseCatalystBorrowedModifiers(stillDown: UIKeyModifierFlags) {
+        for usage in catalystBorrowedModifiers
+        where !stillDown.contains(Self.modifierFlag(forUsage: usage)) {
+            catalystBorrowedModifiers.remove(usage)
+            _ = hardwareKeyboard.release(usage: usage)
+        }
+    }
+
     private func handleCatalystCommandCompatibilityAlias(
         usage: UInt32,
         character: Character,
@@ -1865,6 +2051,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             usage = nil
         }
         guard let usage else { return }
+        // The hardware monitor sees this press too.
+        catalystWindowChordClaims[usage] = CACurrentMediaTime()
         let characters = command.input ?? ""
         let keysym = KeyboardInputHandler.keysymForHIDUsage(
             usage,
@@ -2118,6 +2306,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         hardwareKeyboard.releaseAll()
         releaseAllSupplementalModifiers()
         #if targetEnvironment(macCatalyst)
+        catalystWindowChordUsages.removeAll()
+        catalystBorrowedModifiers.removeAll()
+        pendingCatalystWindowChords.removeAll()
         stopCatalystArrowRepeat()
         #endif
     }

@@ -179,6 +179,15 @@ public final class VNCKeyboardCapture {
     /// explicit menu commands and toolbar modifiers keep their original meaning.
     public var controlOptionAsCommand: Bool = true
 
+    /// Mac: the host has turned off the local system shortcuts on Space
+    /// (Spotlight, input sources). Those presses then reach no responder,
+    /// so the hardware monitor sends them.
+    @ObservationIgnored public var sendsSystemSpaceShortcuts = false
+
+    /// Mac: the host has turned off the local app switcher, so Command-Tab
+    /// reaches no responder and the hardware monitor sends it.
+    @ObservationIgnored public var sendsAppSwitcherShortcut = false
+
     /// Called after a non-modifier key is successfully dispatched with
     /// nonempty supplemental modifiers. Hosts use this to consume one-shot
     /// state; locked state can remain in ``supplementalModifiers``.
@@ -192,6 +201,14 @@ public final class VNCKeyboardCapture {
 
     func noteKeyboardInput() {
         keyboardInputGeneration &+= 1
+    }
+
+    /// Whether the remote input responder holds the keyboard. Capture stays
+    /// on while a local prompt takes it.
+    public private(set) var remoteInputIsFirstResponder = false
+
+    func setRemoteInputIsFirstResponder(_ value: Bool) {
+        if remoteInputIsFirstResponder != value { remoteInputIsFirstResponder = value }
     }
 
     /// Tells the remote responder that something other than its own typing
