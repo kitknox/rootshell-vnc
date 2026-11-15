@@ -181,7 +181,8 @@ public final class VNCKeyboardCapture {
 
     /// Mac: the host has turned off the local system shortcuts on Space
     /// (Spotlight, input sources). Those presses then reach no responder,
-    /// so the hardware monitor sends them.
+    /// so the hardware monitor sends them. Control+Option+Space goes out as
+    /// itself, not as Command+Space.
     @ObservationIgnored public var sendsSystemSpaceShortcuts = false
 
     /// Mac: the host has turned off the local app switcher, so Command-Tab

@@ -482,6 +482,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             return
         }
         synchronizeUniversalModifiers(command.modifierFlags)
+        if input == " " { keepInputSourceChord(usage: 0x2C) }
         switch universalKeys.routeCommand(keysym: keysym) {
         case .duplicate:
             break
@@ -520,7 +521,16 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         pressUniversalKeysym(usage: usage, keysym: keysym)
     }
 
+    /// Control+Option+Space switches input sources on a Mac. A host that sends
+    /// the system Space shortcuts already delivers Command+Space as itself,
+    /// so this chord is not needed as its stand-in.
+    private func keepInputSourceChord(usage: UInt32) {
+        guard usage == 0x2C, keyboardCapture.sendsSystemSpaceShortcuts else { return }
+        hardwareKeyboard.sendControlOptionAsItself()
+    }
+
     private func pressUniversalKeysym(usage: UInt32, keysym: UInt32) {
+        keepInputSourceChord(usage: usage)
         guard keysym != 0, universalKeys.beginPhysical(usage: usage, keysym: keysym) else { return }
         beginSupplementalModifiersIfNeeded(for: usage)
         _ = hardwareKeyboard.press(usage: usage, keysym: keysym)

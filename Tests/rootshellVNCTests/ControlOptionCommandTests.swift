@@ -38,6 +38,34 @@ final class ControlOptionCommandTests: XCTestCase {
         }
     }
 
+    func testChordCanGoOutAsItselfUntilEitherModifierIsReleased() {
+        var state = CommandModifierState()
+        _ = state.press(usage: 0xE0, keysym: control)
+        _ = state.press(usage: 0xE2, keysym: option)
+        XCTAssertEqual(state.sendControlOptionAsItself(), [
+            event(false, command), event(true, control), event(true, option),
+        ])
+        XCTAssertTrue(state.sendControlOptionAsItself().isEmpty)
+        XCTAssertTrue(state.isControlOptionChordActive)
+        XCTAssertEqual(state.release(usage: 0xE2), [event(false, option)])
+        XCTAssertEqual(state.press(usage: 0xE2, keysym: option), [
+            event(false, control), event(true, command),
+        ])
+        XCTAssertEqual(state.releaseAll(), [event(false, command)])
+    }
+
+    func testChordStaysCommandWhileAnotherModifierIsHeld() {
+        var state = CommandModifierState()
+        _ = state.press(usage: 0xE0, keysym: control)
+        _ = state.press(usage: 0xE2, keysym: option)
+        _ = state.press(usage: 0xE1, keysym: KeyboardInputHandler.keysymShiftL)
+        XCTAssertTrue(state.sendControlOptionAsItself().isEmpty)
+        XCTAssertTrue(state.contains(keysym: command))
+        var idle = CommandModifierState()
+        _ = idle.press(usage: 0xE0, keysym: control)
+        XCTAssertTrue(idle.sendControlOptionAsItself().isEmpty)
+    }
+
     func testRightHandModifiersAndPhysicalCommandShareRemoteCommand() {
         var state = CommandModifierState()
         _ = state.press(usage: 0xE4, keysym: KeyboardInputHandler.keysymControlR)
@@ -203,6 +231,34 @@ final class ControlOptionCommandIntegrationTests: XCTestCase {
         XCTAssertEqual(events.map(\.downFlag), [true, true, false])
         _ = view.resignFirstResponder()
         XCTAssertEqual(events.last, HardwareKeyboardTransition(downFlag: false, keysym: 0xFFEB))
+    }
+
+    /// iPad keeps the chord as its way to send Command+Space; only a host
+    /// that sends the system Space shortcuts gets the input source chord.
+    @MainActor
+    func testSpaceChordIsCommandUnlessTheHostSendsSystemSpaceShortcuts() {
+        for sendsSystemSpaceShortcuts in [false, true] {
+            var events: [HardwareKeyboardTransition] = []
+            let capture = VNCKeyboardCapture()
+            capture.sendsSystemSpaceShortcuts = sendsSystemSpaceShortcuts
+            let view = RemoteInputUIView(
+                touchHandler: TouchInputHandler { _, _, _ in },
+                keyboardHandler: KeyboardInputHandler(sendKeyEvent: {
+                    events.append(HardwareKeyboardTransition(downFlag: $0, keysym: $1))
+                }),
+                keyboardCapture: capture,
+                requestPasswordSend: {}, requestDictation: {}, toggleFullScreen: nil, disconnect: {})
+            let command = UIKeyCommand(input: " ", modifierFlags: [.control, .alternate],
+                action: NSSelectorFromString("handleUniversalCommandKey:"))
+            _ = view.perform(command.action, with: command)
+            var held: [UInt32] = []
+            for event in events.prefix(while: { $0.keysym != 0x20 }) {
+                if event.downFlag { held.append(event.keysym) } else { held.removeAll { $0 == event.keysym } }
+            }
+            XCTAssertEqual(held, sendsSystemSpaceShortcuts ? [0xFFE3, 0xFFE9] : [0xFFEB])
+            XCTAssertEqual(events.filter { $0.keysym == 0x20 }.map(\.downFlag), [true, false])
+            _ = view.resignFirstResponder()
+        }
     }
 
     @MainActor

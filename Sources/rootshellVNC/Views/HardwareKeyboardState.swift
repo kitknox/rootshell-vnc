@@ -232,8 +232,19 @@ struct CommandModifierState: Sendable {
     private(set) var physical: [UInt32: UInt32] = [:]
     private var inferredUsages: Set<UInt32> = []
     private var emitted: [UInt32] = []
+    /// The held chord goes out as Control and Option until either is released.
+    private var sendsChordAsItself = false
 
     func contains(keysym: UInt32) -> Bool { emitted.contains(keysym) }
+
+    /// For a chord that means something as Control+Option on the remote.
+    /// Ignored unless those are the only modifiers held.
+    mutating func sendControlOptionAsItself() -> [HardwareKeyboardTransition] {
+        guard isControlOptionChordActive,
+              physical.keys.allSatisfy({ [0xE0, 0xE4, 0xE2, 0xE6].contains($0) }) else { return [] }
+        sendsChordAsItself = true
+        return reconcile()
+    }
 
     var isControlOptionChordActive: Bool {
         (physical[0xE0] != nil || physical[0xE4] != nil)
@@ -298,14 +309,16 @@ struct CommandModifierState: Sendable {
     private mutating func reconcile() -> [HardwareKeyboardTransition] {
         let control = physical[0xE0] != nil || physical[0xE4] != nil
         let option = physical[0xE2] != nil || physical[0xE6] != nil
+        if !(control && option) { sendsChordAsItself = false }
+        let translated = control && option && !sendsChordAsItself
         var desired: [UInt32] = []
         for usage in physical.keys.sorted() {
-            if control && option && [0xE0, 0xE4, 0xE2, 0xE6].contains(usage) { continue }
+            if translated && [0xE0, 0xE4, 0xE2, 0xE6].contains(usage) { continue }
             let keysym = (usage == 0xE3 || usage == 0xE7)
                 ? KeyboardInputHandler.keysymSuperL : physical[usage]!
             if !desired.contains(keysym) { desired.append(keysym) }
         }
-        if control && option && !desired.contains(KeyboardInputHandler.keysymSuperL) {
+        if translated && !desired.contains(KeyboardInputHandler.keysymSuperL) {
             desired.append(KeyboardInputHandler.keysymSuperL)
         }
         let releases = emitted.reversed().filter { !desired.contains($0) }.map {
@@ -402,6 +415,11 @@ final class HardwareKeyboardController {
 
     var isControlOptionChordActive: Bool {
         controlOptionAsCommand && commandModifiers.isControlOptionChordActive
+    }
+
+    func sendControlOptionAsItself() {
+        guard controlOptionAsCommand else { return }
+        commandModifiers.sendControlOptionAsItself().forEach(sendModifier)
     }
 
     private func startRepeat(for usage: UInt32) {
