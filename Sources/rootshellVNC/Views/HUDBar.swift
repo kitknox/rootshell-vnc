@@ -37,6 +37,8 @@ public struct VNCHUDButtonStyle: Equatable, Sendable {
 struct HUDAccessory {
     /// Pinned along the bottom, with the fitted screen kept clear of it.
     var docksToBottom: Bool
+    /// The host's buttons include one that shows and hides the keyboard.
+    var providesKeyboardButton: Bool
     var buttonStyle: (CGFloat) -> VNCHUDButtonStyle
     var behind: (CGFloat) -> AnyView
     var beside: (VNCHUDButtonStyle) -> AnyView

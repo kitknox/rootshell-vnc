@@ -69,7 +69,7 @@ public struct RemoteDesktopView: View {
     private let keyboardHandler: KeyboardInputHandler
     private let isFullScreen: Bool
     private let toggleFullScreen: (() -> Void)?
-    private let hudMenuExtras: AnyView?
+    private let hudMenuExtras: VNCHUDMenuExtras
     #if canImport(UIKit)
     private var hudAccessory: HUDAccessory?
     #endif
@@ -97,6 +97,7 @@ public struct RemoteDesktopView: View {
     }
     #endif
 
+    /// `hudMenuExtras` adds the host's own items to the HUD menu.
     public init(
         session: VNCSession,
         keyboardCapture: VNCKeyboardCapture? = nil,
@@ -112,87 +113,8 @@ public struct RemoteDesktopView: View {
         touchGestures: RemoteTouchGestureConfiguration = .standard,
         onSharedClipboardUserChange: (@MainActor (Bool) -> Void)? = nil,
         hostOwnsRecoveryChrome: Bool = false,
-        brightnessGain: Double = 1.0
-    ) {
-        self.init(
-            session: session,
-            keyboardCapture: keyboardCapture,
-            isFullScreen: isFullScreen,
-            toggleFullScreen: toggleFullScreen,
-            keyboardAvoidanceMode: keyboardAvoidanceMode,
-            hudSafeAreaEdges: hudSafeAreaEdges,
-            clipboardSynchronizer: clipboardSynchronizer,
-            initialViewportPanningMode: initialViewportPanningMode,
-            initialPointerMode: initialPointerMode,
-            pointerSpeed: pointerSpeed,
-            cursorHeight: cursorHeight,
-            touchGestures: touchGestures,
-            onSharedClipboardUserChange: onSharedClipboardUserChange,
-            hostOwnsRecoveryChrome: hostOwnsRecoveryChrome,
-            brightnessGain: brightnessGain,
-            hudMenuExtras: nil)
-    }
-
-    /// Creates a remote desktop view whose HUD menu shows extra items between
-    /// the built-in viewport controls and the password/disconnect actions.
-    ///
-    /// The extras are captured once at init and type-erased; container apps
-    /// that want live state in these items should pass views that read their
-    /// own `@Observable` models so the hosted menu re-renders on change.
-    public init<MenuExtras: View>(
-        session: VNCSession,
-        keyboardCapture: VNCKeyboardCapture? = nil,
-        isFullScreen: Bool = false,
-        toggleFullScreen: (() -> Void)? = nil,
-        keyboardAvoidanceMode: VNCKeyboardAvoidanceMode = .automatic,
-        hudSafeAreaEdges: Edge.Set = .all,
-        clipboardSynchronizer: VNCClipboardSynchronizer? = nil,
-        initialViewportPanningMode: RemoteViewportPanningMode = .edge,
-        initialPointerMode: RemotePointerMode = .direct,
-        pointerSpeed: Double = 1.0,
-        cursorHeight: CGFloat = 17,
-        touchGestures: RemoteTouchGestureConfiguration = .standard,
-        onSharedClipboardUserChange: (@MainActor (Bool) -> Void)? = nil,
-        hostOwnsRecoveryChrome: Bool = false,
         brightnessGain: Double = 1.0,
-        @ViewBuilder hudMenuExtras: () -> MenuExtras
-    ) {
-        self.init(
-            session: session,
-            keyboardCapture: keyboardCapture,
-            isFullScreen: isFullScreen,
-            toggleFullScreen: toggleFullScreen,
-            keyboardAvoidanceMode: keyboardAvoidanceMode,
-            hudSafeAreaEdges: hudSafeAreaEdges,
-            clipboardSynchronizer: clipboardSynchronizer,
-            initialViewportPanningMode: initialViewportPanningMode,
-            initialPointerMode: initialPointerMode,
-            pointerSpeed: pointerSpeed,
-            cursorHeight: cursorHeight,
-            touchGestures: touchGestures,
-            onSharedClipboardUserChange: onSharedClipboardUserChange,
-            hostOwnsRecoveryChrome: hostOwnsRecoveryChrome,
-            brightnessGain: brightnessGain,
-            hudMenuExtras: AnyView(hudMenuExtras()))
-    }
-
-    private init(
-        session: VNCSession,
-        keyboardCapture: VNCKeyboardCapture?,
-        isFullScreen: Bool,
-        toggleFullScreen: (() -> Void)?,
-        keyboardAvoidanceMode: VNCKeyboardAvoidanceMode,
-        hudSafeAreaEdges: Edge.Set,
-        clipboardSynchronizer: VNCClipboardSynchronizer?,
-        initialViewportPanningMode: RemoteViewportPanningMode,
-        initialPointerMode: RemotePointerMode,
-        pointerSpeed: Double,
-        cursorHeight: CGFloat,
-        touchGestures: RemoteTouchGestureConfiguration,
-        onSharedClipboardUserChange: (@MainActor (Bool) -> Void)?,
-        hostOwnsRecoveryChrome: Bool,
-        brightnessGain: Double,
-        hudMenuExtras: AnyView?
+        hudMenuExtras: VNCHUDMenuExtras = VNCHUDMenuExtras()
     ) {
         self.session = session
         self.hostOwnsRecoveryChrome = hostOwnsRecoveryChrome
@@ -252,9 +174,11 @@ public struct RemoteDesktopView: View {
     /// across the whole bar, taking the width it may use. `buttonStyle` sizes
     /// every button from that width. `docksToBottom` pins the bar along the bottom and fits the
     /// screen above it, though zoomed content still shows through underneath.
+    /// `providesKeyboardButton` drops the menu's own Show Keyboard item.
     public func hudAccessory<Behind: View, Beside: View>(
         isEnabled: Bool = true,
         docksToBottom: Bool = false,
+        providesKeyboardButton: Bool = false,
         buttonStyle: @escaping (_ availableWidth: CGFloat) -> VNCHUDButtonStyle,
         @ViewBuilder behind: @escaping (_ availableWidth: CGFloat) -> Behind,
         @ViewBuilder beside: @escaping (_ buttonStyle: VNCHUDButtonStyle) -> Beside
@@ -263,6 +187,7 @@ public struct RemoteDesktopView: View {
         var copy = self
         copy.hudAccessory = HUDAccessory(
             docksToBottom: docksToBottom,
+            providesKeyboardButton: providesKeyboardButton,
             buttonStyle: buttonStyle,
             behind: { AnyView(behind($0)) },
             beside: { AnyView(beside($0)) })
@@ -648,249 +573,104 @@ public struct RemoteDesktopView: View {
     }
     #endif
 
-    @ViewBuilder
+    #if canImport(UIKit)
+    private var hudMenu: some View {
+        HUDMenu(
+            keyboardCapture: keyboardCapture,
+            keyboardHandler: keyboardHandler,
+            keyboardActive: $keyboardActive,
+            hardwareKeyboardAttached: hardwareKeyboardAttached,
+            hostProvidesKeyboardButton: hudAccessory?.providesKeyboardButton ?? false,
+            viewport: $viewport,
+            viewportPanningMode: $viewportPanningMode,
+            pointerMode: $pointerMode,
+            isFullScreen: isFullScreen,
+            toggleFullScreen: toggleFullScreen,
+            extras: hudMenuExtras,
+            disconnect: { session.requestUserDisconnect() },
+            sessionActions: {
+                clipboardMenu
+                if session.fileTransfers.canUpload || session.fileTransfers.canDownload
+                    || !session.fileTransfers.transfers.isEmpty {
+                    Button {
+                        showsFileTransfers.toggle()
+                    } label: {
+                        Label(
+                            showsFileTransfers
+                                ? String(localized: "Hide File Transfers", bundle: .module)
+                                : String(localized: "File Transfers", bundle: .module),
+                            systemImage: "arrow.up.arrow.down.circle")
+                    }
+                }
+                passwordButton
+            },
+            sessionDisplay: { curtainToggle })
+    }
+    #else
+    /// Without the touch and keyboard layer there is little to group.
     private var hudMenu: some View {
         Menu {
-            Button {
-                requestPasswordSend()
+            clipboardMenu
+            passwordButton
+            hudMenuExtras.actions
+            Menu {
+                HUDFitScreenButton(viewport: $viewport)
+                HUDPanningPicker(selection: $viewportPanningMode)
+                HUDPointerPicker(selection: $pointerMode)
+                curtainToggle
+                hudMenuExtras.display
             } label: {
-                Label(String(localized: "Type User Password", bundle: .module), systemImage: "key.fill")
+                Label(String(localized: "Display", bundle: .module), systemImage: "display")
             }
-            .disabled(!session.canSendLoginPassword)
-
-            #if canImport(UIKit)
-            if !hardwareKeyboardAttached {
-                Button {
-                    keyboardCapture.capture()
-                    keyboardActive.toggle()
-                } label: {
-                    Label(
-                        keyboardActive
-                            ? String(localized: "Hide Keyboard", bundle: .module)
-                            : String(localized: "Show Keyboard", bundle: .module),
-                        systemImage: keyboardActive
-                            ? "keyboard.chevron.compact.down" : "keyboard")
-                }
-            }
-
-            if let hudMenuExtras {
-                hudMenuExtras
-            }
-
-            keyboardCaptureControl
-            Toggle(isOn: Binding(
-                get: { keyboardCapture.controlOptionAsCommand },
-                set: { keyboardCapture.controlOptionAsCommand = $0 }
-            )) {
-                Label(String(localized: "Control+Option as Command", bundle: .module), systemImage: "keyboard")
-            }
-            remoteCommandsMenu
-            #endif
-
-            displayMenu
-
             if let toggleFullScreen {
-                Button(action: toggleFullScreen) {
-                    Label(
-                        isFullScreen
-                            ? String(localized: "Exit Full Screen", bundle: .module)
-                            : String(localized: "Enter Full Screen", bundle: .module),
-                        systemImage: isFullScreen
-                            ? "arrow.down.right.and.arrow.up.left"
-                            : "arrow.up.left.and.arrow.down.right")
-                }
+                HUDFullScreenButton(isFullScreen: isFullScreen, toggle: toggleFullScreen)
             }
-
-            if let clipboardSynchronizer {
-                VNCClipboardMenu(
-                    synchronizer: clipboardSynchronizer,
-                    onSharedClipboardUserChange: onSharedClipboardUserChange
-                )
-            }
-
-            #if canImport(UIKit)
-            if session.fileTransfers.canUpload || session.fileTransfers.canDownload
-                || !session.fileTransfers.transfers.isEmpty {
-                Button {
-                    showsFileTransfers.toggle()
-                } label: {
-                    Label(
-                        showsFileTransfers
-                            ? String(localized: "Hide File Transfers", bundle: .module)
-                            : String(localized: "File Transfers", bundle: .module),
-                        systemImage: "arrow.up.arrow.down.circle")
-                }
-            }
-            #endif
-
+            hudMenuExtras.keyboard
+            hudMenuExtras.session
             Divider()
-
-            Button(role: .destructive) {
-                session.requestUserDisconnect()
-            } label: {
-                Label(String(localized: "Close Connection", bundle: .module), systemImage: "xmark.circle")
-            }
+            HUDCloseConnectionButton { session.requestUserDisconnect() }
         } label: {
-            #if canImport(UIKit)
-            HUDMenuButtonLabel()
-            #else
             Image(systemName: "line.3.horizontal")
                 .font(.body.weight(.bold))
                 .frame(width: 46, height: 46)
                 .modifier(HUDButtonChromeModifier())
-            #endif
         }
         .buttonStyle(.plain)
         .foregroundStyle(.primary)
         .accessibilityLabel(String(localized: "Remote Desktop Controls", bundle: .module))
         .help(String(localized: "Remote Desktop Controls", bundle: .module))
     }
-
-    #if canImport(UIKit)
-    @ViewBuilder
-    private var keyboardCaptureControl: some View {
-        if keyboardCapture.hasReservedHostShortcuts {
-            if hardwareKeyboardAttached {
-                Toggle(isOn: Binding(
-                    get: { keyboardCapture.routesReservedHostShortcutsToVNC },
-                    set: { keyboardCapture.routeReservedHostShortcutsToVNC($0) }
-                )) {
-                    Label(String(localized: "Route Reserved Shortcuts to VNC", bundle: .module), systemImage: "keyboard.badge.ellipsis")
-                }
-            }
-        } else {
-            Button {
-                keyboardCapture.toggle()
-                if !keyboardCapture.isCaptured {
-                    keyboardActive = false
-                }
-            } label: {
-                Label(
-                    keyboardCapture.isCaptured
-                        ? String(localized: "Release Keyboard Capture", bundle: .module)
-                        : String(localized: "Capture Keyboard", bundle: .module),
-                    systemImage: keyboardCapture.isCaptured
-                        ? "keyboard.badge.ellipsis" : "keyboard")
-            }
-        }
-    }
-
-    private var remoteCommandsMenu: some View {
-        Menu {
-            Menu(String(localized: "Editing", bundle: .module)) {
-                remoteShortcutButtons(RemoteMenuShortcut.editing)
-            }
-            Menu(String(localized: "Apps and Windows", bundle: .module)) {
-                remoteShortcutButtons(RemoteMenuShortcut.applications)
-            }
-            Menu(String(localized: "Documents and Tabs", bundle: .module)) {
-                remoteShortcutButtons(RemoteMenuShortcut.documents)
-            }
-            Menu(String(localized: "Special Keys", bundle: .module)) {
-                remoteShortcutButtons(RemoteMenuShortcut.keys)
-            }
-
-            Section(String(localized: "Mac Specific", bundle: .module)) {
-                ForEach(RemoteCommand.macSpecific) { command in
-                    Button(command.title) {
-                        keyboardCapture.noteExternalInput()
-                        keyboardHandler.handleRemoteCommand(command)
-                    }
-                }
-            }
-
-            Section(String(localized: "Other Commands", bundle: .module)) {
-                Button(String(localized: "Dictate", bundle: .module)) {
-                    requestDictation()
-                }
-
-                ForEach(RemoteCommand.otherCommands) { command in
-                    Button(command.title) {
-                        keyboardCapture.noteExternalInput()
-                        keyboardHandler.handleRemoteCommand(command)
-                    }
-                }
-            }
-        } label: {
-            Label(
-                String(localized: "Commands", bundle: .module),
-                systemImage: "command")
-        }
-    }
-
-    private func remoteShortcutButtons(_ shortcuts: [RemoteMenuShortcut]) -> some View {
-        ForEach(shortcuts) { shortcut in
-            Button(shortcut.menuTitle) {
-                keyboardCapture.noteExternalInput()
-                keyboardHandler.handleShortcutTap(shortcut.character, modifiers: shortcut.modifiers)
-            }
-        }
-    }
     #endif
 
-    /// Viewport controls and remote-display privacy belong together. Grouping
-    /// them keeps the top level short without hiding any capability.
     @ViewBuilder
-    private var displayMenu: some View {
-        Menu {
-            Menu {
-                ForEach(RemoteViewportPanningMode.allCases, id: \.self) { mode in
-                    Button {
-                        viewportPanningMode = mode
-                    } label: {
-                        Label(
-                            viewportPanningModeTitle(mode),
-                            systemImage: viewportPanningMode == mode
-                                ? "checkmark"
-                                : viewportPanningModeImage(mode))
-                    }
-                    .disabled(viewportPanningMode == mode)
-                }
-            } label: {
-                Label(
-                    String(localized: "Screen Panning", bundle: .module),
-                    systemImage: "cursorarrow.motionlines")
-            }
+    private var clipboardMenu: some View {
+        if let clipboardSynchronizer {
+            VNCClipboardMenu(
+                synchronizer: clipboardSynchronizer,
+                onSharedClipboardUserChange: onSharedClipboardUserChange)
+        }
+    }
 
-            Menu {
-                ForEach(RemotePointerMode.allCases, id: \.self) { mode in
-                    Button {
-                        pointerMode = mode
-                    } label: {
-                        Label(
-                            pointerModeTitle(mode),
-                            systemImage: pointerMode == mode
-                                ? "checkmark"
-                                : pointerModeImage(mode))
-                    }
-                    .disabled(pointerMode == mode)
-                }
-            } label: {
-                Label(
-                    String(localized: "Pointer", bundle: .module),
-                    systemImage: "cursorarrow.rays")
-            }
-
+    /// Absent, not greyed out, while there is no password to type.
+    @ViewBuilder
+    private var passwordButton: some View {
+        if session.canSendLoginPassword {
             Button {
-                viewport.reset()
+                requestPasswordSend()
             } label: {
-                Label(String(localized: "Fit Screen", bundle: .module), systemImage: "arrow.down.right.and.arrow.up.left")
+                Label(String(localized: "Type Password", bundle: .module), systemImage: "key.fill")
             }
-            .disabled(viewport.isIdentity)
+        }
+    }
 
-            if session.supportsCurtainMode {
-                Toggle(isOn: curtainBinding) {
-                    Label(
-                        String(localized: "Curtain Mode", bundle: .module),
-                        systemImage: session.isCurtained
-                            ? "eye.slash.fill"
-                            : "eye.slash")
-                }
+    @ViewBuilder
+    private var curtainToggle: some View {
+        if session.supportsCurtainMode {
+            Toggle(isOn: curtainBinding) {
+                Label(
+                    String(localized: "Curtain Mode", bundle: .module),
+                    systemImage: session.isCurtained ? "eye.slash.fill" : "eye.slash")
             }
-        } label: {
-            Label(
-                String(localized: "Display", bundle: .module),
-                systemImage: "display")
         }
     }
 
@@ -944,50 +724,6 @@ public struct RemoteDesktopView: View {
                     .foregroundStyle(.secondary)
                 Text(String(localized: "No Active Connection", bundle: .module)).foregroundStyle(.secondary)
             }
-        }
-    }
-
-    private func viewportPanningModeTitle(
-        _ mode: RemoteViewportPanningMode
-    ) -> String {
-        switch mode {
-        case .edge:
-            return String(
-                localized: "When Pointer Reaches Edge",
-                bundle: .module)
-        case .continuous:
-            return String(
-                localized: "Continuously with Pointer",
-                bundle: .module)
-        }
-    }
-
-    private func viewportPanningModeImage(
-        _ mode: RemoteViewportPanningMode
-    ) -> String {
-        switch mode {
-        case .edge:
-            return "arrow.up.left.and.arrow.down.right"
-        case .continuous:
-            return "cursorarrow.rays"
-        }
-    }
-
-    private func pointerModeTitle(_ mode: RemotePointerMode) -> String {
-        switch mode {
-        case .direct:
-            return String(localized: "Touch", bundle: .module)
-        case .trackpad:
-            return String(localized: "Trackpad", bundle: .module)
-        }
-    }
-
-    private func pointerModeImage(_ mode: RemotePointerMode) -> String {
-        switch mode {
-        case .direct:
-            return "hand.point.up.left"
-        case .trackpad:
-            return "rectangle.and.hand.point.up.left"
         }
     }
 

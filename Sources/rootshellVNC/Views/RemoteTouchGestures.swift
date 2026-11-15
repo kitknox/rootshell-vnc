@@ -152,6 +152,16 @@ extension VNCKeyboardModifiers {
         if contains(.command) { symbols += "⌘" }
         return symbols
     }
+
+    /// PC key legends in the usual order: Ctrl, Alt, Shift, Win.
+    var keyNames: [String] {
+        var names: [String] = []
+        if contains(.control) { names.append("Ctrl") }
+        if contains(.option) { names.append("Alt") }
+        if contains(.shift) { names.append("Shift") }
+        if contains(.command) { names.append("Win") }
+        return names
+    }
 }
 
 enum TouchButtonIndicatorText {

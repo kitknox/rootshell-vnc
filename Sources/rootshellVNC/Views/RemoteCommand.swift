@@ -1,5 +1,12 @@
 import Foundation
 
+/// Which computer a remote command's shortcut is written for.
+public enum RemoteCommandPlatform: Sendable, Equatable {
+    case mac
+    /// Windows and Linux conventions.
+    case other
+}
+
 /// A local, conflict-resistant shortcut that expands to a familiar command on
 /// the remote computer. These defaults follow common VNC viewer conventions,
 /// so hardware keyboard and touch users share one command vocabulary.
@@ -24,14 +31,15 @@ enum RemoteCommand: String, CaseIterable, Identifiable, Sendable {
         .moveRightASpace,
     ]
 
-    static let otherCommands: [Self] = [
-        .forceQuit,
-        .lockScreen,
-        .logOutUser,
-        .controlAltDelete,
-        .backslash,
-        .insert,
-    ]
+    /// Keys some keyboards lack, listed with the menu's Special Keys.
+    static let keys: [Self] = [.backslash, .insert]
+
+    static func systemCommands(for platform: RemoteCommandPlatform) -> [Self] {
+        switch platform {
+        case .mac: [.forceQuit, .lockScreen, .logOutUser]
+        case .other: [.lockScreen, .controlAltDelete]
+        }
+    }
 
     var title: String {
         switch self {
@@ -90,7 +98,10 @@ enum RemoteCommand: String, CaseIterable, Identifiable, Sendable {
     ///   Apple's Screen Sharing server maps `Alt_L` to Command. `controlAltDelete`
     ///   keeps the literal `Alt_L` (PC "Ctrl-Alt-Del" semantics; the combo has no
     ///   Mac meaning anyway).
-    func remoteChord(appleModifierConvention: Bool) -> RemoteKeyChord {
+    func remoteChord(
+        appleModifierConvention: Bool,
+        platform: RemoteCommandPlatform
+    ) -> RemoteKeyChord {
         let optionKeysym = KeyboardInputHandler.optionLeftKeysym(
             appleModifierConvention: appleModifierConvention)
         switch self {
@@ -107,6 +118,11 @@ enum RemoteCommand: String, CaseIterable, Identifiable, Sendable {
                 modifiers: [KeyboardInputHandler.keysymSuperL, optionKeysym],
                 key: KeyboardInputHandler.keysymEscape)
         case .lockScreen:
+            guard platform == .mac else {
+                return RemoteKeyChord(
+                    modifiers: [KeyboardInputHandler.keysymSuperL],
+                    key: KeyboardInputHandler.keysymForCharacter("l"))
+            }
             return RemoteKeyChord(
                 modifiers: [KeyboardInputHandler.keysymControlL, KeyboardInputHandler.keysymSuperL],
                 key: KeyboardInputHandler.keysymForCharacter("q"))

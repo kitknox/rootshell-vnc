@@ -19,6 +19,69 @@ enum RemoteMenuShortcut: String, CaseIterable, Identifiable {
     static let documents: [Self] = [.newDocument, .open, .save, .print, .newTab, .reopenTab, .previousTab, .nextTab]
     static let keys: [Self] = [.escape, .tab, .backTab, .controlSpace, .enter, .backspace, .forwardDelete]
 
+    /// Menu lists hold every shortcut; a platform shows the ones it has.
+    static func available(_ shortcuts: [Self], on platform: RemoteCommandPlatform) -> [Self] {
+        shortcuts.filter { $0.chord(for: platform) != nil }
+    }
+
+    enum Key: Equatable {
+        case character(Character)
+        case keysym(UInt32)
+
+        var keysym: UInt32 {
+            switch self {
+            case .character(let character): KeyboardInputHandler.keysymForCharacter(character)
+            case .keysym(let keysym): keysym
+            }
+        }
+    }
+
+    struct Chord: Equatable {
+        var key: Key
+        var modifiers: VNCKeyboardModifiers
+    }
+
+    /// The shortcut as the platform spells it, or nil where it has none.
+    /// `character` and `modifiers` are the Mac spelling.
+    func chord(for platform: RemoteCommandPlatform) -> Chord? {
+        let mac = Chord(key: .character(character), modifiers: modifiers)
+        guard platform == .other, !Self.keys.contains(self) else { return mac }
+        switch self {
+        case .undo, .cut, .copy, .paste, .selectAll, .find,
+             .newDocument, .open, .save, .print, .newTab:
+            return Chord(key: mac.key, modifiers: [.control])
+        case .redo:
+            return Chord(key: .character("y"), modifiers: [.control])
+        case .pasteAndMatchStyle, .reopenTab:
+            return Chord(key: mac.key, modifiers: [.control, .shift])
+        case .previousTab:
+            return Chord(key: .character("\t"), modifiers: [.control, .shift])
+        case .nextTab:
+            return Chord(key: .character("\t"), modifiers: [.control])
+        case .switchApp:
+            return Chord(key: mac.key, modifiers: [.option])
+        case .switchAppBackward:
+            return Chord(key: mac.key, modifiers: [.option, .shift])
+        case .closeWindow:
+            return Chord(key: .keysym(KeyboardInputHandler.keysymF4), modifiers: [.option])
+        case .fullScreen:
+            return Chord(key: .keysym(KeyboardInputHandler.keysymF11), modifiers: [])
+        case .spotlight:
+            return Chord(key: .keysym(KeyboardInputHandler.keysymSuperL), modifiers: [])
+        case .switchWindow, .hide, .hideOthers, .minimize, .quit, .settings:
+            return nil
+        case .escape, .tab, .backTab, .controlSpace, .enter, .backspace, .forwardDelete:
+            return mac
+        }
+    }
+
+    func title(for platform: RemoteCommandPlatform) -> String {
+        if self == .spotlight, platform == .other {
+            return String(localized: "Start Menu", bundle: .module)
+        }
+        return title
+    }
+
     var title: String {
         switch self {
         case .undo: String(localized: "Undo", bundle: .module)
@@ -101,14 +164,33 @@ enum RemoteMenuShortcut: String, CaseIterable, Identifiable {
         }
     }
 
-    var menuTitle: String {
-        guard !Self.keys.contains(self) else { return title }
-        var symbols = modifiers.symbols
-        switch character {
-        case "\t": symbols += "⇥"
-        case " ": symbols += String(localized: "Space", bundle: .module)
-        default: symbols += String(character).uppercased()
+    func menuTitle(for platform: RemoteCommandPlatform) -> String {
+        let title = title(for: platform)
+        guard !Self.keys.contains(self), let chord = chord(for: platform),
+              let key = Self.keyName(chord.key, platform: platform) else { return title }
+        switch platform {
+        case .mac:
+            return "\(title) (\(chord.modifiers.symbols)\(key))"
+        case .other:
+            return "\(title) (\((chord.modifiers.keyNames + [key]).joined(separator: "+")))"
         }
-        return "\(title) (\(symbols))"
+    }
+
+    /// Nil for a key with no name worth showing, such as a lone modifier.
+    private static func keyName(_ key: Key, platform: RemoteCommandPlatform) -> String? {
+        switch key {
+        case .character("\t"):
+            return platform == .mac ? "⇥" : String(localized: "Tab", bundle: .module)
+        case .character(" "):
+            return String(localized: "Space", bundle: .module)
+        case .character(let character):
+            return String(character).uppercased()
+        case .keysym(KeyboardInputHandler.keysymF4):
+            return "F4"
+        case .keysym(KeyboardInputHandler.keysymF11):
+            return "F11"
+        case .keysym:
+            return nil
+        }
     }
 }

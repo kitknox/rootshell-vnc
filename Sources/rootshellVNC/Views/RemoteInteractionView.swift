@@ -626,7 +626,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
 
     private lazy var viewerCommandKeyCommands: [UIKeyCommand] = [
         makeViewerCommand(
-            title: String(localized: "Type User Password", bundle: .module),
+            title: String(localized: "Type Password", bundle: .module),
             input: "p",
             modifiers: [.control, .shift],
             action: #selector(handlePasswordCommand(_:))),

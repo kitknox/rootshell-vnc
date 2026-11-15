@@ -91,6 +91,14 @@ public struct KeyboardInputHandler {
     /// instead of `Alt_L`/`Alt_R` (standard X11).
     public var usesAppleModifierMapping: Bool { usesAppleModifierConvention() }
 
+    /// Set where the modifier convention does not tell the remote computer's kind.
+    private let commandPlatformOverride: (@MainActor () -> RemoteCommandPlatform)?
+
+    /// Whose shortcuts the command menu sends.
+    public var commandPlatform: RemoteCommandPlatform {
+        commandPlatformOverride?() ?? (usesAppleModifierConvention() ? .mac : .other)
+    }
+
     // MARK: - Init
 
     /// Create a keyboard input handler that delegates key events to the given closure.
@@ -104,14 +112,18 @@ public struct KeyboardInputHandler {
     ///     standard X11 convention for standalone and non-Apple use.
     ///   - sendPhysicalKeyEvent: When set, hardware keys with a known HID
     ///     usage go here instead of `sendKeyEvent`, and are not auto-repeated.
+    ///   - commandPlatform: Whose shortcuts menu commands send. Nil follows
+    ///     the modifier convention.
     public init(
         sendKeyEvent: @escaping KeyEventHandler,
         usesAppleModifierConvention: @escaping @MainActor () -> Bool = { false },
-        sendPhysicalKeyEvent: PhysicalKeyEventHandler? = nil
+        sendPhysicalKeyEvent: PhysicalKeyEventHandler? = nil,
+        commandPlatform: (@MainActor () -> RemoteCommandPlatform)? = nil
     ) {
         self.sendKeyEvent = sendKeyEvent
         self.usesAppleModifierConvention = usesAppleModifierConvention
         self.sendPhysicalKeyEvent = sendPhysicalKeyEvent
+        self.commandPlatformOverride = commandPlatform
     }
 
     private let sendPhysicalKeyEvent: PhysicalKeyEventHandler?
@@ -131,7 +143,8 @@ public struct KeyboardInputHandler {
                 sendKeyEvent(downFlag, keysym)
             },
             usesAppleModifierConvention: usesAppleModifierConvention,
-            sendPhysicalKeyEvent: physical)
+            sendPhysicalKeyEvent: physical,
+            commandPlatform: commandPlatformOverride)
     }
 
     var forwardsPhysicalKeys: Bool { sendPhysicalKeyEvent != nil }
@@ -240,7 +253,18 @@ public struct KeyboardInputHandler {
     /// the remote computer.
     func handleRemoteCommand(_ command: RemoteCommand) {
         handleChord(command.remoteChord(
-            appleModifierConvention: usesAppleModifierConvention()))
+            appleModifierConvention: usesAppleModifierConvention(),
+            platform: commandPlatform))
+    }
+
+    /// Send a touch-menu shortcut as the remote computer's platform spells it.
+    func handleMenuShortcut(_ shortcut: RemoteMenuShortcut) {
+        guard let chord = shortcut.chord(for: commandPlatform) else { return }
+        handleChord(RemoteKeyChord(
+            modifiers: Self.keysyms(
+                for: chord.modifiers,
+                appleModifierConvention: usesAppleModifierConvention()),
+            key: chord.key.keysym))
     }
 
     /// Send an atomic Command/Super shortcut. Kept for clients and the iPad
