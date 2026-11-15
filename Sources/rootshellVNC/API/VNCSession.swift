@@ -1063,7 +1063,25 @@ public final class VNCSession {
     /// resolve through Retry, and nothing that merely happens to the app
     /// afterwards, an app switch included, may undo them.
     private var automaticRecoveryDeclined = false
+    /// Retired transports still closing, by server. A new connection to the
+    /// same server waits for them, so a virtual display release cannot land
+    /// on the display the new connection then requests.
+    private static var transportRetirements: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored
+    private var transportServerKey: String?
+    /// The session closed its connection ahead of a suspension and owes a
+    /// reconnect when the app returns.
+    @ObservationIgnored
+    private var leftVirtualDisplayForSuspension = false
     #if canImport(UIKit)
+    #if !targetEnvironment(macCatalyst)
+    /// Leaves a Standard virtual display before iOS suspends the app.
+    @ObservationIgnored
+    private var backgroundVirtualDisplayExitTask: Task<Void, Never>?
+    /// Short enough to finish before the Mac drops a suspended viewer
+    /// (about 20 s), long enough to keep a quick app switch connected.
+    private static let backgroundVirtualDisplayGrace = Duration.seconds(8)
+    #endif
     @ObservationIgnored
     private var backgroundLifecycleTask: Task<Void, Never>?
     @ObservationIgnored
@@ -1136,6 +1154,9 @@ public final class VNCSession {
         #if canImport(UIKit)
         backgroundLifecycleTask?.cancel()
         foregroundLifecycleTask?.cancel()
+        #if !targetEnvironment(macCatalyst)
+        backgroundVirtualDisplayExitTask?.cancel()
+        #endif
         for observer in sceneLifecycleObservers {
             NotificationCenter.default.removeObserver(observer)
         }
@@ -1280,6 +1301,11 @@ public final class VNCSession {
         intentionallyDisconnected = true
         reconnectTask?.cancel()
         reconnectTask = nil
+        leftVirtualDisplayForSuspension = false
+        #if canImport(UIKit) && !targetEnvironment(macCatalyst)
+        backgroundVirtualDisplayExitTask?.cancel()
+        backgroundVirtualDisplayExitTask = nil
+        #endif
         connectionState = .disconnecting
         logger.info("Disconnecting")
 
@@ -1294,11 +1320,7 @@ public final class VNCSession {
         fileTransfers.transportDidEnd()
 
         // Close the transport
-        if let transport = transportSession {
-            Task {
-                await transport.disconnect()
-            }
-        }
+        retire(transportSession)
         transportSession = nil
         activeCredentials = nil
         resetAppleLoginPromptState()
@@ -1380,8 +1402,7 @@ public final class VNCSession {
         // Mirror the proven media-bootstrap recovery path: close the old
         // transport while the reconnect task performs ordered cleanup and
         // establishes a fresh transport with the replacement configuration.
-        let transport = transportSession
-        Task { await transport?.disconnect() }
+        retire(transportSession)
         scheduleReconnect(immediate: true, minimumAttempts: 1)
         return true
     }
@@ -3298,7 +3319,7 @@ public final class VNCSession {
         // event cannot reach `handleDisconnected` and start the loop again.
         let transport = transportSession
         cleanupTransport(clearCredentials: false)
-        Task { await transport?.disconnect() }
+        retire(transport)
         // This cap exists to stop a reconnect loop. Reviving it on the next
         // foreground edge would restart the very loop it just broke.
         automaticRecoveryDeclined = true
@@ -3367,7 +3388,7 @@ public final class VNCSession {
                 "Retrying Apple media with tilesPerFrame=\(retryTilesPerFrame)")
         }
         logger.error("Video bootstrap failed (\(reason)); reconnecting")
-        Task { await transport?.disconnect() }
+        retire(transport)
         scheduleReconnect(immediate: true)
     }
 
@@ -3427,7 +3448,33 @@ public final class VNCSession {
         return true
     }
 
+    /// Close a transport this session is done with. Closing can take a moment
+    /// while the server gets ready to release a virtual display.
+    private func retire(_ transport: TransportSession?) {
+        guard let transport else { return }
+        guard let key = transportServerKey else {
+            Task { await transport.disconnect() }
+            return
+        }
+        let previous = Self.transportRetirements[key]
+        let retirement = Task {
+            await previous?.value
+            await transport.disconnect()
+        }
+        Self.transportRetirements[key] = retirement
+        Task { @MainActor in
+            await retirement.value
+            if Self.transportRetirements[key] == retirement {
+                Self.transportRetirements[key] = nil
+            }
+        }
+    }
+
     private func establishTransport(credentials: VNCCredentials) async throws {
+        let serverKey = "\(credentials.host):\(credentials.port)"
+        await Self.transportRetirements[serverKey]?.value
+        try Task.checkCancellation()
+        transportServerKey = serverKey
         // A custom transport is built fresh here for every attempt: the
         // reconnect loop lands on this path per retry, and the provider
         // contract requires a usable tunnel each time.
@@ -3802,6 +3849,43 @@ public final class VNCSession {
         inputQueue.removeAll()
     }
 
+    /// A suspended app keeps its socket open, so the Mac removes a Standard
+    /// virtual display only long after, often with its own display asleep.
+    /// Close the connection first; `rejoinAfterSuspension()` reconnects.
+    func leaveStandardVirtualDisplayForSuspension() async {
+        guard configuration.displaySizingMode == .matchClient,
+              !isHighPerformanceMode,
+              connectionState.isConnected,
+              let transport = transportSession,
+              await transport.holdsStandardVirtualDisplay,
+              !Task.isCancelled,
+              connectionState.isConnected,
+              transportSession === transport else { return }
+        logger.info("Leaving the remote virtual display before the app is suspended")
+        leftVirtualDisplayForSuspension = true
+        // Cleanup first, so the retired transport's `.disconnected` event
+        // cannot start a reconnect while the app is in the background.
+        cleanupTransport(clearCredentials: false)
+        connectionState = .reconnecting(attempt: 1, delay: 0)
+        retire(transport)
+        await Self.transportRetirements[transportServerKey ?? ""]?.value
+    }
+
+    /// Reconnect a session that left for a suspension. Returns whether it had.
+    @discardableResult
+    func rejoinAfterSuspension() -> Bool {
+        guard leftVirtualDisplayForSuspension else { return false }
+        leftVirtualDisplayForSuspension = false
+        if !intentionallyDisconnected {
+            scheduleReconnect(
+                immediate: true,
+                minimumAttempts: 1,
+                freeLeadingAttempt: true,
+                cause: "app resumed; the session left the remote display before it was suspended")
+        }
+        return true
+    }
+
     #if canImport(UIKit)
     /// UIKit can suspend the process long enough for RTP to advance beyond the
     /// half-range rule normally used to distinguish a late UInt16 sequence.
@@ -3821,6 +3905,9 @@ public final class VNCSession {
                     wasLiveWhenBackgrounded = false
                 }
                 noteMediaInterruptionBoundary(requestRefresh: false)
+                #if !targetEnvironment(macCatalyst)
+                scheduleBackgroundVirtualDisplayExit()
+                #endif
             }
         }
         foregroundLifecycleTask = Task { @MainActor [weak self] in
@@ -3832,6 +3919,11 @@ public final class VNCSession {
                 mediaWasBackgrounded = false
                 let wasLive = wasLiveWhenBackgrounded
                 wasLiveWhenBackgrounded = false
+                #if !targetEnvironment(macCatalyst)
+                backgroundVirtualDisplayExitTask?.cancel()
+                backgroundVirtualDisplayExitTask = nil
+                #endif
+                if rejoinAfterSuspension() { continue }
                 // Only a session that went into the background alive can have
                 // been killed by the background.
                 if wasLive { armSuspensionResumeWindow() }
@@ -3895,6 +3987,25 @@ public final class VNCSession {
             guard !Task.isCancelled, let self else { return }
             appInactiveSuspendsDisplaySizeUpdates = false
             applyDeferredDisplaySizeUpdate()
+        }
+    }
+    #endif
+
+    #if !targetEnvironment(macCatalyst)
+    private func scheduleBackgroundVirtualDisplayExit() {
+        backgroundVirtualDisplayExitTask?.cancel()
+        backgroundVirtualDisplayExitTask = nil
+        guard configuration.displaySizingMode == .matchClient,
+              !isHighPerformanceMode,
+              connectionState.isConnected,
+              let assertion = BackgroundTaskAssertion(
+                  name: "rootshellVNC.virtualDisplayExit") else { return }
+
+        backgroundVirtualDisplayExitTask = Task { @MainActor [weak self] in
+            defer { assertion.end() }
+            try? await Task.sleep(for: Self.backgroundVirtualDisplayGrace)
+            guard !Task.isCancelled, let self, self.mediaWasBackgrounded else { return }
+            await self.leaveStandardVirtualDisplayForSuspension()
         }
     }
     #endif
@@ -5276,3 +5387,24 @@ final class BandFrameCoalescer: @unchecked Sendable {
         }
     }
 }
+
+#if canImport(UIKit) && !targetEnvironment(macCatalyst)
+/// Keeps the app running in the background until `end()` or expiry.
+@MainActor
+private final class BackgroundTaskAssertion {
+    private var identifier = UIBackgroundTaskIdentifier.invalid
+
+    init?(name: String) {
+        identifier = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+            self?.end()
+        }
+        guard identifier != .invalid else { return nil }
+    }
+
+    func end() {
+        guard identifier != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(identifier)
+        identifier = .invalid
+    }
+}
+#endif

@@ -346,6 +346,8 @@ final class TransportSessionScriptedTests: XCTestCase {
             preferredEncodings: [.raw],
             requestsVirtualDisplays: true,
             connection: connection)
+        await session.setVirtualDisplayReleaseTiming(
+            timeout: .milliseconds(20), wakeSettle: .zero)
         let staged = try await session.requestRemoteDisplaySize(
             pixelWidth: 4, pixelHeight: 2, pointWidth: 2, pointHeight: 1)
         XCTAssertEqual(staged, .waitingForServerSupport)
@@ -424,6 +426,8 @@ final class TransportSessionScriptedTests: XCTestCase {
             preferredEncodings: [.raw],
             requestsVirtualDisplays: true,
             connection: connection)
+        await session.setVirtualDisplayReleaseTiming(
+            timeout: .milliseconds(20), wakeSettle: .zero)
         await session.setAbsoluteControlTiming(
             release: .milliseconds(100), maximumHold: .seconds(10))
         _ = try await session.requestRemoteDisplaySize(
@@ -502,6 +506,8 @@ final class TransportSessionScriptedTests: XCTestCase {
             preferredEncodings: [.raw],
             requestsVirtualDisplays: true,
             connection: connection)
+        await session.setVirtualDisplayReleaseTiming(
+            timeout: .milliseconds(20), wakeSettle: .zero)
         _ = try await session.requestRemoteDisplaySize(
             pixelWidth: 4, pixelHeight: 2, pointWidth: 2, pointHeight: 1)
         try await session.connect()
@@ -535,6 +541,8 @@ final class TransportSessionScriptedTests: XCTestCase {
             preferredEncodings: [.raw],
             requestsVirtualDisplays: true,
             connection: connection)
+        await session.setVirtualDisplayReleaseTiming(
+            timeout: .milliseconds(20), wakeSettle: .zero)
         try await session.connect()
 
         await connection.holdSends()
@@ -603,6 +611,8 @@ final class TransportSessionScriptedTests: XCTestCase {
             preferredEncodings: [.raw],
             requestsVirtualDisplays: true,
             connection: connection)
+        await session.setVirtualDisplayReleaseTiming(
+            timeout: .milliseconds(20), wakeSettle: .zero)
         await session.setStandardVirtualDisplayTimeout(.milliseconds(50))
         try await session.connect()
 
@@ -635,6 +645,122 @@ final class TransportSessionScriptedTests: XCTestCase {
         }
         XCTAssertTrue(sentQueued)
         await session.disconnect()
+    }
+
+    /// The Mac removes a Standard viewer's virtual display at disconnect only
+    /// once that viewer has asked for a media stream, and it wakes its display
+    /// before answering. The connection must stay open until the answer.
+    func testAppleStandardMatchClientAsksForDisplayReleaseBeforeClosing() async throws {
+        let (session, connection) = try await Self.standardMatchClientSession(
+            host: "standard-release.test")
+        let sentBeforeDisconnect = await connection.sentBytes().count
+
+        let closed = CompletionFlag()
+        Task {
+            await session.disconnect()
+            await closed.set()
+        }
+        let request = ClientMessage.appleMediaStreamRequest.serialize()
+        let asked = await Self.waitUntil {
+            await connection.sentBytes().dropFirst(sentBeforeDisconnect).suffix(request.count)
+                == request
+        }
+        XCTAssertTrue(asked)
+        let release = Data(await connection.sentBytes().dropFirst(sentBeforeDisconnect))
+        // SetEncodings leads with encoding 1010, which the request depends on.
+        XCTAssertEqual(release.prefix(2), Data([0x02, 0x00]))
+        XCTAssertEqual(
+            Data(release.dropFirst(4).prefix(4)),
+            Self.uint32Bytes(UInt32(bitPattern: Encoding.appleH264.rawValue)))
+
+        let closedEarly = await Self.waitUntil(timeout: .milliseconds(300)) {
+            await closed.isSet
+        }
+        XCTAssertFalse(closedEarly, "The connection must wait for the Mac's answer")
+
+        var mediaMessageOne = Data(repeating: 0, count: 36)
+        mediaMessageOne[1] = 1 // version 1
+        mediaMessageOne[3] = 1 // message 1
+        var framedMediaMessage = Data([0, UInt8(mediaMessageOne.count)])
+        framedMediaMessage.append(mediaMessageOne)
+        await connection.enqueueServerBytes(Self.framebufferUpdate([(
+            Self.rectangleHeader(
+                x: 0, y: 0, width: 0, height: 0,
+                encoding: Encoding.appleH264.rawValue),
+            framedMediaMessage,
+        )]))
+        let closedAfterAnswer = await Self.waitUntil { await closed.isSet }
+        XCTAssertTrue(closedAfterAnswer)
+        // The answer is a confirmation only: no media negotiation follows.
+        let sentAfterAnswer = await connection.sentBytes()
+        XCTAssertEqual(sentAfterAnswer.count, sentBeforeDisconnect + release.count)
+    }
+
+    func testAppleStandardMatchClientClosesWhenDisplayReleaseGoesUnanswered() async throws {
+        let (session, connection) = try await Self.standardMatchClientSession(
+            host: "standard-release-timeout.test")
+        await session.setVirtualDisplayReleaseTiming(
+            timeout: .milliseconds(50), wakeSettle: .zero)
+
+        let closed = await Self.withTimeout(seconds: 2) {
+            await session.disconnect()
+            return true
+        }
+        XCTAssertEqual(closed, true)
+        let request = ClientMessage.appleMediaStreamRequest.serialize()
+        let sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: request, in: sent), 1)
+    }
+
+    /// With no virtual display there is nothing for the Mac to release.
+    func testAppleStandardSessionWithoutVirtualDisplayClosesAtOnce() async throws {
+        let (session, connection) = try await Self.standardMatchClientSession(
+            host: "standard-no-release.test", requestsDisplay: false)
+        let sentBeforeDisconnect = await connection.sentBytes().count
+
+        let closed = await Self.withTimeout(seconds: 1) {
+            await session.disconnect()
+            return true
+        }
+        XCTAssertEqual(closed, true)
+        let sentAfterDisconnect = await connection.sentBytes().count
+        XCTAssertEqual(sentAfterDisconnect, sentBeforeDisconnect)
+    }
+
+    private actor CompletionFlag {
+        private(set) var isSet = false
+        func set() { isSet = true }
+    }
+
+    private static func standardMatchClientSession(
+        host: String,
+        requestsDisplay: Bool = true
+    ) async throws -> (TransportSession, ScriptedRFBConnection) {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(appleServerInitMessage(
+            width: 6,
+            height: 4,
+            name: "Standard Mac",
+            flags: 0x52,
+            serverCommands: [AppleServerCapabilities.displayConfigurationCommand]))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: host,
+            port: 5900,
+            password: "",
+            preferredEncodings: [.raw],
+            requestsVirtualDisplays: true,
+            connection: connection)
+        if requestsDisplay {
+            _ = try await session.requestRemoteDisplaySize(
+                pixelWidth: 4, pixelHeight: 2, pointWidth: 2, pointHeight: 1)
+        }
+        try await session.connect()
+        return (session, connection)
     }
 
     /// Without Apple's capability bitmap, Match Client is SetDesktopSize only,

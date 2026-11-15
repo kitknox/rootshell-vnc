@@ -809,6 +809,15 @@ public actor TransportSession {
     /// How long a written command 29 may go unanswered. Armed only after the
     /// write completes, so a backed-up connection never overlaps two.
     private(set) var standardVirtualDisplayTimeout = Duration.seconds(5)
+    /// Command 29 reached the Mac, so a virtual display may exist.
+    private var sentAppleVirtualDisplay = false
+    private var virtualDisplayReleaseRequested = false
+    private var virtualDisplayReleaseSettled = false
+    private var virtualDisplayReleaseWaiter: CheckedContinuation<Void, Never>?
+    /// The Mac wakes its display before answering, which takes close to 2 s.
+    private(set) var virtualDisplayReleaseTimeout = Duration.seconds(4)
+    /// How long the Mac gets to wake its display when nothing answers.
+    private(set) var virtualDisplayWakeSettle = Duration.milliseconds(400)
     /// Absolute control held across command 29 so the Mac's post-change input
     /// window drops nothing; released once every queued change has settled.
     private var absoluteControlActive = false
@@ -1714,6 +1723,9 @@ public actor TransportSession {
     /// Disconnect from the server.
     public func disconnect() async {
         log.info("Disconnecting")
+        await prepareVirtualDisplayRelease()
+        // A second disconnect must not leave the first one waiting.
+        finishVirtualDisplayRelease(confirmed: false)
         isDisconnecting = true
         terminalDisconnectHandled = true
         readTask?.cancel()
@@ -2398,6 +2410,7 @@ public actor TransportSession {
     ) async {
         guard !isDisconnecting, !terminalDisconnectHandled else { return }
         terminalDisconnectHandled = true
+        finishVirtualDisplayRelease(confirmed: false)
         await logDisconnectSummary(error, origin: origin)
         readTask?.cancel()
         appleAutoUpdateRefreshTask?.cancel()
@@ -3842,6 +3855,7 @@ public actor TransportSession {
     }
 
     private func waitForFramebufferCreditIfNeeded() async {
+        guard !virtualDisplayReleaseRequested else { return }
         guard unacknowledgedUpdates >= maxUnacknowledgedUpdates else { return }
         await withCheckedContinuation { continuation in
             if unacknowledgedUpdates < maxUnacknowledgedUpdates {
@@ -3998,6 +4012,7 @@ public actor TransportSession {
     private func sendAppleVirtualDisplaySize(
         _ requested: PendingRemoteDisplaySize
     ) async throws {
+        guard !virtualDisplayReleaseRequested else { return }
         // The display command describes a 2× virtual display with both pixel
         // and point dimensions. A nominal 110 points/inch gives the virtual display
         // a stable physical size without affecting its explicit HiDPI mode.
@@ -4051,6 +4066,7 @@ public actor TransportSession {
                 emitAppleRemoteDisplayResizeSettled()
                 throw error
             }
+            sentAppleVirtualDisplay = true
             armStandardVirtualDisplayTimeout(for: requested)
             log.info(
                 "Requested Standard virtual display \(requested.pixelWidth)x"
@@ -4096,6 +4112,7 @@ public actor TransportSession {
             appleDisplayReconfigurationGeneration = nil
             throw error
         }
+        sentAppleVirtualDisplay = true
         lastSentRemoteDisplaySize = requested
         pendingRemoteDisplaySize = nil
         emitAppleRemoteDisplayResizeSettled()
@@ -4119,6 +4136,88 @@ public actor TransportSession {
         pendingRemoteDisplaySize == nil
             && appleDisplayReconfigurationGeneration == nil
             && awaitedStandardVirtualDisplay == nil
+    }
+
+    /// Whether this Standard connection asked the Mac for a virtual display,
+    /// which the Mac keeps for a while after a connection that just drops.
+    public var holdsStandardVirtualDisplay: Bool {
+        sentAppleVirtualDisplay && !requestAppleMediaStream
+    }
+
+    /// Get the Mac ready to remove this viewer's virtual display the moment
+    /// the connection closes, with its display awake. A Mac that removes one
+    /// while its display sleeps can fail to bring the physical display back.
+    private func prepareVirtualDisplayRelease() async {
+        guard sentAppleVirtualDisplay, handshakeComplete,
+              !isDisconnecting, !terminalDisconnectHandled,
+              !virtualDisplayReleaseRequested else { return }
+        virtualDisplayReleaseRequested = true
+        standardVirtualDisplayTimeoutTask?.cancel()
+        standardVirtualDisplayTimeoutTask = nil
+        // Updates have no consumer left, and the read loop must reach the reply.
+        framebufferCreditWaiter?.resume()
+        framebufferCreditWaiter = nil
+
+        if requestAppleMediaStream {
+            // The Mac removes a media viewer's display at disconnect by
+            // itself, and SetEncodings wakes its display.
+            let encodings = ClientMessage.setEncodings(
+                appleMediaPostAcceptEncodings()).serialize()
+            guard (try? await sendClientPayload(encodings)) != nil else { return }
+            try? await Task.sleep(for: virtualDisplayWakeSettle)
+            return
+        }
+
+        // A Standard viewer's display otherwise stays until the agent exits
+        // about 15 s later; a viewer that asked for a media stream has it
+        // removed at disconnect. Encoding 1010 allows that request.
+        var encodings = stateMachine.preferredEncodings
+        encodings.removeAll { $0 == .appleH264 }
+        encodings.insert(.appleH264, at: 0)
+        for encoding in [Encoding.encryptionInfo, .mediaStreamOffer, .mediaStreamAnswer]
+        where !encodings.contains(encoding) {
+            encodings.append(encoding)
+        }
+        var request = ClientMessage.setEncodings(encodings).serialize()
+        if stateMachine.selectedSecurityType == .vncAuthentication {
+            // A password-only Mac takes a frame request, not the media request.
+            request.append(ClientMessage.framebufferUpdateRequest(
+                incremental: false, x: 0, y: 0, width: fbWidth, height: fbHeight
+            ).serialize())
+        } else {
+            request.append(ClientMessage.appleMediaStreamRequest.serialize())
+        }
+        do {
+            try await sendControlChannel(request)
+        } catch {
+            log.info("Virtual display release was not sent: \(error.localizedDescription)")
+            return
+        }
+        guard !virtualDisplayReleaseSettled else { return }
+        let timeout = virtualDisplayReleaseTimeout
+        await withCheckedContinuation { continuation in
+            virtualDisplayReleaseWaiter = continuation
+            Task { [weak self] in
+                try? await Task.sleep(for: timeout)
+                await self?.finishVirtualDisplayRelease(confirmed: false)
+            }
+        }
+    }
+
+    private func finishVirtualDisplayRelease(confirmed: Bool) {
+        guard virtualDisplayReleaseRequested,
+              !virtualDisplayReleaseSettled else { return }
+        virtualDisplayReleaseSettled = true
+        log.info(confirmed
+            ? "The server will release the virtual display at disconnect"
+            : "The server did not confirm the virtual display release")
+        virtualDisplayReleaseWaiter?.resume()
+        virtualDisplayReleaseWaiter = nil
+    }
+
+    func setVirtualDisplayReleaseTiming(timeout: Duration, wakeSettle: Duration) {
+        virtualDisplayReleaseTimeout = timeout
+        virtualDisplayWakeSettle = wakeSettle
     }
 
     func setStandardVirtualDisplayTimeout(_ timeout: Duration) {
@@ -4848,6 +4947,11 @@ public actor TransportSession {
     }
 
     private func handleAppleMediaStreamOfferPayload(_ offerData: Data) async throws {
+        if virtualDisplayReleaseRequested {
+            // Not a stream to set up: the offer only confirms the request.
+            finishVirtualDisplayRelease(confirmed: true)
+            return
+        }
         var offerReader = MessageReader(data: offerData)
         let offer = try AppleMediaStreamOffer(reader: &offerReader)
         if !isAppleMediaComCryptionTransition(offer.rawPayload) {
@@ -5914,6 +6018,10 @@ public actor TransportSession {
     private func handleAppleAVCServerMediaMessageIfPresent(_ payload: Data) async throws -> Bool {
         guard let message = findAppleAVCMediaMessage(in: payload) else { return false }
         guard message.messageType == 1 else { return false }
+        if virtualDisplayReleaseRequested {
+            finishVirtualDisplayRelease(confirmed: true)
+            return true
+        }
 
         // No 1103 offer preceded this: password-only Macs and servers that
         // skip the 1103 exchange (wayshare) enter High Performance here.
