@@ -1217,32 +1217,41 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
 
     func insertText(_ text: String) {
         let modifiers = keyboardCapture.supplementalModifiers
-        if modifiers.isEmpty {
-            if textDocument.committedLength > 4096 { discardTextDocument() }
-            textDocument.insert(text)
-        } else {
-            // A modifier chord is a shortcut, not text the keyboard can edit.
+        // A modifier chord is a shortcut, and Return or Tab acts on the whole
+        // remote line: both go to the remote caret, not the keyboard's.
+        guard modifiers.isEmpty, !RemoteTextInputDocument.movesRemoteCaret(text) else {
+            discardTextDocument()
+            typeText(text, modifiers: modifiers)
+            return
+        }
+        // Trim only while appending; elsewhere the edit needs the text.
+        if textDocument.committedLength > 4096, textDocument.insertsAtEnd {
             discardTextDocument()
         }
-        typeText(text, modifiers: modifiers)
+        applyTextEdit(textDocument.insert(text))
     }
 
     func deleteBackward() {
         let modifiers = keyboardCapture.supplementalModifiers
         if modifiers.isEmpty {
-            // Deleting inside a composition never reaches the remote desktop.
-            if textDocument.deleteBackward() { return }
-        } else {
-            discardTextDocument()
+            // A deletion that only edits the composition stays local.
+            if let edit = textDocument.deleteBackward() { applyTextEdit(edit) }
+            return
         }
+        discardTextDocument()
         typeBackspace(modifiers: modifiers)
     }
 
-    /// Sends text an input method committed from its composition.
-    func commitComposedText(_ text: String) {
+    /// Sends what an input method committed from its composition.
+    func commitComposition(_ commit: RemoteTextInputDocument.Commit) {
         let modifiers = keyboardCapture.supplementalModifiers
-        if !modifiers.isEmpty { discardTextDocument() }
-        typeText(text, modifiers: modifiers)
+        guard !modifiers.isEmpty else {
+            applyTextEdit(commit.edit)
+            return
+        }
+        // A modifier chord is a shortcut, typed where the remote caret is.
+        discardTextDocument()
+        typeText(commit.text, modifiers: modifiers)
     }
 
     /// Retypes the end of the remote text after a keyboard replacement.

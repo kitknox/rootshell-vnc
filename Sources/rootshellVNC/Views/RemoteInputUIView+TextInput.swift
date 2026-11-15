@@ -40,12 +40,14 @@ extension RemoteInputUIView: UITextInput {
     // MARK: Composition
 
     func setMarkedText(_ markedText: String?, selectedRange: NSRange) {
-        textDocument.setMarked(markedText, selectedRange: selectedRange)
+        // Clearing a composition deletes the selection it had replaced.
+        guard let edit = textDocument.setMarked(markedText, selectedRange: selectedRange) else { return }
+        applyTextEdit(edit)
     }
 
     func unmarkText() {
-        guard let text = textDocument.unmark() else { return }
-        commitComposedText(text)
+        guard let commit = textDocument.unmark() else { return }
+        commitComposition(commit)
     }
 
     var markedTextRange: UITextRange? {
@@ -56,7 +58,7 @@ extension RemoteInputUIView: UITextInput {
 
     var selectedTextRange: UITextRange? {
         get { textRange(textDocument.selectedRange) }
-        // Only a composition has a selection to move; typed text is remote.
+        // The keyboard selects typed text to replace or delete it.
         set {
             guard let newValue, let range = currentRange(newValue) else { return }
             textDocument.select(range)
@@ -72,11 +74,11 @@ extension RemoteInputUIView: UITextInput {
 
     func replace(_ range: UITextRange, withText text: String) {
         guard let range = currentRange(range) else { return }
-        let wasComposing = textDocument.marked != nil
-        guard let edit = textDocument.replace(range, with: text) else { return }
-        if wasComposing {
-            commitComposedText(edit.text)
-        } else {
+        if textDocument.marked != nil {
+            // Replacing any of a composition commits the result.
+            guard let commit = textDocument.commitMarked(replacing: range, with: text) else { return }
+            commitComposition(commit)
+        } else if let edit = textDocument.replace(range, with: text) {
             applyTextEdit(edit)
         }
     }

@@ -13,93 +13,167 @@ struct RemoteTextInputDocument: Equatable, Sendable {
         var text: String
     }
 
+    /// A finished composition: the text the input method committed, and the
+    /// keys that put it where the composition was.
+    struct Commit: Equatable, Sendable {
+        var text: String
+        var edit: Edit
+    }
+
+    /// What the remote desktop holds. A composition is not in it yet.
     private(set) var committed = ""
     private(set) var marked: String?
     /// The input method's selection inside ``marked``, in UTF-16 offsets
     /// from its start. Empty and at the end unless it says otherwise.
     private(set) var markedSelection = NSRange(location: 0, length: 0)
+    /// The keyboard's selection inside ``committed`` in UTF-16 offsets, or
+    /// nil for a caret at the end, where the remote caret always is.
+    /// While composing it is what the composition replaces.
+    private var committedSelection: NSRange?
     /// Changes whenever the document is discarded, so ranges handed out
     /// before then can be told apart from current ones.
     private(set) var generation: UInt64 = 0
 
-    var text: String { committed + (marked ?? "") }
+    /// What the keyboard sees: the composition stands in for the selection
+    /// it replaces.
+    var text: String {
+        guard let marked else { return committed }
+        guard let target = committedSelection, let indices = Range(target, in: committed) else {
+            return committed + marked
+        }
+        return committed.replacingCharacters(in: indices, with: marked)
+    }
+
     var isEmpty: Bool { committed.isEmpty && marked == nil }
     var committedLength: Int { committed.utf16.count }
     var length: Int { text.utf16.count }
 
     var markedRange: NSRange? {
         guard let marked, !marked.isEmpty else { return nil }
-        return NSRange(location: committedLength, length: marked.utf16.count)
+        return NSRange(location: selectionStart, length: marked.utf16.count)
     }
 
-    /// Records text the keyboard inserted directly. It replaces any
-    /// composition, which the keyboard commits this way or abandons.
-    mutating func insert(_ text: String) {
+    /// Where the selection in ``committed`` starts, and so any composition.
+    private var selectionStart: Int { committedSelection?.location ?? committedLength }
+
+    /// True when inserted text lands after everything typed, so nothing
+    /// typed earlier is needed to place it.
+    var insertsAtEnd: Bool { committedSelection == nil }
+
+    /// Records text the keyboard inserted directly, replacing the selection.
+    /// It also replaces any composition, which the keyboard commits this way
+    /// or abandons.
+    @discardableResult
+    mutating func insert(_ text: String) -> Edit {
         clearMarked()
-        committed += text
+        return replaceSelection(with: text)
     }
 
     /// The selection in UTF-16 offsets into ``text``: the input method's own
-    /// while composing, otherwise a caret after everything typed.
+    /// while composing, otherwise the keyboard's, a caret after everything
+    /// typed unless it moved it.
     var selectedRange: NSRange {
-        guard marked != nil else { return NSRange(location: committedLength, length: 0) }
+        guard marked != nil else {
+            return committedSelection ?? NSRange(location: committedLength, length: 0)
+        }
         return NSRange(
-            location: committedLength + markedSelection.location,
+            location: selectionStart + markedSelection.location,
             length: markedSelection.length)
     }
 
-    /// Moves the selection, which is only possible inside a composition.
+    /// Moves the selection. While composing it stays inside the composition.
     mutating func select(_ range: NSRange) {
-        guard let marked, range.location >= committedLength else { return }
+        guard let marked else {
+            setCommittedSelection(Self.clamped(range, in: committed))
+            return
+        }
+        guard range.location >= selectionStart else { return }
         markedSelection = Self.clamped(
-            NSRange(location: range.location - committedLength, length: range.length),
+            NSRange(location: range.location - selectionStart, length: range.length),
             in: marked)
     }
 
-    /// Returns true when the deletion only edited the composition, so no
-    /// Backspace should reach the remote desktop.
-    mutating func deleteBackward() -> Bool {
+    /// Deletes the selection, or the character before the caret. Returns the
+    /// keys that do the same remotely, or nil when the deletion only edited
+    /// the composition.
+    mutating func deleteBackward() -> Edit? {
         if let current = marked, !current.isEmpty {
             let string = current as NSString
             var doomed = markedSelection
             if doomed.length == 0 {
                 // A caret at the start of the composition has nothing to delete.
-                guard doomed.location > 0 else { return true }
+                guard doomed.location > 0 else { return nil }
                 doomed = string.rangeOfComposedCharacterSequence(at: doomed.location - 1)
             }
             let shortened = string.replacingCharacters(in: doomed, with: "")
-            if shortened.isEmpty {
-                clearMarked()
-            } else {
+            guard shortened.isEmpty else {
                 marked = shortened
                 markedSelection = NSRange(location: doomed.location, length: 0)
+                return nil
             }
-            return true
+            return abandonMarked()
         }
         clearMarked()
-        if !committed.isEmpty { committed.removeLast() }
-        return false
+        guard var doomed = committedSelection else {
+            // The remote text may reach back further than what was typed here.
+            if !committed.isEmpty { committed.removeLast() }
+            return Edit(backspaces: 1, text: "")
+        }
+        let nothing = Edit(backspaces: 0, text: "")
+        if doomed.length == 0 {
+            // Text before the caret is still to its right remotely.
+            guard doomed.location > 0 else { return nothing }
+            doomed = (committed as NSString).rangeOfComposedCharacterSequence(at: doomed.location - 1)
+        }
+        return replace(doomed, with: "") ?? nothing
     }
 
-    /// `selectedRange` is relative to the start of `text`; a missing or
-    /// out-of-range one puts the caret at the end.
-    mutating func setMarked(_ text: String?, selectedRange: NSRange? = nil) {
+    /// Starts or updates the composition, which replaces the selection once
+    /// committed. `selectedRange` is relative to the start of `text`; a
+    /// missing or out-of-range one puts the caret at the end. Clearing a
+    /// composition returns the keys that delete the selection it replaced.
+    @discardableResult
+    mutating func setMarked(_ text: String?, selectedRange: NSRange? = nil) -> Edit? {
         guard let text, !text.isEmpty else {
-            clearMarked()
-            return
+            return marked == nil ? nil : abandonMarked()
         }
         marked = text
         let end = NSRange(location: text.utf16.count, length: 0)
         guard let selectedRange, selectedRange.location != NSNotFound else {
             markedSelection = end
-            return
+            return nil
         }
         markedSelection = Self.clamped(selectedRange, in: text)
+        return nil
     }
 
     private mutating func clearMarked() {
         marked = nil
         markedSelection = NSRange(location: 0, length: 0)
+    }
+
+    /// Drops the composition along with the selection it had replaced.
+    /// Returns nil when that selection was only a caret.
+    private mutating func abandonMarked() -> Edit? {
+        clearMarked()
+        guard let target = committedSelection, target.length > 0 else { return nil }
+        return replace(target, with: "")
+    }
+
+    /// Stores `range`, keeping a caret at the end as nil.
+    private mutating func setCommittedSelection(_ range: NSRange) {
+        let atEnd = range.length == 0 && range.location == committedLength
+        committedSelection = atEnd ? nil : range
+    }
+
+    /// Puts `text` in place of the selection, leaving a caret after it.
+    private mutating func replaceSelection(with text: String) -> Edit {
+        guard let selection = committedSelection, let edit = replace(selection, with: text) else {
+            committedSelection = nil
+            committed += text
+            return Edit(backspaces: 0, text: text)
+        }
+        return edit
     }
 
     /// Fits `range` inside `text` without splitting a character.
@@ -111,35 +185,38 @@ struct RemoteTextInputDocument: Equatable, Sendable {
         return Range(fitted, in: text) == nil ? end : fitted
     }
 
-    /// Ends the composition and returns the text it commits, if any.
-    mutating func unmark() -> String? {
+    /// Ends the composition, committing its text over the selection it
+    /// replaced. Returns nil when there was none.
+    mutating func unmark() -> Commit? {
         guard let text = marked else { return nil }
+        return commit(text)
+    }
+
+    /// Applies a keyboard replacement of `range` (UTF-16 offsets into
+    /// ``text``) inside the composition, which commits the result. Returns
+    /// nil, changing nothing, when the range reaches outside it.
+    mutating func commitMarked(replacing range: NSRange, with replacement: String) -> Commit? {
+        guard let current = marked, range.length >= 0 else { return nil }
+        let local = NSRange(location: range.location - selectionStart, length: range.length)
+        guard local.location >= 0, let indices = Range(local, in: current) else { return nil }
+        return commit(current.replacingCharacters(in: indices, with: replacement))
+    }
+
+    private mutating func commit(_ text: String) -> Commit {
         clearMarked()
-        guard !text.isEmpty else { return nil }
-        committed += text
-        return text
+        return Commit(text: text, edit: replaceSelection(with: text))
     }
 
     /// Applies a keyboard replacement of `range` (UTF-16 offsets into
     /// ``text``). Returns nil, changing nothing, when the range is not one
-    /// this document can honor.
+    /// this document can honor, or a composition is active.
     mutating func replace(_ range: NSRange, with replacement: String) -> Edit? {
-        let full = text
-        guard range.location >= 0, range.length >= 0,
+        let full = committed
+        guard marked == nil,
+              range.location >= 0, range.length >= 0,
               range.location <= full.utf16.count,
               range.length <= full.utf16.count - range.location,
               let indices = Range(range, in: full) else { return nil }
-
-        if let current = marked {
-            // Only the composition itself can change while one is active,
-            // and replacing any of it commits the result.
-            let local = NSRange(location: range.location - committedLength, length: range.length)
-            guard local.location >= 0, let localIndices = Range(local, in: current) else { return nil }
-            let text = current.replacingCharacters(in: localIndices, with: replacement)
-            clearMarked()
-            committed += text
-            return Edit(backspaces: 0, text: text)
-        }
 
         let result = full.replacingCharacters(in: indices, with: replacement)
         let shared = zip(full, result).prefix { $0 == $1 }.count
@@ -147,6 +224,18 @@ struct RemoteTextInputDocument: Equatable, Sendable {
             backspaces: full.count - shared,
             text: String(result.dropFirst(shared)))
         committed = result
+        if var selection = committedSelection {
+            let inserted = replacement.utf16.count
+            if selection.location >= range.location + range.length {
+                // Past the replacement: it moves with the text after it.
+                selection.location += inserted - range.length
+            } else if selection.location + selection.length > range.location {
+                // Overlapping it: what was selected is gone.
+                selection = NSRange(location: range.location + inserted, length: 0)
+            }
+            // Even an unmoved caret can now be at the end.
+            setCommittedSelection(selection)
+        }
         return edit
     }
 
@@ -170,6 +259,7 @@ struct RemoteTextInputDocument: Equatable, Sendable {
     mutating func reset() -> Bool {
         guard !isEmpty else { return false }
         committed = ""
+        committedSelection = nil
         clearMarked()
         generation &+= 1
         return true
