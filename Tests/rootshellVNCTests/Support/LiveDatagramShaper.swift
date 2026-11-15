@@ -13,6 +13,10 @@ final class LiveDatagramShaper: @unchecked Sendable {
         var downlinkBitsPerSecond: Int
         var queueMilliseconds: Int
         var oneWayDelayMilliseconds: Int
+        /// Behave like a port-preserving NAT in front of the client: a flow
+        /// carries downlink only once the client has sent on it, and server
+        /// media that arrives first takes the mapping for good.
+        var requiresUplinkFirst = false
     }
 
     struct Snapshot: Sendable {
@@ -21,6 +25,21 @@ final class LiveDatagramShaper: @unchecked Sendable {
         var droppedPackets = 0
         var droppedBytes = 0
         var maxQueueMilliseconds = 0.0
+        var uplinkPackets = 0
+        var blockedByNATPackets = 0
+        var openFlows = 0
+        var lostFlows = 0
+    }
+
+    private enum Mapping {
+        case none, open, lost
+    }
+
+    /// A datagram on a flow whose mapping is still undecided.
+    private struct Undecided {
+        let arrivalTicks: UInt64
+        let isUplink: Bool
+        let bytes: [UInt8]
     }
 
     private struct Flow {
@@ -91,10 +110,15 @@ final class LiveDatagramShaper: @unchecked Sendable {
 
     private func addFlow(host: String, remotePort: UInt16, localPort: UInt16) throws -> Int32 {
         let network = try Self.connectedSocket(host: host, remotePort: remotePort, localPort: localPort)
-        var pair: [Int32] = [0, 0]
-        guard socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0 else {
+        // Loopback UDP rather than a socketpair: AF_UNIX datagrams carry no
+        // kernel receive timestamp, and the NAT gate orders by arrival.
+        guard let pair = Self.loopbackPair() else {
             close(network)
-            throw VNCProtocolError.ioError("shaper socketpair failed: \(errno)")
+            throw VNCProtocolError.ioError("shaper loopback pair failed: \(errno)")
+        }
+        var one: Int32 = 1
+        for fd in [network, pair[1]] {
+            setsockopt(fd, SOL_SOCKET, SO_TIMESTAMP_MONOTONIC, &one, socklen_t(MemoryLayout<Int32>.size))
         }
         var big: Int32 = 4 * 1024 * 1024
         setsockopt(pair[1], SOL_SOCKET, SO_SNDBUF, &big, socklen_t(MemoryLayout<Int32>.size))
@@ -113,6 +137,85 @@ final class LiveDatagramShaper: @unchecked Sendable {
         var byte: UInt8 = 1
         _ = write(wake.write, &byte, 1)
         return pair[0]
+    }
+
+    /// Two UDP sockets on 127.0.0.1 connected to each other.
+    private static func loopbackPair() -> [Int32]? {
+        var fds: [Int32] = []
+        var ports: [in_port_t] = []
+        for _ in 0..<2 {
+            let fd = socket(AF_INET, SOCK_DGRAM, 0)
+            var address = loopbackAddress(port: 0)
+            var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let ready = fd >= 0 && withUnsafeMutablePointer(to: &address) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    bind(fd, $0, length) == 0 && getsockname(fd, $0, &length) == 0
+                }
+            }
+            if fd >= 0 { fds.append(fd) }
+            guard ready else {
+                fds.forEach { close($0) }
+                return nil
+            }
+            ports.append(address.sin_port)
+        }
+        for (fd, peerPort) in zip(fds, ports.reversed()) {
+            var peer = loopbackAddress(port: peerPort)
+            let connected = withUnsafePointer(to: &peer) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+                }
+            }
+            guard connected else {
+                fds.forEach { close($0) }
+                return nil
+            }
+        }
+        return fds
+    }
+
+    /// `port` is in network byte order.
+    private static func loopbackAddress(port: in_port_t) -> sockaddr_in {
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = port
+        address.sin_addr.s_addr = INADDR_LOOPBACK.bigEndian
+        return address
+    }
+
+    /// One datagram with its kernel arrival time in `mach_absolute_time` ticks.
+    private static func receive(
+        _ fd: Int32,
+        into buffer: inout [UInt8]
+    ) -> (bytes: [UInt8], arrivalTicks: UInt64)? {
+        var control = [UInt8](repeating: 0, count: 64)
+        let capacity = buffer.count
+        return buffer.withUnsafeMutableBytes { data in
+            control.withUnsafeMutableBytes { ancillary in
+                var vector = iovec(iov_base: data.baseAddress, iov_len: capacity)
+                return withUnsafeMutablePointer(to: &vector) { vectorPointer in
+                    var message = msghdr()
+                    message.msg_iov = vectorPointer
+                    message.msg_iovlen = 1
+                    message.msg_control = ancillary.baseAddress
+                    message.msg_controllen = socklen_t(ancillary.count)
+                    let count = recvmsg(fd, &message, 0)
+                    guard count > 0 else { return nil }
+                    var ticks = mach_absolute_time()
+                    let headerSize = MemoryLayout<cmsghdr>.size
+                    if Int(message.msg_controllen) >= headerSize + 8 {
+                        let header = ancillary.load(as: cmsghdr.self)
+                        if header.cmsg_level == SOL_SOCKET,
+                           header.cmsg_type == SCM_TIMESTAMP_MONOTONIC {
+                            ticks = ancillary.loadUnaligned(
+                                fromByteOffset: headerSize, as: UInt64.self)
+                        }
+                    }
+                    return (Array(data.prefix(count)), ticks)
+                }
+            }
+        }
     }
 
     private static func connectedSocket(host: String, remotePort: UInt16, localPort: UInt16) throws -> Int32 {
@@ -166,6 +269,8 @@ final class LiveDatagramShaper: @unchecked Sendable {
 
     private func run() {
         var buffer = [UInt8](repeating: 0, count: 65_536)
+        var mappings: [Mapping] = []
+        var undecided: [[Undecided]] = []
         while true {
             lock.lock()
             if stopped {
@@ -173,6 +278,9 @@ final class LiveDatagramShaper: @unchecked Sendable {
                 return
             }
             let current = flows
+            let gated = configuration.requiresUplinkFirst
+            mappings += Array(repeating: .none, count: current.count - mappings.count)
+            undecided += Array(repeating: [], count: current.count - undecided.count)
             let nextDelivery = queueHead < queue.count ? queue[queueHead].deliverNanos : nil
             lock.unlock()
 
@@ -186,26 +294,62 @@ final class LiveDatagramShaper: @unchecked Sendable {
                 let now = DispatchTime.now().uptimeNanoseconds
                 timeout = nextDelivery <= now ? 0 : Int32(min(50, (nextDelivery - now) / 1_000_000 + 1))
             }
+            if undecided.contains(where: { !$0.isEmpty }) { timeout = min(timeout, 1) }
             _ = poll(&pollFDs, nfds_t(pollFDs.count), timeout)
 
             if pollFDs[0].revents != 0 {
                 while read(wake.read, &buffer, buffer.count) > 0 {}
             }
             for (index, flow) in current.enumerated() {
-                if pollFDs[1 + index * 2].revents & Int16(POLLIN) != 0 {
-                    while true {
-                        let count = recv(flow.network, &buffer, buffer.count, 0)
-                        guard count > 0 else { break }
-                        enqueue(flow: index, bytes: Array(buffer[0..<count]))
+                func downlink(_ bytes: [UInt8]) {
+                    if !gated || mappings[index] == .open {
+                        enqueue(flow: index, bytes: bytes)
+                        return
+                    }
+                    lock.lock()
+                    if mappings[index] == .none { stats.lostFlows += 1 }
+                    stats.blockedByNATPackets += 1
+                    lock.unlock()
+                    mappings[index] = .lost
+                }
+                func uplink(_ bytes: [UInt8]) {
+                    lock.lock()
+                    stats.uplinkPackets += 1
+                    if mappings[index] == .none { stats.openFlows += 1 }
+                    lock.unlock()
+                    if mappings[index] == .none { mappings[index] = .open }
+                    _ = send(flow.network, bytes, bytes.count, 0)
+                }
+
+                // Which side sent first decides the mapping for good, so go
+                // by kernel arrival time, not by which socket is read first.
+                // Everything that arrived before `settled` is in hand once
+                // both sockets are drained; later arrivals wait a pass.
+                let ordering = gated && mappings[index] == .none
+                let settled = mach_absolute_time()
+                while let packet = Self.receive(flow.network, into: &buffer) {
+                    if ordering {
+                        undecided[index].append(Undecided(
+                            arrivalTicks: packet.arrivalTicks, isUplink: false, bytes: packet.bytes))
+                    } else {
+                        downlink(packet.bytes)
                     }
                 }
-                if pollFDs[2 + index * 2].revents & Int16(POLLIN) != 0 {
-                    while true {
-                        let count = recv(flow.local, &buffer, buffer.count, 0)
-                        guard count > 0 else { break }
-                        _ = send(flow.network, buffer, count, 0)
+                while let packet = Self.receive(flow.local, into: &buffer) {
+                    if ordering {
+                        undecided[index].append(Undecided(
+                            arrivalTicks: packet.arrivalTicks, isUplink: true, bytes: packet.bytes))
+                    } else {
+                        uplink(packet.bytes)
                     }
                 }
+                guard ordering, !undecided[index].isEmpty else { continue }
+                undecided[index].sort { $0.arrivalTicks < $1.arrivalTicks }
+                guard undecided[index][0].arrivalTicks < settled else { continue }
+                for packet in undecided[index] {
+                    if packet.isUplink { uplink(packet.bytes) } else { downlink(packet.bytes) }
+                }
+                undecided[index].removeAll()
             }
             deliverDue(flows: current)
         }

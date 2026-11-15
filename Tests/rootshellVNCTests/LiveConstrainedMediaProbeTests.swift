@@ -18,6 +18,9 @@ import RFBProtocol
 ///   VNC_PROBE_CONSTRAINED=1 VNC_PROBE_DOWNLINK_SCHEDULE=0:20000,20:4000 \
 ///   swift test --filter LiveConstrainedMediaProbeTests
 ///
+/// VNC_PROBE_NAT=1 puts a port-preserving NAT in front of the media sockets
+/// and fails unless video still arrives.
+///
 /// Optional: VNC_PROBE_LOGIN=1 (type the password at the lock screen),
 /// VNC_PROBE_SECONDS=40, VNC_PROBE_QUEUE_MS=150, VNC_PROBE_DELAY_MS=0,
 /// ROOTSHELL_VNC_FRAME_OUT_DIR=... with VNC_PROBE_DUMP_EVERY=5.
@@ -41,11 +44,14 @@ final class LiveConstrainedMediaProbeTests: XCTestCase {
         let schedule = Self.parseSchedule(env["VNC_PROBE_DOWNLINK_SCHEDULE"])
         let queueMS = Int(env["VNC_PROBE_QUEUE_MS"] ?? "150") ?? 150
         let delayMS = Int(env["VNC_PROBE_DELAY_MS"] ?? "0") ?? 0
-        let shaper = schedule.first.map {
+        let behindNAT = env["VNC_PROBE_NAT"] == "1"
+        let unshapedKbps = 1_000_000
+        let shaper = (schedule.first?.kbps ?? (behindNAT ? unshapedKbps : nil)).map {
             LiveDatagramShaper(configuration: .init(
-                downlinkBitsPerSecond: $0.kbps * 1_000,
+                downlinkBitsPerSecond: $0 * 1_000,
                 queueMilliseconds: queueMS,
-                oneWayDelayMilliseconds: delayMS))
+                oneWayDelayMilliseconds: delayMS,
+                requiresUplinkFirst: behindNAT))
         }
 
         let hp: [Encoding] = [
@@ -145,7 +151,8 @@ final class LiveConstrainedMediaProbeTests: XCTestCase {
                 shaper?.update(.init(
                     downlinkBitsPerSecond: step.kbps * 1_000,
                     queueMilliseconds: queueMS,
-                    oneWayDelayMilliseconds: delayMS))
+                    oneWayDelayMilliseconds: delayMS,
+                    requiresUplinkFirst: behindNAT))
                 probe.note(">>> downlink \(step.kbps) kbps")
             }
             try await Task.sleep(for: .seconds(1))
@@ -177,6 +184,12 @@ final class LiveConstrainedMediaProbeTests: XCTestCase {
         probe.note(String(
             format: "SUMMARY rx avg %.2f Mbps peak %.2f Mbps, decoded avg %.1f fps",
             average, rateSamples.max() ?? 0, averageFPS))
+        if behindNAT, let nat = shaper?.snapshot() {
+            probe.note("NAT flows open=\(nat.openFlows) lost=\(nat.lostFlows) "
+                + "uplink=\(nat.uplinkPackets) blocked=\(nat.blockedByNATPackets)")
+            XCTAssertEqual(nat.lostFlows, 0, "server media reached the NAT before the client opened a mapping")
+            XCTAssertGreaterThan(probe.byteTotal(), 0, "no media arrived through the NAT")
+        }
         eventTask.cancel()
         await session.disconnect()
         manager.stopStream()

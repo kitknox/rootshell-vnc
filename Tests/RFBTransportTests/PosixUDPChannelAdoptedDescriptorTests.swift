@@ -29,6 +29,33 @@ final class PosixUDPChannelAdoptedDescriptorTests: XCTestCase {
         await channel.close()
     }
 
+    /// The keepalive that opens a NAT mapping keys off these two readings.
+    func testChannelReportsSendIdleTimeAndFirstReceive() async throws {
+        var fds: [Int32] = [-1, -1]
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_DGRAM, 0, &fds), 0)
+        let peer = fds[1]
+        defer { close(peer) }
+
+        let channel = PosixUDPChannel(adoptingConnectedDescriptor: fds[0], label: "pair")
+        try await channel.start()
+        var idle = await channel.nanosecondsSinceLastSend
+        var received = await channel.hasReceivedDatagram
+        XCTAssertNil(idle)
+        XCTAssertFalse(received)
+
+        try await channel.send(Data([1]))
+        idle = await channel.nanosecondsSinceLastSend
+        XCTAssertNotNil(idle)
+        XCTAssertLessThan(idle ?? .max, 5_000_000_000)
+
+        XCTAssertEqual(Darwin.send(peer, [7] as [UInt8], 1, 0), 1)
+        _ = try await channel.receive()
+        received = await channel.hasReceivedDatagram
+        XCTAssertTrue(received)
+
+        await channel.close()
+    }
+
     func testStartAfterCloseThrows() async {
         var fds: [Int32] = [-1, -1]
         XCTAssertEqual(socketpair(AF_UNIX, SOCK_DGRAM, 0, &fds), 0)

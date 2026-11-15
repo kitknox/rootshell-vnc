@@ -486,6 +486,7 @@ public actor TransportSession {
     private var framebufferCreditWaiter: CheckedContinuation<Void, Never>?
     private let maxUnacknowledgedUpdates = 1
     private var udpReadTasks: [Task<Void, Never>] = []
+    private var udpKeepaliveTasks: [Task<Void, Never>] = []
     private var udpChannels: [PosixUDPChannel] = []
     private let log = VNCLogger(category: "TransportSession")
     /// The profile requested Apple's accelerated media mode. It becomes active
@@ -6208,6 +6209,9 @@ public actor TransportSession {
             )
         }
         try await channel.start()
+        // Must leave before this returns: the caller answers the offer next,
+        // and server media that reaches a NAT first takes the port mapping.
+        try? await channel.send(Self.appleMediaUDPKeepaliveDatagram)
         udpChannels.append(channel)
         let actualPort = await channel.localPort ?? binding.localPort ?? 0
         continuation?.yield(.appleMediaUDPStarted(localPort: actualPort))
@@ -6229,6 +6233,36 @@ public actor TransportSession {
             }
         }
         udpReadTasks.append(readTask)
+        startAppleMediaUDPKeepalive(on: channel)
+    }
+
+    /// An empty Receiver Report with no SRTCP trailer: the peer discards it,
+    /// but a NAT or stateful firewall on the path records the flow.
+    private nonisolated static let appleMediaUDPKeepaliveDatagram = Data(
+        [0x80, 0xC9, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00])
+
+    /// The server addresses media to the TCP peer on the offered port and
+    /// every other send here answers a received packet, so behind a NAT
+    /// nothing would open the return path. Channel setup sends the first
+    /// datagram; this repeats it twice a second until media arrives, then
+    /// only when the channel has been silent for 15 s.
+    private func startAppleMediaUDPKeepalive(on channel: PosixUDPChannel) {
+        let task = Task { [channel] in
+            let started = DispatchTime.now().uptimeNanoseconds
+            var opening = true
+            while !Task.isCancelled {
+                try? await Task.sleep(for: opening ? .milliseconds(500) : .seconds(5))
+                if Task.isCancelled { return }
+                let age = DispatchTime.now().uptimeNanoseconds &- started
+                let received = await channel.hasReceivedDatagram
+                opening = age < 10_000_000_000 && !received
+                let idle = await channel.nanosecondsSinceLastSend
+                if opening || idle.map({ $0 >= 15_000_000_000 }) ?? true {
+                    try? await channel.send(Self.appleMediaUDPKeepaliveDatagram)
+                }
+            }
+        }
+        udpKeepaliveTasks.append(task)
     }
 
     /// Keep a socket-drain batch on this actor until every packet has been
@@ -6316,6 +6350,10 @@ public actor TransportSession {
             task.cancel()
         }
         udpReadTasks.removeAll()
+        for task in udpKeepaliveTasks {
+            task.cancel()
+        }
+        udpKeepaliveTasks.removeAll()
 
         for channel in udpChannels {
             await channel.close()
