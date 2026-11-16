@@ -1,6 +1,13 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "Switch Keyboard Language" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Switch Keyboard Language" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "키보드 언어 전환" } }
+      }
+    },
     "%@ of %@" : {
       "localizations" : {
         "ar" : {

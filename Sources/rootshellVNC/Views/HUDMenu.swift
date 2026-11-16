@@ -228,6 +228,15 @@ struct HUDMenu<SessionActions: View, SessionDisplay: View>: View {
                 shortcutButtons(RemoteMenuShortcut.documents, platform: platform)
             }
             Menu(String(localized: "Special Keys", bundle: .module)) {
+                if keyboardCapture.canSwitchLocalInputSource {
+                    Button {
+                        keyboardCapture.switchLocalInputSource()
+                    } label: {
+                        Label(
+                            String(localized: "Switch Keyboard Language", bundle: .module),
+                            systemImage: "globe")
+                    }
+                }
                 shortcutButtons(RemoteMenuShortcut.keys, platform: platform)
                 commandButtons(RemoteCommand.keys)
             }
