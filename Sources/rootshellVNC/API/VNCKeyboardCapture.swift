@@ -179,9 +179,19 @@ public final class VNCKeyboardCapture {
     /// explicit menu commands and toolbar modifiers keep their original meaning.
     public var controlOptionAsCommand: Bool = true
 
-    /// Caps Lock and Control-Space cycle these installed languages on iPhone/iPad.
-    /// Requires two matches; physical-key hosts and Mac Catalyst ignore it.
-    public var localInputSourceLanguages: [String] = []
+    /// On iOS, send Control-Space to the remote computer. When false, cycle
+    /// installed input languages locally. Physical-key hosts and Catalyst ignore it.
+    public var routesControlSpaceToRemote = true {
+        didSet { onInputSourceRoutingChanged?() }
+    }
+
+    /// Opt in to using Caps Lock for local language switching on iOS.
+    /// Hold Caps Lock or use Shift-Caps Lock for case locking. Requires two languages.
+    public var capsLockSwitchesInputSource = false {
+        didSet { onInputSourceRoutingChanged?() }
+    }
+
+    @ObservationIgnored var onInputSourceRoutingChanged: (@MainActor () -> Void)?
 
     public internal(set) var canSwitchLocalInputSource = false
     @ObservationIgnored var onSwitchLocalInputSource: (@MainActor () -> Void)?

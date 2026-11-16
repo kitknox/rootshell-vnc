@@ -4,13 +4,13 @@ struct LocalInputSourceState {
     private(set) var capsLockIsDown = false
     private(set) var compensatesCapsLock = false
     private(set) var uppercaseLocked = false
+    private var capsLockPressedAt: TimeInterval?
+    static let capsLockHoldDuration: TimeInterval = 0.5
 
-    static func matchingLanguages(preferences: [String], available: [String]) -> [String] {
+    static func availableLanguages(_ available: [String]) -> [String] {
         var result: [String] = []
-        for preference in preferences {
-            let match = available.first { $0 == preference }
-                ?? available.first { $0.hasPrefix(preference + "-") }
-            if let match, !result.contains(match) { result.append(match) }
+        for language in available where !language.isEmpty && language != "emoji" && language != "dictation" {
+            if !result.contains(language) { result.append(language) }
         }
         return result
     }
@@ -23,15 +23,36 @@ struct LocalInputSourceState {
         return languages[(index + 1) % languages.count]
     }
 
-    mutating func pressCapsLock(shift: Bool) -> Bool {
+    mutating func pressCapsLock(shift: Bool, at time: TimeInterval) -> Bool {
         guard !capsLockIsDown else { return false }
         capsLockIsDown = true
         compensatesCapsLock = true
         if shift { uppercaseLocked.toggle() }
-        return !shift
+        capsLockPressedAt = shift ? nil : time
+        return true
     }
 
-    mutating func releaseCapsLock() { capsLockIsDown = false }
+    mutating func holdCapsLock(at time: TimeInterval) {
+        guard let start = capsLockPressedAt, time - start >= Self.capsLockHoldDuration else { return }
+        capsLockPressedAt = nil
+        uppercaseLocked.toggle()
+    }
+
+    mutating func releaseCapsLock(at time: TimeInterval) -> Bool {
+        holdCapsLock(at: time)
+        var switchesLanguage = capsLockPressedAt != nil
+        if switchesLanguage, uppercaseLocked {
+            uppercaseLocked = false
+            switchesLanguage = false
+        }
+        releaseCapsLock()
+        return switchesLanguage
+    }
+
+    mutating func releaseCapsLock() {
+        capsLockIsDown = false
+        capsLockPressedAt = nil
+    }
 
     // Consuming Caps Lock can still latch the OS state. Correct letters, not symbols.
     func hardwareCharacters(_ characters: String, shift: Bool) -> String {
