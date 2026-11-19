@@ -788,7 +788,22 @@ public final class VNCSession {
     /// The public single callbacks above remain for hosts that consume raw
     /// clipboard events themselves.
     @ObservationIgnored
-    private var serverClipboardObservers: [UUID: (VNCClipboardContent) -> Void] = [:]
+    private var serverClipboardObservers: [UUID: (ClipboardEvent) -> Void] = [:]
+    @ObservationIgnored
+    private var viewerClipboardRequestID = AppleClipboardRequestID.viewerBit
+
+    enum ClipboardEvent {
+        case content(VNCClipboardContent)
+        case key(down: Bool, keysym: UInt32)
+        case pointer(buttonMask: UInt8)
+        case requestFailed(UInt32)
+        case requestStarted(UInt32, changeNotice: Bool, localUploadPending: Bool = false)
+        case reply(UInt32, VNCClipboardContent?)
+    }
+
+    private func notifyClipboardObservers(_ event: ClipboardEvent) {
+        for observer in serverClipboardObservers.values { observer(event) }
+    }
     @ObservationIgnored
     private var connectionStateObservers: [UUID: (VNCConnectionState) -> Void] = [:]
     @ObservationIgnored
@@ -943,6 +958,8 @@ public final class VNCSession {
     private var inputGeneration: UInt64 = 0
     @ObservationIgnored
     private var inputQueue = SessionInputQueue()
+    @ObservationIgnored
+    private var pendingClipboardUploads = 0
     private let diagnostics = ConnectionDiagnostics()
     private let logger = VNCLogger(category: "Session")
     /// GPU renderer for the high-performance HEVC screen bands. The
@@ -1475,7 +1492,7 @@ public final class VNCSession {
                 enqueueInput(event)
             case .pointer(let buttonMask, let x, let y):
                 sendPointerEvent(buttonMask: buttonMask, x: x, y: y)
-            case .scroll, .gesture, .clipboard, .fileTransfer, .clipboardRequest,
+            case .scroll, .gesture, .clipboard, .fileTransfer, .clipboardRequest, .appleClipboardRequest,
                  .sharedClipboard, .curtain:
                 assertionFailure("Unexpected event in login password sequence")
             }
@@ -1574,6 +1591,15 @@ public final class VNCSession {
             )
         }
 
+        #if os(macOS) || targetEnvironment(macCatalyst)
+        if diagnostics.clientVersion?.isApple == true {
+            // Queue a baseline before key-down and the resulting snapshot after key-up.
+            if downFlag { notifyClipboardObservers(.key(down: true, keysym: key)) }
+            enqueueInput(.key(downFlag: downFlag, keysym: key))
+            if !downFlag { notifyClipboardObservers(.key(down: false, keysym: key)) }
+            return
+        }
+        #endif
         enqueueInput(.key(downFlag: downFlag, keysym: key))
     }
 
@@ -1586,6 +1612,11 @@ public final class VNCSession {
     ///   - y: The Y coordinate in framebuffer pixels.
     public func sendPointerEvent(buttonMask: UInt8, x: UInt16, y: UInt16) {
         guard connectionState.isConnected, transportSession != nil else { return }
+        #if os(macOS) || targetEnvironment(macCatalyst)
+        if diagnostics.clientVersion?.isApple == true {
+            notifyClipboardObservers(.pointer(buttonMask: buttonMask))
+        }
+        #endif
         fileTransfers.observePointer(buttonMask: buttonMask, x: x, y: y)
 
         if isTraceEnabled {
@@ -1652,6 +1683,7 @@ public final class VNCSession {
             )
         }
 
+        pendingClipboardUploads += 1
         enqueueInput(.clipboard(content))
     }
 
@@ -1661,6 +1693,16 @@ public final class VNCSession {
               transportSession != nil,
               supportsRemoteClipboardRequest else { return }
         enqueueInput(.clipboardRequest)
+    }
+
+    /// Queue command 11 alongside input so a baseline precedes its click and
+    /// a copy fetch follows its keystroke. The reply echoes this exact ID.
+    func requestAppleClipboard() -> UInt32? {
+        guard connectionState.isConnected, transportSession != nil,
+              diagnostics.clientVersion?.isApple == true else { return nil }
+        viewerClipboardRequestID = (viewerClipboardRequestID &+ 1) | AppleClipboardRequestID.viewerBit
+        enqueueInput(.appleClipboardRequest(viewerClipboardRequestID))
+        return viewerClipboardRequestID
     }
 
     /// Control Apple's server-side automatic pasteboard notifications.
@@ -1725,8 +1767,22 @@ public final class VNCSession {
         curtainChangeFailed = false
     }
 
+    private func publishServerClipboard(_ content: VNCClipboardContent) {
+        if isTraceEnabled {
+            diagnostics.protocolTrace.recordReceived(
+                type: "ServerClipboard",
+                data: Data((content.plainText ?? "").utf8),
+                details: content.summary
+            )
+        }
+        if let text = content.plainText {
+            onServerClipboardText?(text)
+        }
+        onServerClipboardContent?(content)
+    }
+
     func addServerClipboardObserver(
-        _ observer: @escaping (VNCClipboardContent) -> Void
+        _ observer: @escaping (ClipboardEvent) -> Void
     ) -> UUID {
         let id = UUID()
         serverClipboardObservers[id] = observer
@@ -1970,22 +2026,19 @@ public final class VNCSession {
             }
 
         case .clipboardContent(let content):
-            if isTraceEnabled {
-                diagnostics.protocolTrace.recordReceived(
-                    type: "ServerClipboard",
-                    data: Data((content.plainText ?? "").utf8),
-                    details: content.summary
-                )
+            publishServerClipboard(content)
+            notifyClipboardObservers(.content(content))
+
+        case .appleClipboardRequestStarted(let id, let changeNotice):
+            notifyClipboardObservers(.requestStarted(
+                id, changeNotice: changeNotice, localUploadPending: pendingClipboardUploads > 0))
+            if changeNotice { enqueueInput(.appleClipboardRequest(id)) }
+
+        case .appleClipboardReply(let id, let content):
+            if let content, !AppleClipboardRequestID.isViewerRequest(id) {
+                publishServerClipboard(content)
             }
-            if let text = content.plainText {
-                onServerClipboardText?(text)
-            }
-            onServerClipboardContent?(content)
-            // Snapshot the callbacks so observers may invalidate themselves
-            // safely while handling an event.
-            for observer in Array(serverClipboardObservers.values) {
-                observer(content)
-            }
+            notifyClipboardObservers(.reply(id, content))
 
         case .clipboardCapabilitiesChanged:
             await refreshClipboardCapabilities(from: transport)
@@ -3524,7 +3577,7 @@ public final class VNCSession {
         }
 
         startEventProcessing(transport: transport)
-        try await transport.connect()
+        try await transport.connectReportingAppleClipboardReplies()
     }
 
     /// - Parameters:
@@ -3710,6 +3763,7 @@ public final class VNCSession {
                             "Failed to send clipboard: "
                                 + error.localizedDescription)
                     }
+                    if self.inputGeneration == generation { self.pendingClipboardUploads -= 1 }
                 case .fileTransfer(let message):
                     do {
                         try await transport.sendAppleFileTransferMessage(message)
@@ -3717,6 +3771,15 @@ public final class VNCSession {
                         self.logger.warning(
                             "Failed to send file transfer message: "
                                 + error.localizedDescription)
+                    }
+                case .appleClipboardRequest(let id):
+                    do {
+                        try await transport.requestAppleClipboard(id: id)
+                    } catch {
+                        if self.transportSession === transport {
+                            self.notifyClipboardObservers(.requestFailed(id))
+                        }
+                        self.logger.warning("Failed to request Apple clipboard: " + error.localizedDescription)
                     }
                 case .clipboardRequest:
                     do {
@@ -3836,7 +3899,7 @@ public final class VNCSession {
             return .key(downFlag: downFlag, key: keysym)
         case .pointer(let buttonMask, let x, let y):
             return .pointer(buttonMask: buttonMask, x: x, y: y)
-        case .pause, .scroll, .gesture, .clipboard, .fileTransfer, .clipboardRequest,
+        case .pause, .scroll, .gesture, .clipboard, .fileTransfer, .clipboardRequest, .appleClipboardRequest,
              .sharedClipboard, .curtain:
             return nil
         }
@@ -3847,6 +3910,7 @@ public final class VNCSession {
         inputTask?.cancel()
         inputTask = nil
         inputQueue.removeAll()
+        pendingClipboardUploads = 0
     }
 
     /// A suspended app keeps its socket open, so the Mac removes a Standard

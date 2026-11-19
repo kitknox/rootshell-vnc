@@ -203,6 +203,10 @@ public enum SessionEvent: Sendable {
 
     /// The server's clipboard changed.
     case clipboardContent(ClipboardContent)
+    /// Identifies an ordinary get. For a change notice the viewer queues the fetch with its input.
+    case appleClipboardRequestStarted(id: UInt32, changeNotice: Bool)
+    /// A complete packed reply. Nil means there was no usable representation.
+    case appleClipboardReply(UInt32, ClipboardContent?)
 
     /// ExtendedClipboard caps arrived, changing ``TransportSession/clipboardContentSupport``
     /// and the remote-clipboard request flags.
@@ -777,6 +781,19 @@ public actor TransportSession {
     private var fileTransferCreditWaiter: CheckedContinuation<Void, Never>?
     static let maximumOutstandingFileTransferBytes = 8 * 1024 * 1024
     private var appleClipboardRequestID: UInt32 = 0
+    private var reportsAppleClipboardReplies = false
+
+    /// The viewer consumes correlated replies. Direct transport clients keep
+    /// receiving ordinary clipboardContent events.
+    package func connectReportingAppleClipboardReplies() async throws {
+        reportsAppleClipboardReplies = true
+        try await connect()
+    }
+
+    package func requestAppleClipboard(id: UInt32) async throws {
+        try await sendClientPayload(AppleClipboardProtocol.requestMessage(requestID: id))
+    }
+
     private var sharedClipboardEnabled = false
     /// A negative cut-text length means ExtendedClipboard only after a
     /// SetEncodings carrying the pseudo-encoding.
@@ -1305,6 +1322,10 @@ public actor TransportSession {
 
     /// Ask the server for its current clipboard.
     public func requestRemoteClipboard() async throws {
+        try await requestRemoteClipboard(forChangeNotice: false)
+    }
+
+    private func requestRemoteClipboard(forChangeNotice: Bool) async throws {
         guard supportsRemoteClipboardRequest else { return }
         if let extendedClipboard {
             let announced = extendedClipboard.announcedFormats ?? []
@@ -1316,9 +1337,19 @@ public actor TransportSession {
                 ExtendedClipboardProtocol.clientMessage(.request(wanted)))
             return
         }
-        appleClipboardRequestID &+= 1
-        try await sendClientPayload(AppleClipboardProtocol.requestMessage(
-            requestID: appleClipboardRequestID))
+        appleClipboardRequestID = (appleClipboardRequestID &+ 1) & ~AppleClipboardRequestID.viewerBit
+        let id = appleClipboardRequestID
+        if reportsAppleClipboardReplies {
+            continuation?.yield(.appleClipboardRequestStarted(id: id, changeNotice: forChangeNotice))
+            // The viewer orders this read after clipboard writes already queued on its input pump.
+            if forChangeNotice { return }
+        }
+        do {
+            try await requestAppleClipboard(id: id)
+        } catch {
+            if reportsAppleClipboardReplies { continuation?.yield(.appleClipboardReply(id, nil)) }
+            throw error
+        }
     }
 
     /// Enable or disable automatic remote-clipboard updates: Apple's server
@@ -3021,9 +3052,10 @@ public actor TransportSession {
                 "Apple clipboard size is out of range")
         }
 
+        let requestID = AppleClipboardProtocol.uint32BE(header, at: header.startIndex + 3)!
         let compressed = try await readControlChannel(exactly: compressedLength)
         decodeApplePackedClipboard(
-            compressed,
+            compressed, requestID: requestID,
             uncompressedLength: uncompressedLength)
     }
 
@@ -3065,7 +3097,7 @@ public actor TransportSession {
         _ = try await readControlChannel(exactly: 7)
         guard sharedClipboardEnabled else { return }
         do {
-            try await requestRemoteClipboard()
+            try await requestRemoteClipboard(forChangeNotice: true)
         } catch {
             // Clipboard synchronization is auxiliary. A failed automatic
             // request must not terminate an otherwise healthy display session.
@@ -3080,21 +3112,23 @@ public actor TransportSession {
     /// the screen-sharing connection.
     private func decodeApplePackedClipboard(
         _ compressed: Data,
+        requestID: UInt32,
         uncompressedLength: Int
     ) {
-        do {
-            let content = try AppleClipboardProtocol.unpackContent(
-                compressed: compressed,
-                uncompressedSize: uncompressedLength)
-            if content.isEmpty {
-                log.debug("Apple clipboard contained no supported flavor")
-            } else {
-                continuation?.yield(.clipboardContent(content))
+        var content: ClipboardContent?
+        if !compressed.isEmpty || uncompressedLength != 0 {
+            do {
+                let decoded = try AppleClipboardProtocol.unpackContent(
+                    compressed: compressed, uncompressedSize: uncompressedLength)
+                if !decoded.isEmpty { content = decoded }
+            } catch {
+                log.warning("Ignoring unsupported Apple clipboard payload: " + error.localizedDescription)
             }
-        } catch {
-            log.warning(
-                "Ignoring unsupported Apple clipboard payload: "
-                    + error.localizedDescription)
+        }
+        if reportsAppleClipboardReplies {
+            continuation?.yield(.appleClipboardReply(requestID, content))
+        } else if let content {
+            continuation?.yield(.clipboardContent(content))
         }
     }
 
@@ -4659,7 +4693,7 @@ public actor TransportSession {
                 appleDecryptedRFBBuffer.removeSubrange(base..<base + 8)
                 if sharedClipboardEnabled {
                     do {
-                        try await requestRemoteClipboard()
+                        try await requestRemoteClipboard(forChangeNotice: true)
                     } catch {
                         log.warning(
                             "Unable to request changed Apple clipboard: "
@@ -5015,11 +5049,12 @@ public actor TransportSession {
         guard messageEnd <= appleDecryptedRFBBuffer.endIndex else {
             return false
         }
+        let requestID = AppleClipboardProtocol.uint32BE(appleDecryptedRFBBuffer, at: base + 4)!
         let compressed = Data(appleDecryptedRFBBuffer[
             base + headerSize..<messageEnd])
         appleDecryptedRFBBuffer.removeSubrange(base..<messageEnd)
         decodeApplePackedClipboard(
-            compressed,
+            compressed, requestID: requestID,
             uncompressedLength: uncompressedLength)
         return true
     }

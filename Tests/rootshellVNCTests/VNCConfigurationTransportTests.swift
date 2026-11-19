@@ -1,7 +1,7 @@
 import XCTest
 import CoreGraphics
 import RFBProtocol
-import RFBTransport
+@testable import RFBTransport
 @testable import rootshellVNC
 
 /// Minimal transport stub: dialing succeeds at the provider level and the
@@ -79,17 +79,33 @@ private actor SuccessfulRFBConnection: RFBConnection {
     private var readOffset = 0
     private var closed = false
     private var readWaiters: [CheckedContinuation<Void, Never>] = []
+    private var shouldPauseClipboardUpload = false
+    private var pausedClipboardUpload: CheckedContinuation<Void, Never>?
+
+    func pauseClipboardUpload() {
+        shouldPauseClipboardUpload = true
+    }
+
+    func resumeClipboardUpload() {
+        shouldPauseClipboardUpload = false
+        pausedClipboardUpload?.resume()
+        pausedClipboardUpload = nil
+    }
+
+    private(set) var clipboardRequests: [Data] = []
+    private(set) var keyAndClipboardBytes = Data()
     private var sentFramebufferUpdateRequests = 0
     private var latestFramebufferUpdateRequest: Data?
     private let recordsFramebufferUpdateRequests: Bool
 
     init(
         name: String,
+        version: ProtocolVersion = .v3_8,
         width: UInt16 = 1024,
         height: UInt16 = 768,
         recordsFramebufferUpdateRequests: Bool = false
     ) {
-        var script = Data("RFB 003.008\n".utf8)
+        var script = version.wireBytes()
         script.append(contentsOf: [1, SecurityType.none.rawValue])
         script.append(contentsOf: [0, 0, 0, 0])
         script.append(Self.serverInitMessage(
@@ -126,6 +142,15 @@ private actor SuccessfulRFBConnection: RFBConnection {
 
     func send(_ data: Data) async throws {
         if closed { throw VNCProtocolError.connectionClosed }
+        if data.first == 6, shouldPauseClipboardUpload {
+            await withCheckedContinuation { pausedClipboardUpload = $0 }
+        }
+        if data.count == 8, data.first == 11 {
+            clipboardRequests.append(data)
+            keyAndClipboardBytes.append(data)
+        } else if data.first == 4 {
+            keyAndClipboardBytes.append(data)
+        }
         if recordsFramebufferUpdateRequests, data.first == 3 {
             sentFramebufferUpdateRequests += 1
             latestFramebufferUpdateRequest = data
@@ -361,6 +386,108 @@ final class VNCConfigurationTransportTests: XCTestCase {
         XCTAssertEqual(calls.first?.host, "vnc.internal")
         XCTAssertEqual(calls.first?.port, 5901)
     }
+
+    #if os(macOS) || targetEnvironment(macCatalyst)
+    @MainActor
+    func testNativeSessionCopyRequestsAppleClipboardWithoutDesktopView() async throws {
+        let connection = SuccessfulRFBConnection(name: "Mac", version: .apple)
+        var configuration = VNCConfiguration(videoQualityMode: .standard)
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+        let sync = VNCClipboardSynchronizer(session: session)
+        defer {
+            sync.invalidate()
+            session.disconnect()
+        }
+        try await session.connect(credentials: VNCCredentials(host: "apple.test", port: 5900, password: ""))
+        let connected = await waitUntil { session.connectionState.isConnected }
+        XCTAssertTrue(connected)
+        sync.applicationDidBecomeActive()
+        sync.sharedClipboardEnabled = true
+        session.sendKeyEvent(downFlag: true, key: KeyboardInputHandler.keysymSuperL)
+        session.sendKeyEvent(downFlag: true, key: 0x63)
+        session.sendKeyEvent(downFlag: false, key: 0x63)
+        await session.flushPendingInput()
+        var expected = ClientMessage.keyEvent(downFlag: true, key: KeyboardInputHandler.keysymSuperL).serialize()
+        expected.append(AppleClipboardProtocol.requestMessage(requestID: 0x8000_0001))
+        expected.append(ClientMessage.keyEvent(downFlag: true, key: 0x63).serialize())
+        expected.append(ClientMessage.keyEvent(downFlag: false, key: 0x63).serialize())
+        expected.append(AppleClipboardProtocol.requestMessage(requestID: 0x8000_0002))
+        let bytes = await connection.keyAndClipboardBytes
+        XCTAssertEqual(bytes, expected)
+    }
+
+    @MainActor
+    func testAppleChangeNoticeFetchWaitsForQueuedLocalUpload() async throws {
+        let connection = SuccessfulRFBConnection(name: "Mac", version: .apple)
+        var configuration = VNCConfiguration(videoQualityMode: .standard)
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+        defer { session.disconnect() }
+        try await session.connect(credentials: VNCCredentials(host: "apple.test", port: 5900, password: ""))
+        let connected = await waitUntil { session.connectionState.isConnected }
+        XCTAssertTrue(connected)
+        session.setRemoteSharedClipboardEnabled(true)
+        await session.flushPendingInput()
+
+        var noticesDuringUpload: [Bool] = []
+        let observer = session.addServerClipboardObserver { event in
+            if case .requestStarted(_, true, let uploadPending) = event { noticesDuringUpload.append(uploadPending) }
+        }
+        defer { session.removeServerClipboardObserver(observer) }
+        let notice = Data([0x14, 0, 0, 0, 0, 0, 0, 0])
+        await connection.pauseClipboardUpload()
+        session.sendClipboardText("new local")
+        await connection.enqueueServerBytes(notice)
+        let firstNotice = await waitUntil { noticesDuringUpload.count == 1 }
+        XCTAssertTrue(firstNotice)
+        let requestsBeforeUpload = await connection.clipboardRequests
+        XCTAssertTrue(requestsBeforeUpload.isEmpty)
+
+        await connection.resumeClipboardUpload()
+        await session.flushPendingInput()
+        let requestsAfterUpload = await connection.clipboardRequests
+        XCTAssertEqual(requestsAfterUpload.count, 1)
+        await connection.enqueueServerBytes(notice)
+        let secondNotice = await waitUntil { noticesDuringUpload.count == 2 }
+        XCTAssertTrue(secondNotice)
+        XCTAssertEqual(noticesDuringUpload, [true, false])
+    }
+
+    @MainActor
+    func testAppleManualGetPublishesBothPublicClipboardCallbacks() async throws {
+        let connection = SuccessfulRFBConnection(name: "Mac", version: .apple)
+        var configuration = VNCConfiguration(videoQualityMode: .standard)
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+        let sync = VNCClipboardSynchronizer(session: session)
+        defer {
+            sync.invalidate()
+            session.disconnect()
+        }
+        try await session.connect(credentials: VNCCredentials(host: "apple.test", port: 5900, password: ""))
+        let connected = await waitUntil { session.connectionState.isConnected }
+        XCTAssertTrue(connected)
+        var texts: [String] = []
+        var contents: [VNCClipboardContent] = []
+        session.onServerClipboardText = { texts.append($0) }
+        session.onServerClipboardContent = { contents.append($0) }
+        sync.getClipboard()
+        // The session still owes its host the requested data. Detaching the
+        // pasteboard consumer here keeps the test off the real Mac clipboard.
+        sync.invalidate()
+        await session.flushPendingInput()
+        let requests = await connection.clipboardRequests
+        let request = try XCTUnwrap(requests.last)
+        var reply = try AppleClipboardProtocol.packedTextMessage("manual")
+        reply.replaceSubrange(4..<8, with: request[4..<8])
+        await connection.enqueueServerBytes(reply)
+        let delivered = await waitUntil { !contents.isEmpty }
+        XCTAssertTrue(delivered)
+        XCTAssertEqual(texts, ["manual"])
+        XCTAssertEqual(contents, [.text("manual")])
+    }
+    #endif
 
     @MainActor
     func testSessionPublishesAndClearsNegotiatedContentEncryption() async throws {

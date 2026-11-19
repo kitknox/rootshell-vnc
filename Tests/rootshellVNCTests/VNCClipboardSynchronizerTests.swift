@@ -37,6 +37,14 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         }
     }
 
+    private func appleRequestIDs() -> () -> UInt32? {
+        var id: UInt32 = 0x8000_0000
+        return {
+            id += 1
+            return id
+        }
+    }
+
     private func makeSynchronizer(
         clipboard: FakeClipboard,
         connected: @escaping () -> Bool = { true },
@@ -44,6 +52,8 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         automaticallyMonitors: Bool = false,
         canRequestRemoteClipboard: @escaping () -> Bool = { false },
         requestRemoteClipboard: @escaping () -> Void = {},
+        requestAppleClipboard: @escaping () -> UInt32? = { nil },
+        now: @escaping () -> ContinuousClock.Instant = { .now },
         canControlRemoteSharedClipboard: @escaping () -> Bool = { false },
         setRemoteSharedClipboard: @escaping (Bool) -> Void = { _ in },
         notificationCenter: NotificationCenter = NotificationCenter(),
@@ -61,6 +71,7 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
             contentSupport: contentSupport,
             canRequestRemoteClipboard: canRequestRemoteClipboard,
             requestRemoteClipboard: requestRemoteClipboard,
+            requestAppleClipboard: requestAppleClipboard, now: now,
             canControlRemoteSharedClipboard: canControlRemoteSharedClipboard,
             setRemoteSharedClipboard: setRemoteSharedClipboard,
             notificationCenter: notificationCenter,
@@ -242,6 +253,568 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
 
         synchronizer.receiveRemoteClipboardText("new focused remote")
         XCTAssertEqual(clipboard.text, "new focused remote")
+    }
+
+    func testMacCopyCanBePastedAfterAnImmediateAppSwitch() {
+        for windowResignsFirst in [false, true] {
+            let clipboard = FakeClipboard()
+            var requests = 0
+            var sent: [String] = []
+            let sync = makeSynchronizer(
+                clipboard: clipboard, canRequestRemoteClipboard: { true },
+                requestAppleClipboard: {
+                    requests += 1
+                    return 0x8000_0000 + UInt32(requests)
+                }) { sent.append($0) }
+            sync.sharedClipboardEnabled = true
+            sync.remoteKeyEvent(down: true, key: KeyboardInputHandler.keysymSuperL)
+            sync.remoteKeyEvent(down: true, key: 0x63)
+            sync.handleClipboardEvent(.reply(0x8000_0001, .text("before copy")))
+            if windowResignsFirst { sync.setHostWindowActive(false) }
+            sync.applicationWillResignActive()
+            sync.setHostWindowActive(false)
+            sync.remoteKeyEvent(down: false, key: 0x63)
+            XCTAssertEqual(requests, 2)
+
+            sync.handleClipboardEvent(.reply(0x8000_0002, .text("first reply")))
+            sync.handleClipboardEvent(.requestStarted(2, changeNotice: true))
+            sync.handleClipboardEvent(.reply(2, .text("latest remote copy")))
+            XCTAssertEqual(clipboard.text, "latest remote copy")
+            sync.applicationDidBecomeActive()
+            sync.setHostWindowActive(true)
+            XCTAssertTrue(sent.isEmpty)
+        }
+    }
+
+    func testCopyReplyBetweenWindowAndAppResignationIsAppliedOnDeparture() {
+        let clipboard = FakeClipboard()
+        clipboard.copyOnDevice("original")
+        var sent: [String] = []
+        let sync = makeSynchronizer(
+            clipboard: clipboard, canRequestRemoteClipboard: { true },
+            requestAppleClipboard: appleRequestIDs()) { sent.append($0) }
+        sync.sharedClipboardEnabled = true
+        sync.remoteKeyEvent(down: true, key: KeyboardInputHandler.keysymSuperL)
+        sync.remoteKeyEvent(down: true, key: 0x63)
+        sync.handleClipboardEvent(.reply(0x8000_0001, .text("before copy")))
+        sync.setHostWindowActive(false)
+        sync.handleClipboardEvent(.reply(0x8000_0002, .text("first")))
+        sync.handleClipboardEvent(.requestStarted(2, changeNotice: true))
+        sync.handleClipboardEvent(.reply(2, .text("second")))
+        XCTAssertEqual(clipboard.text, "original")
+        sync.applicationWillResignActive()
+        XCTAssertEqual(clipboard.text, "second")
+        sync.applicationDidBecomeActive()
+        sync.setHostWindowActive(true)
+        XCTAssertTrue(sent.isEmpty)
+    }
+
+    func testLocalCopyBeforeResignationCannotBeReplacedOnReturn() {
+        for alreadySent in [false, true] {
+            let clipboard = FakeClipboard()
+            var sent: [String] = []
+            let sync = makeSynchronizer(
+                clipboard: clipboard, canRequestRemoteClipboard: { true },
+            requestAppleClipboard: appleRequestIDs()) { sent.append($0) }
+            sync.sharedClipboardEnabled = true
+            sync.remoteKeyEvent(down: true, key: KeyboardInputHandler.keysymSuperR)
+            sync.remoteKeyEvent(down: true, key: 0x63)
+            sync.handleClipboardEvent(.reply(0x8000_0001, .text("before copy")))
+            sync.remoteKeyEvent(down: false, key: 0x63)
+            clipboard.copyOnDevice("new local")
+            if alreadySent { sync.localClipboardDidChange() }
+            sync.applicationWillResignActive()
+            sync.handleClipboardEvent(.reply(0x8000_0002, .text("late remote")))
+            XCTAssertEqual(clipboard.text, "new local")
+            sync.applicationDidBecomeActive()
+            XCTAssertEqual(clipboard.text, "new local")
+            XCTAssertEqual(sent, ["new local"])
+        }
+    }
+
+    func testOtherWindowTakingFocusRevokesPendingCopyAcrossAppSwitch() {
+        let clipboard = FakeClipboard()
+        clipboard.copyOnDevice("original")
+        let a = makeSynchronizer(clipboard: clipboard, canRequestRemoteClipboard: { true },
+            requestAppleClipboard: appleRequestIDs()) { _ in }
+        let b = makeSynchronizer(clipboard: clipboard, canRequestRemoteClipboard: { true },
+            requestAppleClipboard: appleRequestIDs()) { _ in }
+        b.setHostWindowActive(false)
+        a.sharedClipboardEnabled = true
+        b.sharedClipboardEnabled = true
+        a.remoteKeyEvent(down: true, key: KeyboardInputHandler.keysymSuperL)
+        a.remoteKeyEvent(down: true, key: 0x63)
+        a.handleClipboardEvent(.reply(0x8000_0001, .text("before copy")))
+        a.setHostWindowActive(false)
+        a.handleClipboardEvent(.reply(0x8000_0002, .text("early A")))
+        a.handleClipboardEvent(.requestStarted(2, changeNotice: true))
+        b.setHostWindowActive(true)
+        a.applicationWillResignActive()
+        b.applicationWillResignActive()
+        XCTAssertEqual(clipboard.text, "original")
+        a.handleClipboardEvent(.reply(2, .text("late A")))
+        XCTAssertEqual(clipboard.text, "original")
+        b.applicationDidBecomeActive()
+        a.applicationDidBecomeActive()
+        b.setHostWindowActive(false)
+        a.setHostWindowActive(true)
+        XCTAssertEqual(clipboard.text, "original")
+    }
+
+    func testRemoteMenuCopyFetchesOnDepartureAndOrdinaryClickPreservesLocalClipboard() {
+        for didCopy in [false, true] {
+            let clipboard = FakeClipboard()
+            clipboard.copyOnDevice("initial local")
+            var requests = 0
+            let sync = makeSynchronizer(
+                clipboard: clipboard, canRequestRemoteClipboard: { true },
+                requestAppleClipboard: {
+                    requests += 1
+                    return 0x8000_0000 + UInt32(requests)
+                }) { _ in }
+            sync.sharedClipboardEnabled = true
+            sync.remotePointerWillSend(buttonMask: 1)
+            sync.handleClipboardEvent(.reply(0x8000_0001, .text("initial remote")))
+            sync.remotePointerWillSend(buttonMask: 0)
+            XCTAssertEqual(clipboard.text, "initial local")
+            sync.applicationWillResignActive()
+            XCTAssertEqual(requests, 2)
+            sync.handleClipboardEvent(.reply(0x8000_0002, .text(didCopy ? "menu copy" : "initial remote")))
+            XCTAssertEqual(clipboard.text, didCopy ? "menu copy" : "initial local")
+            sync.applicationDidBecomeActive()
+            XCTAssertEqual(clipboard.text, didCopy ? "menu copy" : "initial local")
+        }
+    }
+
+    func testCommandCWithoutSelectionPreservesDeviceClipboardWhileActive() {
+        let clipboard = FakeClipboard()
+        clipboard.copyOnDevice("L")
+        let count = clipboard.changeCount
+        let sync = makeSynchronizer(
+            clipboard: clipboard, canRequestRemoteClipboard: { true },
+            requestAppleClipboard: appleRequestIDs()) { _ in }
+        sync.sharedClipboardEnabled = true
+        sync.remoteKeyEvent(down: true, key: KeyboardInputHandler.keysymSuperL)
+        sync.remoteKeyEvent(down: true, key: 0x63)
+        sync.handleClipboardEvent(.reply(0x8000_0001, .text("A")))
+        sync.remoteKeyEvent(down: false, key: 0x63)
+        sync.handleClipboardEvent(.reply(0x8000_0002, .text("A")))
+        XCTAssertEqual(clipboard.text, "L")
+        XCTAssertEqual(clipboard.changeCount, count)
+        // Copying the same text deliberately still produces a server notice.
+        sync.handleClipboardEvent(.requestStarted(1, changeNotice: true))
+        sync.handleClipboardEvent(.reply(1, .text("A")))
+        XCTAssertEqual(clipboard.text, "A")
+    }
+
+    func testUnannouncedSnapshotWaitsForBaselineInEitherReplyOrder() {
+        for keyboard in [false, true] {
+            for baselineFirst in [false, true] {
+                for baseline in [nil, "A", "B"] as [String?] {
+                    let clipboard = FakeClipboard()
+                    clipboard.copyOnDevice("local")
+                    let count = clipboard.changeCount
+                    let sync = makeSynchronizer(
+                        clipboard: clipboard, canRequestRemoteClipboard: { true },
+                        requestAppleClipboard: appleRequestIDs()) { _ in }
+                    sync.sharedClipboardEnabled = true
+                    if keyboard {
+                        sync.remoteKeyEvent(down: true, key: KeyboardInputHandler.keysymSuperL)
+                        sync.remoteKeyEvent(down: true, key: 0x63)
+                    } else {
+                        sync.remotePointerWillSend(buttonMask: 1)
+                    }
+                    sync.applicationWillResignActive()
+                    let before = VNCSession.ClipboardEvent.reply(0x8000_0001, baseline.map(VNCClipboardContent.text))
+                    if baselineFirst { sync.handleClipboardEvent(before) }
+                    sync.handleClipboardEvent(.reply(0x8000_0002, .text("A")))
+                    if !baselineFirst {
+                        XCTAssertEqual(clipboard.changeCount, count)
+                        sync.handleClipboardEvent(before)
+                    }
+                    XCTAssertEqual(clipboard.text, baseline == "A" ? "local" : "A")
+                    XCTAssertEqual(clipboard.changeCount, baseline == "A" ? count : count + 1)
+                }
+            }
+        }
+    }
+
+    func testMenuCopyNoticeCompletesWithoutBaselineReply() {
+        let clipboard = FakeClipboard()
+        clipboard.copyOnDevice("local")
+        let sync = makeSynchronizer(
+            clipboard: clipboard, canRequestRemoteClipboard: { true },
+            requestAppleClipboard: appleRequestIDs()) { _ in }
+        sync.sharedClipboardEnabled = true
+        sync.remotePointerWillSend(buttonMask: 1)
+        sync.applicationWillResignActive()
+        sync.handleClipboardEvent(.reply(0x8000_0002, .text("first copy")))
+        XCTAssertEqual(clipboard.text, "local")
+        sync.handleClipboardEvent(.requestStarted(3, changeNotice: true))
+        sync.handleClipboardEvent(.reply(3, .text("first copy")))
+        XCTAssertEqual(clipboard.text, "first copy")
+    }
+
+    func testOnlyNewestAnnouncedClipboardWritesInEitherReplyOrder() {
+        for newerFirst in [false, true] {
+            let clipboard = FakeClipboard()
+            clipboard.copyOnDevice("original")
+            let sync = makeSynchronizer(
+                clipboard: clipboard, canRequestRemoteClipboard: { true },
+                requestAppleClipboard: appleRequestIDs()) { _ in }
+            sync.sharedClipboardEnabled = true
+            sync.remoteKeyEvent(down: true, key: KeyboardInputHandler.keysymSuperL)
+            sync.remoteKeyEvent(down: true, key: 0x63)
+            sync.handleClipboardEvent(.reply(0x8000_0001, .text("before copy")))
+            sync.remoteKeyEvent(down: false, key: 0x63)
+            sync.handleClipboardEvent(.requestStarted(1, changeNotice: true))
+            sync.handleClipboardEvent(.requestStarted(2, changeNotice: true))
+            if newerFirst { sync.handleClipboardEvent(.reply(2, .text("B"))) }
+            sync.handleClipboardEvent(.reply(1, .text("A")))
+            XCTAssertEqual(clipboard.text, newerFirst ? "B" : "original")
+            if !newerFirst { sync.handleClipboardEvent(.reply(2, .text("B"))) }
+            XCTAssertEqual(clipboard.text, "B")
+        }
+    }
+
+    func testClickDuringDownloadOrNormalizationPreservesAcceptedImage() async throws {
+        let tiff = VNCClipboardContent(items: [[.init(
+            type: ClipboardType.tiff, data: try Self.imageData(type: "public.tiff"))]])
+        for clickBeforeReply in [true, false] {
+            let clipboard = FakeClipboard()
+            var id: UInt32 = 0x8000_0000
+            let sync = makeSynchronizer(
+                clipboard: clipboard, canRequestRemoteClipboard: { true },
+                requestAppleClipboard: {
+                    id += 1
+                    return id
+                }) { _ in }
+            sync.sharedClipboardEnabled = true
+            sync.remoteKeyEvent(down: true, key: KeyboardInputHandler.keysymSuperL)
+            sync.remoteKeyEvent(down: true, key: 0x63)
+            sync.handleClipboardEvent(.reply(0x8000_0001, .text("before copy")))
+            sync.remoteKeyEvent(down: false, key: 0x63)
+            if clickBeforeReply { sync.remotePointerWillSend(buttonMask: 1) }
+            sync.handleClipboardEvent(.reply(0x8000_0002, tiff))
+            if !clickBeforeReply { sync.remotePointerWillSend(buttonMask: 1) }
+            sync.applicationWillResignActive()
+            let written = await Self.waitUntil { clipboard.content?.contains(type: ClipboardType.png) == true }
+            XCTAssertTrue(written)
+        }
+    }
+
+    func testClickAfterReducedUploadPreservesFullLocalClipboard() {
+        let clipboard = FakeClipboard()
+        var id: UInt32 = 0x8000_0000
+        let sync = makeSynchronizer(
+            clipboard: clipboard, canRequestRemoteClipboard: { true },
+            requestAppleClipboard: {
+                id += 1
+                return id
+            }) { _ in }
+        sync.sharedClipboardEnabled = true
+        let full = VNCClipboardContent(items: [[
+            .init(type: ClipboardType.png, data: Data([1, 2, 3])),
+            .init(type: ClipboardType.utf8PlainText, data: Data("label".utf8))
+        ]])
+        clipboard.copyOnDevice(full)
+        sync.localClipboardDidChange()
+        let count = clipboard.changeCount
+        sync.remotePointerWillSend(buttonMask: 1)
+        sync.handleClipboardEvent(.reply(0x8000_0001, .text("label")))
+        sync.applicationWillResignActive()
+        sync.handleClipboardEvent(.reply(0x8000_0002, .text("label")))
+        XCTAssertEqual(clipboard.content, full)
+        XCTAssertEqual(clipboard.changeCount, count)
+    }
+
+    func testPointerBaselineBelongsToCurrentSharingInterval() {
+        let clipboard = FakeClipboard()
+        var id: UInt32 = 0x8000_0000
+        let sync = makeSynchronizer(
+            clipboard: clipboard, canRequestRemoteClipboard: { true },
+            requestAppleClipboard: {
+                    id += 1
+                    return id
+                }) { _ in }
+        sync.sharedClipboardEnabled = true
+        sync.remotePointerWillSend(buttonMask: 1)
+        sync.receiveRemoteClipboardText("A")
+        sync.sharedClipboardEnabled = false
+        clipboard.copyOnDevice("L")
+        sync.sharedClipboardEnabled = true
+        sync.remotePointerWillSend(buttonMask: 1)
+        sync.applicationWillResignActive()
+        sync.handleClipboardEvent(.reply(0x8000_0001, .text("A")))
+        sync.handleClipboardEvent(.reply(0x8000_0002, .text("B")))
+        sync.handleClipboardEvent(.reply(0x8000_0003, .text("B")))
+        XCTAssertEqual(id, 0x8000_0003)
+        XCTAssertEqual(clipboard.text, "L")
+    }
+
+    func testSlowAppleClipboardDownloadAndNormalizationFinishAfterDeparture() async throws {
+        let tiff = VNCClipboardContent(items: [[.init(
+            type: ClipboardType.tiff, data: try Self.imageData(type: "public.tiff"))]])
+        for announced in [false, true] {
+            let clipboard = FakeClipboard()
+            var instant = ContinuousClock.now
+            let sync = makeSynchronizer(
+                clipboard: clipboard, canRequestRemoteClipboard: { true },
+                requestAppleClipboard: appleRequestIDs(), now: { instant }) { _ in }
+            sync.sharedClipboardEnabled = true
+            sync.remoteKeyEvent(down: true, key: KeyboardInputHandler.keysymSuperL)
+            sync.remoteKeyEvent(down: true, key: 0x63)
+            sync.handleClipboardEvent(.reply(0x8000_0001, .text("before copy")))
+            sync.remoteKeyEvent(down: false, key: 0x63)
+            sync.applicationWillResignActive()
+            sync.handleClipboardEvent(.reply(99, .text("unrelated early reply")))
+            XCTAssertNil(clipboard.content)
+            if announced {
+                sync.handleClipboardEvent(.requestStarted(42, changeNotice: true))
+                sync.handleClipboardEvent(.reply(0x8000_0002, .text("superseded snapshot")))
+                XCTAssertNil(clipboard.content)
+            }
+            instant += .seconds(10)
+            sync.handleClipboardEvent(.reply(announced ? 42 : 0x8000_0002, tiff))
+            instant += .seconds(10)
+            let written = await Self.waitUntil { clipboard.content?.contains(type: ClipboardType.png) == true }
+            XCTAssertTrue(written)
+            let count = clipboard.changeCount
+            sync.handleClipboardEvent(.reply(99, .text("unrelated later update")))
+            XCTAssertEqual(clipboard.changeCount, count)
+        }
+    }
+
+    func testLateMatchedDownloadStillYieldsToLocalCopy() {
+        let clipboard = FakeClipboard()
+        var instant = ContinuousClock.now
+        let sync = makeSynchronizer(
+            clipboard: clipboard, canRequestRemoteClipboard: { true },
+            requestAppleClipboard: appleRequestIDs(), now: { instant }) { _ in }
+        sync.sharedClipboardEnabled = true
+        sync.remoteKeyEvent(down: true, key: KeyboardInputHandler.keysymSuperL)
+        sync.remoteKeyEvent(down: true, key: 0x63)
+        sync.handleClipboardEvent(.reply(0x8000_0001, .text("before copy")))
+        sync.applicationWillResignActive()
+        instant += .seconds(10)
+        clipboard.copyOnDevice("newer local")
+        sync.handleClipboardEvent(.reply(0x8000_0002, .text("late")))
+        sync.applicationDidBecomeActive()
+        XCTAssertEqual(clipboard.text, "newer local")
+    }
+
+    func testCopyReplyBetweenAppAndWindowActivationIsAppliedOnReturn() {
+        for localCopy in [false, true] {
+            let clipboard = FakeClipboard()
+            clipboard.copyOnDevice("original")
+            let sync = makeSynchronizer(
+                clipboard: clipboard, canRequestRemoteClipboard: { true },
+                requestAppleClipboard: appleRequestIDs()) { _ in }
+            sync.sharedClipboardEnabled = true
+            sync.remoteKeyEvent(down: true, key: KeyboardInputHandler.keysymSuperL)
+            sync.remoteKeyEvent(down: true, key: 0x63)
+            sync.handleClipboardEvent(.reply(0x8000_0001, .text("before copy")))
+            sync.applicationWillResignActive()
+            sync.setHostWindowActive(false)
+            sync.applicationDidBecomeActive()
+            sync.handleClipboardEvent(.reply(0x8000_0002, .text("remote copy")))
+            XCTAssertEqual(clipboard.text, "original")
+            if localCopy { clipboard.copyOnDevice("new local") }
+            sync.setHostWindowActive(true)
+            XCTAssertEqual(clipboard.text, localCopy ? "new local" : "remote copy")
+            let count = clipboard.changeCount
+            sync.applicationWillResignActive()
+            XCTAssertEqual(clipboard.changeCount, count)
+        }
+    }
+
+    func testNoticeBeforeLocalUploadCannotOverwriteLocalCopy() {
+        for uploadAlreadyQueued in [false, true] {
+            let clipboard = FakeClipboard()
+            clipboard.copyOnDevice("original")
+            var sent: [String] = []
+            let sync = makeSynchronizer(
+                clipboard: clipboard, canRequestRemoteClipboard: { true },
+                requestAppleClipboard: appleRequestIDs()) { sent.append($0) }
+            sync.sharedClipboardEnabled = true
+            sync.remoteKeyEvent(down: true, key: KeyboardInputHandler.keysymSuperL)
+            sync.remoteKeyEvent(down: true, key: 0x63)
+            sync.handleClipboardEvent(.reply(0x8000_0001, .text("before copy")))
+            sync.remoteKeyEvent(down: false, key: 0x63)
+            clipboard.copyOnDevice("new local")
+            if uploadAlreadyQueued { sync.localClipboardDidChange() }
+            sync.handleClipboardEvent(.requestStarted(1, changeNotice: true, localUploadPending: uploadAlreadyQueued))
+            sync.handleClipboardEvent(.reply(1, .text("old remote")))
+            sync.handleClipboardEvent(.reply(0x8000_0002, .text("old remote")))
+            XCTAssertEqual(clipboard.text, "new local")
+            XCTAssertEqual(sent, ["new local"])
+            sync.handleClipboardEvent(.requestStarted(2, changeNotice: true))
+            sync.handleClipboardEvent(.reply(2, .text("subsequent remote copy")))
+            XCTAssertEqual(clipboard.text, "subsequent remote copy")
+        }
+    }
+
+    func testLateNoticeFinishesSilentKeyboardFetchDuringAppSwitch() {
+        let clipboard = FakeClipboard()
+        clipboard.copyOnDevice("original")
+        var instant = ContinuousClock.now
+        let sync = makeSynchronizer(
+            clipboard: clipboard, canRequestRemoteClipboard: { true },
+            requestAppleClipboard: appleRequestIDs(), now: { instant }) { _ in }
+        sync.sharedClipboardEnabled = true
+        sync.remoteKeyEvent(down: true, key: KeyboardInputHandler.keysymSuperL)
+        sync.remoteKeyEvent(down: true, key: 0x63)
+        sync.handleClipboardEvent(.reply(0x8000_0001, .text("before copy")))
+        sync.applicationWillResignActive()
+        instant += .seconds(10)
+        sync.handleClipboardEvent(.requestStarted(2, changeNotice: true))
+        sync.handleClipboardEvent(.reply(2, .text("newer notice")))
+        XCTAssertEqual(clipboard.text, "newer notice")
+        // An empty response, if it eventually arrives, cannot undo the announced copy.
+        let count = clipboard.changeCount
+        sync.handleClipboardEvent(.reply(0x8000_0002, nil))
+        XCTAssertEqual(clipboard.changeCount, count)
+    }
+
+    func testOrdinaryReplySurvivesReturnBeforeWindowBecomesKey() {
+        for localCopy in [false, true] {
+            let clipboard = FakeClipboard()
+            clipboard.copyOnDevice("original")
+            let sync = makeSynchronizer(clipboard: clipboard) { _ in }
+            sync.sharedClipboardEnabled = true
+            sync.applicationWillResignActive()
+            sync.setHostWindowActive(false)
+            sync.handleClipboardEvent(.requestStarted(1, changeNotice: true))
+            if localCopy { clipboard.copyOnDevice("new local") }
+            sync.applicationDidBecomeActive()
+            sync.setHostWindowActive(true)
+            sync.handleClipboardEvent(.reply(1, .text("away update")))
+            XCTAssertEqual(clipboard.text, localCopy ? "new local" : "away update")
+        }
+    }
+
+    func testLateNoticeLeavesAcceptedDownloadEligibleInEitherReplyOrder() {
+        for noticeFirst in [false, true] {
+            let clipboard = FakeClipboard()
+            clipboard.copyOnDevice("original")
+            var instant = ContinuousClock.now
+            let sync = makeSynchronizer(
+                clipboard: clipboard, canRequestRemoteClipboard: { true },
+                requestAppleClipboard: appleRequestIDs(), now: { instant }) { _ in }
+            sync.sharedClipboardEnabled = true
+            sync.remoteKeyEvent(down: true, key: KeyboardInputHandler.keysymSuperL)
+            sync.remoteKeyEvent(down: true, key: 0x63)
+            sync.handleClipboardEvent(.reply(0x8000_0001, .text("before copy")))
+            sync.applicationWillResignActive()
+            instant += .seconds(10)
+            sync.handleClipboardEvent(.requestStarted(2, changeNotice: true))
+            if noticeFirst {
+                sync.handleClipboardEvent(.reply(2, .text("newer notice")))
+                XCTAssertEqual(clipboard.text, "newer notice")
+            }
+            sync.handleClipboardEvent(.reply(0x8000_0002, .text("accepted copy")))
+            XCTAssertEqual(clipboard.text, noticeFirst ? "newer notice" : "accepted copy")
+            if !noticeFirst { sync.handleClipboardEvent(.reply(2, .text("newer notice"))) }
+            sync.applicationDidBecomeActive()
+            XCTAssertEqual(clipboard.text, "newer notice")
+        }
+    }
+
+    func testNoticePublishesRepeatedRemoteMenuCopy() {
+        let clipboard = FakeClipboard()
+        clipboard.copyOnDevice("L")
+        var id: UInt32 = 0x8000_0000
+        let sync = makeSynchronizer(
+            clipboard: clipboard, canRequestRemoteClipboard: { true },
+            requestAppleClipboard: {
+                id += 1
+                return id
+            }) { _ in }
+        sync.sharedClipboardEnabled = true
+        sync.remotePointerWillSend(buttonMask: 1)
+        sync.handleClipboardEvent(.reply(0x8000_0001, .text("A")))
+        sync.applicationWillResignActive()
+        sync.handleClipboardEvent(.reply(0x8000_0002, .text("A")))
+        XCTAssertEqual(clipboard.text, "L")
+        sync.handleClipboardEvent(.requestStarted(3, changeNotice: true))
+        sync.handleClipboardEvent(.reply(3, .text("A")))
+        XCTAssertEqual(clipboard.text, "A")
+    }
+
+    func testNewerDeferredReplySupersedesRunningImageNormalization() async throws {
+        let clipboard = FakeClipboard()
+        clipboard.copyOnDevice("original")
+        let sync = makeSynchronizer(
+            clipboard: clipboard, canRequestRemoteClipboard: { true },
+            requestAppleClipboard: appleRequestIDs()) { _ in }
+        let tiff = VNCClipboardContent(items: [[.init(
+            type: ClipboardType.tiff, data: try Self.imageData(type: "public.tiff"))]])
+        sync.sharedClipboardEnabled = true
+        sync.remoteKeyEvent(down: true, key: KeyboardInputHandler.keysymSuperL)
+        sync.remoteKeyEvent(down: true, key: 0x63)
+        sync.handleClipboardEvent(.reply(0x8000_0001, .text("before copy")))
+        sync.remoteKeyEvent(down: false, key: 0x63)
+        sync.handleClipboardEvent(.reply(0x8000_0002, tiff))
+        let conversion = try XCTUnwrap(sync.normalizationTask)
+        sync.setHostWindowActive(false)
+        sync.handleClipboardEvent(.requestStarted(2, changeNotice: true))
+        sync.handleClipboardEvent(.reply(2, .text("B")))
+        await conversion.value
+        XCTAssertEqual(clipboard.text, "original")
+        sync.applicationWillResignActive()
+        XCTAssertEqual(clipboard.text, "B")
+        sync.applicationDidBecomeActive()
+        sync.setHostWindowActive(true)
+        XCTAssertEqual(clipboard.text, "B")
+    }
+
+    func testNewLocalCopyWinsOverMacCopyReply() {
+        let clipboard = FakeClipboard()
+        var sent: [String] = []
+        let sync = makeSynchronizer(
+            clipboard: clipboard, canRequestRemoteClipboard: { true },
+            requestAppleClipboard: appleRequestIDs()) { sent.append($0) }
+        sync.sharedClipboardEnabled = true
+        sync.remoteKeyEvent(down: true, key: KeyboardInputHandler.keysymSuperR)
+        sync.remoteKeyEvent(down: true, key: 0x78)
+        sync.handleClipboardEvent(.reply(0x8000_0001, .text("before copy")))
+        sync.remoteKeyEvent(down: false, key: 0x78)
+        sync.applicationWillResignActive()
+        clipboard.copyOnDevice("copied locally")
+        sync.handleClipboardEvent(.reply(0x8000_0002, .text("late reply")))
+        XCTAssertEqual(clipboard.text, "copied locally")
+        sync.applicationDidBecomeActive()
+        XCTAssertEqual(sent, ["copied locally"])
+    }
+
+    func testOnlyCopyOrCutFromTheFocusedSharedPaneRequestsTheClipboard() {
+        let clipboard = FakeClipboard()
+        var requests = 0
+        let sync = makeSynchronizer(
+            clipboard: clipboard, canRequestRemoteClipboard: { true },
+            requestAppleClipboard: {
+                    requests += 1
+                    return 0x8000_0000 + UInt32(requests)
+                }) { _ in }
+        func sendC() {
+            sync.remoteKeyEvent(down: true, key: 0x63)
+            sync.remoteKeyEvent(down: false, key: 0x63)
+        }
+        sync.remoteKeyEvent(down: true, key: KeyboardInputHandler.keysymSuperL)
+        sendC()
+        sync.sharedClipboardEnabled = true
+        sendC()
+        sync.remoteKeyEvent(down: true, key: KeyboardInputHandler.keysymSuperL)
+        sync.remoteKeyEvent(down: true, key: KeyboardInputHandler.keysymShiftL)
+        sendC()
+        sync.remoteKeyEvent(down: false, key: KeyboardInputHandler.keysymShiftL)
+        XCTAssertEqual(requests, 0)
+        sendC()
+        XCTAssertEqual(requests, 2)
+        sync.setHostFocused(false)
+        sync.applicationWillResignActive()
+        sync.receiveRemoteClipboardText("inactive pane")
+        XCTAssertNil(clipboard.text)
     }
 
     func testForegroundLocalChangeWinsOverRemoteChange() {

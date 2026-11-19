@@ -1,6 +1,16 @@
 import Foundation
 import RFBProtocol
 
+/// IDs supplied by the viewer use the upper half of the wire ID space. The
+/// transport allocates the lower half for ordinary gets and server notices.
+package enum AppleClipboardRequestID {
+    package static let viewerBit: UInt32 = 1 << 31
+
+    package static func isViewerRequest(_ id: UInt32) -> Bool {
+        id & viewerBit != 0
+    }
+}
+
 /// The private pasteboard extension used by Apple's Screen Sharing client.
 /// A packed scrap holds every pasteboard item and flavor; only the types in
 /// ``ClipboardType`` are kept, and a malformed scrap never ends the session.

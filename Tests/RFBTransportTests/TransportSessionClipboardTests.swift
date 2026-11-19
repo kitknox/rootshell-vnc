@@ -175,6 +175,39 @@ final class TransportSessionClipboardTests: XCTestCase {
         await session.disconnect()
     }
 
+    func testAppleClipboardRepliesEchoIDsIncludingEmptyAndUnsupportedScraps() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue, 0, 0, 0, 0])
+        script.append(Self.appleServerInitMessage(serverCommands: [31]))
+        await connection.enqueueServerBytes(script)
+        let session = TransportSession(host: "apple.test", port: 5900, password: "",
+                                       preferredEncodings: [.raw], connection: connection)
+        try await session.connectReportingAppleClipboardReplies()
+        let recorder = EventRecorder()
+        recorder.record(session)
+
+        let empty = Data([31, 0, 0, 0, 0x80, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0])
+        var unknown = try AppleClipboardProtocol.packedMessage(ClipboardContent(items: [[
+            .init(type: "com.example.unsupported", data: Data([1, 2]))
+        ]]))
+        unknown.replaceSubrange(4..<8, with: [0x80, 0, 0, 2])
+        var copy = try AppleClipboardProtocol.packedTextMessage("first usable")
+        copy.replaceSubrange(4..<8, with: [0x80, 0, 0, 3])
+        await connection.enqueueServerBytes(empty + unknown + copy)
+        for (id, expected) in [(UInt32(0x8000_0001), nil as String?),
+                               (0x8000_0002, nil), (0x8000_0003, "first usable")] {
+            let received = await Self.waitUntil {
+                recorder.contains {
+                    guard case .appleClipboardReply(id, let content) = $0 else { return false }
+                    return content?.plainText == expected
+                }
+            }
+            XCTAssertTrue(received)
+        }
+        await session.disconnect()
+    }
+
     // MARK: - Helpers
 
     private func connectConventionalServer() async throws

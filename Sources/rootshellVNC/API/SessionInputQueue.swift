@@ -20,6 +20,7 @@ enum SessionInputEvent: Sendable, Equatable {
     /// A prebuilt file-transfer message kept in order with pointer input.
     case fileTransfer(Data)
     case clipboardRequest
+    case appleClipboardRequest(UInt32)
     case sharedClipboard(Bool)
     case curtain(enabled: Bool, message: String)
 }
