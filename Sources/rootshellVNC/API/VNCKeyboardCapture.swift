@@ -223,6 +223,14 @@ public final class VNCKeyboardCapture {
     @ObservationIgnored
     var onExternalInput: (@MainActor () -> Void)?
 
+    /// What an input method is still composing in the remote responder.
+    /// None of it has reached the remote desktop.
+    private(set) var composition: RemoteTextInputDocument.Composition?
+
+    func setComposition(_ value: RemoteTextInputDocument.Composition?) {
+        if composition != value { composition = value }
+    }
+
     /// Whether the software keyboard should be shown for the remote desktop.
     ///
     /// Two-way synced with `RemoteDesktopView`'s internal keyboard state:

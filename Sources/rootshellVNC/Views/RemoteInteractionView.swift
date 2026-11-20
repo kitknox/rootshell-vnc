@@ -140,7 +140,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
 
     /// What the software keyboard thinks it is editing; see
     /// `RemoteTextInputDocument`.
-    var textDocument = RemoteTextInputDocument()
+    var textDocument = RemoteTextInputDocument() {
+        // The composition is drawn by the preview, not by this view.
+        didSet { keyboardCapture.setComposition(textDocument.composition) }
+    }
     /// True while this view types text, so its own keys do not count as
     /// input that moved the remote caret.
     private var isTypingText = false
@@ -1008,6 +1011,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             releasePointerModifiersNow()
             cancelScrollInteraction()
             stopEdgeScrolling()
+            // A composition cannot outlive the view that was editing it.
+            discardTextDocument()
             #if !targetEnvironment(macCatalyst)
             remoteCursorHoverLocation = nil
             remoteCursorImageView.isHidden = true

@@ -220,6 +220,8 @@ struct DraggableHUDOverlay<Content: View>: UIViewRepresentable {
     var pinnedRowHeight: CGFloat?
     /// Height at the bottom that a pinned HUD occupies; 0 while it floats.
     var onReserveChange: ((CGFloat) -> Void)?
+    /// The HUD's frame in the overlay, wherever it is put or dragged.
+    var onFrameChange: ((CGRect) -> Void)?
     @ViewBuilder var content: () -> Content
 
     func makeUIView(context: Context) -> DraggableHUDOverlayHostView {
@@ -228,6 +230,7 @@ struct DraggableHUDOverlay<Content: View>: UIViewRepresentable {
         view.safeAreaEdges = safeAreaEdges
         view.pinnedRowHeight = pinnedRowHeight
         view.onReserveChange = onReserveChange
+        view.onFrameChange = onFrameChange
 
         let host = UIHostingController(rootView: Self.sized(content(), in: view))
         host.view.backgroundColor = .clear
@@ -255,6 +258,7 @@ struct DraggableHUDOverlay<Content: View>: UIViewRepresentable {
         uiView.safeAreaEdges = safeAreaEdges
         uiView.pinnedRowHeight = pinnedRowHeight
         uiView.onReserveChange = onReserveChange
+        uiView.onFrameChange = onFrameChange
         uiView.setNeedsLayout()
     }
 
@@ -324,6 +328,8 @@ final class DraggableHUDOverlayHostView: UIView {
     var pinnedRowHeight: CGFloat?
     var onReserveChange: ((CGFloat) -> Void)?
     private var reportedReserve: CGFloat = 0
+    var onFrameChange: ((CGRect) -> Void)?
+    private var reportedFrame = CGRect.null
 
     /// Edge-relative state, rather than an absolute center, prevents a HUD
     /// clamped above the software keyboard from staying in the middle after
@@ -414,6 +420,7 @@ final class DraggableHUDOverlayHostView: UIView {
         default:
             break
         }
+        reportFrame(bar.frame)
     }
 
     private func allowedCenterRect(for size: CGSize) -> CGRect {
@@ -436,13 +443,9 @@ final class DraggableHUDOverlayHostView: UIView {
     }
 
     private var physicalSafeAreaEdges: HUDSafeAreaEdges {
-        let rightToLeft = effectiveUserInterfaceLayoutDirection == .rightToLeft
-        var edges: HUDSafeAreaEdges = []
-        if safeAreaEdges.contains(.top) { edges.insert(.top) }
-        if safeAreaEdges.contains(.bottom) { edges.insert(.bottom) }
-        if safeAreaEdges.contains(.leading) { edges.insert(rightToLeft ? .right : .left) }
-        if safeAreaEdges.contains(.trailing) { edges.insert(rightToLeft ? .left : .right) }
-        return edges
+        HUDSafeAreaEdges(
+            safeAreaEdges,
+            rightToLeft: effectiveUserInterfaceLayoutDirection == .rightToLeft)
     }
 
     override func safeAreaInsetsDidChange() {
@@ -460,6 +463,7 @@ final class DraggableHUDOverlayHostView: UIView {
     }
 
     private func layoutDockedBar(_ bar: UIView, size: CGSize) {
+        defer { reportFrame(bar.frame) }
         if let pinnedRowHeight {
             isDragging = false
             let allowed = allowedCenterRect(for: size)
@@ -488,6 +492,16 @@ final class DraggableHUDOverlayHostView: UIView {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.onReserveChange?(self.reportedReserve)
+        }
+    }
+
+    /// Deferred for the same reason, and because a drag reports mid-gesture.
+    private func reportFrame(_ frame: CGRect) {
+        guard frame != reportedFrame else { return }
+        reportedFrame = frame
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.onFrameChange?(self.reportedFrame)
         }
     }
 

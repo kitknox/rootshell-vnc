@@ -58,6 +58,7 @@ public struct RemoteDesktopView: View {
     @State private var keyboardViewportMetrics = DockedKeyboardViewportMetrics()
     @State private var hardwareKeyboardAttached = false
     @State private var showsFileTransfers = false
+    @State private var hudFrame = HUDFrameModel()
     #endif
 
     #if !canImport(UIKit)
@@ -465,12 +466,19 @@ public struct RemoteDesktopView: View {
                 safeAreaEdges: hudSafeAreaEdges,
                 pinnedRowHeight: hudAccessory?.docksToBottom == true
                     ? hudAccessory?.buttonStyle(available).size.height : nil,
-                onReserveChange: { hudReserve = $0 }
+                onReserveChange: { hudReserve = $0 },
+                onFrameChange: { [hudFrame] in hudFrame.frame = $0 }
             ) {
                 HUDBar(accessory: hudAccessory, availableWidth: available) {
                     hudMenu
                 }
             }
+            CompositionPreviewLayer(
+                keyboardCapture: keyboardCapture,
+                hudFrame: hudFrame,
+                margin: margin,
+                safeArea: proxy.safeAreaInsets,
+                safeAreaEdges: hudSafeAreaEdges)
         }
         #else
         VStack {

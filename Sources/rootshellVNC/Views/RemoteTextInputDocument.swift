@@ -20,6 +20,22 @@ struct RemoteTextInputDocument: Equatable, Sendable {
         var edit: Edit
     }
 
+    /// A composition as the input method presents it. `selection` is in
+    /// UTF-16 offsets from the start of `text`.
+    struct Composition: Equatable, Sendable {
+        var text: String
+        var selection: NSRange
+
+        /// The text before, inside and after the selection.
+        var parts: (before: String, selected: String, after: String) {
+            guard let range = Range(selection, in: text) else { return (text, "", "") }
+            return (
+                String(text[..<range.lowerBound]),
+                String(text[range]),
+                String(text[range.upperBound...]))
+        }
+    }
+
     /// What the remote desktop holds. A composition is not in it yet.
     private(set) var committed = ""
     private(set) var marked: String?
@@ -51,6 +67,12 @@ struct RemoteTextInputDocument: Equatable, Sendable {
     var markedRange: NSRange? {
         guard let marked, !marked.isEmpty else { return nil }
         return NSRange(location: selectionStart, length: marked.utf16.count)
+    }
+
+    /// The composition to show locally, or nil when nothing is being composed.
+    var composition: Composition? {
+        guard let marked, !marked.isEmpty else { return nil }
+        return Composition(text: marked, selection: markedSelection)
     }
 
     /// Where the selection in ``committed`` starts, and so any composition.

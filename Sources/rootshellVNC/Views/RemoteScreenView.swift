@@ -63,6 +63,7 @@ public struct RemoteScreenView: View {
     @State private var viewport = RemoteViewportState()
     /// Height at the bottom that a docked HUD bar keeps clear of the fitted screen.
     @State private var hudReserve: CGFloat = 0
+    @State private var hudFrame = HUDFrameModel()
     @State private var viewportPanningMode: RemoteViewportPanningMode
     @State private var pointerMode: RemotePointerMode
     @State private var keyboardActive = false
@@ -217,12 +218,19 @@ public struct RemoteScreenView: View {
                         safeAreaEdges: hudSafeAreaEdges,
                         pinnedRowHeight: hudAccessory?.docksToBottom == true
                             ? hudAccessory?.buttonStyle(hudWidth).size.height : nil,
-                        onReserveChange: { hudReserve = $0 }
+                        onReserveChange: { hudReserve = $0 },
+                        onFrameChange: { [hudFrame] in hudFrame.frame = $0 }
                     ) {
                         HUDBar(accessory: hudAccessory, availableWidth: hudWidth) {
                             hudMenu
                         }
                     }
+                    CompositionPreviewLayer(
+                        keyboardCapture: keyboardCapture,
+                        hudFrame: hudFrame,
+                        margin: hudMargin,
+                        safeArea: geometry.safeAreaInsets,
+                        safeAreaEdges: hudSafeAreaEdges)
                 }
                 .clipped()
                 .onChange(of: geometry.size) { _, newSize in
