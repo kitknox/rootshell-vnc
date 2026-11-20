@@ -1,6 +1,47 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "Send Control-Space to Remote Computer": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Send Control-Space to Remote Computer"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Control-Space를 원격 컴퓨터로 전송"
+          }
+        }
+      }
+    },
+    "Caps Lock Switches Keyboard Language": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Caps Lock Switches Keyboard Language"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Caps Lock으로 키보드 언어 전환"
+          }
+        }
+      }
+    },
+    "Switch Keyboard Language" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Switch Keyboard Language" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "키보드 언어 전환" } }
+      }
+    },
     "%@ of %@" : {
       "localizations" : {
         "ar" : {
