@@ -239,6 +239,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private var lastPointerViewLocation: CGPoint?
     private weak var activeScrollRecognizer: UIGestureRecognizer?
     private var activeScrollUsesDirectTouch = false
+    /// Viewport scale that the pinch's cumulative scale multiplies.
+    private var pinchBaseScale: CGFloat = RemoteViewportState.minimumScale
+    /// A touchless (trackpad transform) pinch is in progress.
+    private var trackpadPinchActive = false
     private var releaseVelocityEstimator = ScrollReleaseVelocityEstimator()
     private var previousScrollTimestamp: CFTimeInterval = 0
     private var syntheticMomentumVelocity = CGPoint.zero
@@ -2487,6 +2491,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     /// the momentum tail ourselves from displacement over the gesture's
     /// trailing window, the same way native scroll views derive a fling.
     @objc private func handleNativeScrollState(_ recognizer: UIPanGestureRecognizer) {
+        // A trackpad pinch also emits scroll events; the zoom owns them.
+        if trackpadPinchActive, recognizer.state == .began || recognizer.state == .changed {
+            return
+        }
         stopEdgeScrolling()
         logInputRoute(
             "scroll state=\(recognizer.state.rawValue) "
@@ -3238,15 +3246,39 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         trackpadScrollRecognizer.isEnabled = usesTrackpad
     }
 
+    /// Trackpad pinches arrive as transform events, where resetting
+    /// `recognizer.scale` does not stick and compounds the zoom; follow the
+    /// cumulative scale instead.
     @objc private func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
-        guard recognizer.state == .began || recognizer.state == .changed else { return }
+        switch recognizer.state {
+        case .began:
+            pinchBaseScale = viewport.scale
+            // Glass pinches leave a mouse wheel free to scroll alongside.
+            trackpadPinchActive = recognizer.numberOfTouches == 0
+            if trackpadPinchActive,
+               activeScrollRecognizer === scrollRecognizer,
+               directScrollPhaseActive || momentumScrollPhaseActive {
+                cancelScrollInteraction()
+            }
+        case .changed:
+            break
+        default:
+            trackpadPinchActive = false
+            return
+        }
         stopEdgeScrolling()
+        let gestureScale = recognizer.scale
+        guard gestureScale.isFinite, gestureScale > 0, viewport.scale > 0 else { return }
+        let target = pinchBaseScale * gestureScale
         viewport.zoom(
-            by: recognizer.scale,
+            by: target / viewport.scale,
             around: visibleLocation(for: recognizer.location(in: self)),
             viewSize: bounds.size,
             framebufferSize: framebufferSize)
-        recognizer.scale = 1
+        // Held at a limit: rebase so reversing responds at once.
+        if viewport.scale != target {
+            pinchBaseScale = viewport.scale / gestureScale
+        }
         onViewportChange?(viewport)
     }
 
@@ -4537,9 +4569,14 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
     ) -> Bool {
         let pair = Set([ObjectIdentifier(gestureRecognizer), ObjectIdentifier(otherGestureRecognizer)])
+        // Scroll only ever receives UIEvent.scroll, so pairing it with pinch
+        // affects trackpad pinches alone.
         return pair == Set([
             ObjectIdentifier(pinchRecognizer),
             ObjectIdentifier(viewportPanRecognizer),
+        ]) || pair == Set([
+            ObjectIdentifier(pinchRecognizer),
+            ObjectIdentifier(scrollRecognizer),
         ])
     }
 
