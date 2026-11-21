@@ -25,7 +25,7 @@ extension VNCSession {
     /// down then, even though there is no complete snapshot yet. The
     /// displays are separate streams, and either can be first.
     public var isPresentingPicture: Bool {
-        guard isHighPerformanceMode else { return currentImage != nil }
+        guard isHighPerformanceMode else { return hasPresentedStandardPicture }
         if videoBandRenderer.latestComposedFrame != nil { return true }
         return presentedVideoDisplayRegions.count > 1
             && secondaryVideoBandRenderer.latestComposedFrame != nil

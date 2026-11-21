@@ -483,12 +483,34 @@ public actor TransportSession {
     private var pendingAppleClassicAutoUpdateActivation = false
     private var appleAutoUpdateActive = false
     private var appleAutoUpdateRefreshTask: Task<Void, Never>?
-    /// Auto-update delivery still retains exactly one decode credit. Pausing
-    /// socket reads at this boundary applies TCP backpressure to the encoder,
-    /// which both bounds stale-frame latency and gives the server an honest
-    /// bandwidth signal for its DCT quality controller.
+    /// Auto-update delivery applies bounded pipeline backpressure: allowing a
+    /// small in-flight window overlaps socket reads/framing of band N+1 with
+    /// DCT decoding of band N while still giving macOS's quality controller an
+    /// honest TCP backpressure signal whenever decoding or memory falls behind.
+    /// Classic type-3 request-driven RFB and DCT bootstrap remain at 1 credit.
     private var framebufferCreditWaiter: CheckedContinuation<Void, Never>?
     private let maxUnacknowledgedUpdates = 1
+    private let maxAutoUpdateUnacknowledgedUpdates = 3
+    private let maxAutoUpdateUnacknowledgedBytes = 4 * 1024 * 1024
+    private var unacknowledgedUpdateBytesQueue: [Int] = []
+    private var unacknowledgedUpdateBytes = 0
+    /// Number of framebuffer updates currently in flight through `events`
+    /// (`AsyncStream`). Direct sink delivery is paused while non-zero so a
+    /// direct batch can never overtake an earlier AsyncStream batch.
+    private var pendingAsyncStreamFramebufferUpdates = 0
+    /// Post-handshake actor-local read buffer so multi-field RFB messages
+    /// avoid repeated actor hops into `TCPConnection` when bytes are already
+    /// available. Strictly unused during handshake so STARTTLS boundaries
+    /// stay exact.
+    private var controlReadBuffer = Data()
+    private var controlReadOffset = 0
+    private static let controlReadChunkSize = 64 * 1024
+    private static let controlReadCompactionThreshold = 64 * 1024
+    /// Optional direct off-MainActor consumer for framebuffer updates.
+    /// Returning `false` falls back to `continuation?.yield(.framebufferUpdate)`.
+    private var framebufferUpdateSink: (@Sendable ([(FramebufferRect, Data)]) -> Bool)?
+    /// Cached AES-128-ECB cryptor for Apple command 0x10 encrypted input.
+    private var appleEncryptedInputCipher: AppleEncryptedInputCipher?
     private var udpReadTasks: [Task<Void, Never>] = []
     private var udpKeepaliveTasks: [Task<Void, Never>] = []
     private var udpChannels: [PosixUDPChannel] = []
@@ -1012,6 +1034,13 @@ public actor TransportSession {
         controlChannelBytesReceived = 0
         lastControlChannelSendNanos = 0
         controlChannelBytesSent = 0
+        controlReadBuffer.removeAll(keepingCapacity: true)
+        controlReadOffset = 0
+        unacknowledgedUpdates = 0
+        unacknowledgedUpdateBytesQueue.removeAll(keepingCapacity: true)
+        unacknowledgedUpdateBytes = 0
+        pendingAsyncStreamFramebufferUpdates = 0
+        appleEncryptedInputCipher = nil
         await tcp.setDisconnectHandler { [weak self] error in
             Task { await self?.handleUnexpectedTCPDisconnect(error) }
         }
@@ -1108,11 +1137,25 @@ public actor TransportSession {
         return appleInputEncryptionKey ?? appleSessionKey
     }
 
+    /// Reusable AES-128-ECB cipher matching the active input key.
+    private func cachedAppleInputCipher() -> AppleEncryptedInputCipher? {
+        guard let key = appleEncryptedInputKey else {
+            appleEncryptedInputCipher = nil
+            return nil
+        }
+        if let existing = appleEncryptedInputCipher, existing.key == key {
+            return existing
+        }
+        let created = AppleEncryptedInputCipher(key: key)
+        appleEncryptedInputCipher = created
+        return created
+    }
+
     /// Mac servers that take command 0x10 get keystrokes encrypted; the Mac
     /// maps the keysym exactly as for an RFB KeyEvent.
     private func keyMessage(downFlag: Bool, keysym: UInt32) -> Data {
-        if let key = appleEncryptedInputKey,
-           let message = AppleEncryptedInput.keyMessage(down: downFlag, keysym: keysym, key: key) {
+        if let cipher = cachedAppleInputCipher(),
+           let message = cipher.keyMessage(down: downFlag, keysym: keysym) {
             return message
         }
         return ClientMessage.keyEvent(downFlag: downFlag, key: keysym).serialize()
@@ -1152,11 +1195,11 @@ public actor TransportSession {
         let now = DispatchTime.now().uptimeNanoseconds
         defer { lastPointerMessageNanos = now }
         if wireButtonMask & ~AppleEncryptedInput.buttonBits == 0,
-           let key = appleEncryptedInputKey {
+           let cipher = cachedAppleInputCipher() {
             let delta = lastPointerMessageNanos == 0 ? 0 : (now &- lastPointerMessageNanos) / 1_000
-            if let message = AppleEncryptedInput.mouseMessage(
+            if let message = cipher.mouseMessage(
                 buttons: wireButtonMask, x: x, y: y,
-                timeDeltaMicroseconds: UInt32(clamping: delta), key: key) {
+                timeDeltaMicroseconds: UInt32(clamping: delta)) {
                 return message
             }
         }
@@ -1578,6 +1621,16 @@ public actor TransportSession {
         sink?(isAppleRemoteDisplayResizeSettled)
     }
 
+    /// Install an off-MainActor consumer for framebuffer updates. When the
+    /// closure returns `true`, the transport skips yielding `.framebufferUpdate`
+    /// onto `events` (unless layout events accompanied the same update), letting
+    /// decoding and credit return run without a MainActor round-trip.
+    public func setFramebufferUpdateSink(
+        _ sink: (@Sendable ([(FramebufferRect, Data)]) -> Bool)?
+    ) {
+        framebufferUpdateSink = sink
+    }
+
     /// Request a framebuffer update from the server.
     public func requestFramebufferUpdate(incremental: Bool) async throws {
         if appleAutoUpdateActive {
@@ -1613,7 +1666,23 @@ public actor TransportSession {
     /// standard-RFB credit, the next request is deliberately
     /// deferred until this acknowledgement so stale frames cannot queue.
     public func finishFramebufferUpdate() async throws {
+        try await completeFramebufferUpdate(fromDirectSink: false)
+    }
+
+    /// Acknowledge a framebuffer update delivered via `setFramebufferUpdateSink`.
+    public func finishDirectFramebufferUpdate() async throws {
+        try await completeFramebufferUpdate(fromDirectSink: true)
+    }
+
+    private func completeFramebufferUpdate(fromDirectSink: Bool) async throws {
         unacknowledgedUpdates = max(0, unacknowledgedUpdates - 1)
+        if !fromDirectSink {
+            pendingAsyncStreamFramebufferUpdates = max(0, pendingAsyncStreamFramebufferUpdates - 1)
+        }
+        if !unacknowledgedUpdateBytesQueue.isEmpty {
+            let released = unacknowledgedUpdateBytesQueue.removeFirst()
+            unacknowledgedUpdateBytes = max(0, unacknowledgedUpdateBytes - released)
+        }
         defer { resumeFramebufferCreditWaiterIfPossible() }
 
         if pendingAppleDCTAutoUpdateActivation {
@@ -1771,6 +1840,12 @@ public actor TransportSession {
         absoluteControlReleaseTask = nil
         framebufferCreditWaiter?.resume()
         framebufferCreditWaiter = nil
+        framebufferUpdateSink = nil
+        controlReadBuffer.removeAll(keepingCapacity: false)
+        controlReadOffset = 0
+        unacknowledgedUpdateBytesQueue.removeAll(keepingCapacity: false)
+        unacknowledgedUpdateBytes = 0
+        appleEncryptedInputCipher = nil
         appleMediaGenerationSink = nil
         appleMediaSenderClockSink = nil
         appleRemoteDisplaySizeSink = nil
@@ -2333,13 +2408,76 @@ public actor TransportSession {
     /// Granularity is one read: a single very large `read(exactly:)` updates
     /// the timestamp only when it completes, because the byte stream does not
     /// expose partial progress.
+    private var controlBufferedCount: Int {
+        controlReadBuffer.count - controlReadOffset
+    }
+
+    private func consumeControlBuffer(_ count: Int) -> Data {
+        if controlReadOffset == 0 && count == controlReadBuffer.count {
+            let result = controlReadBuffer
+            controlReadBuffer = Data()
+            return result
+        }
+        let start = controlReadBuffer.startIndex + controlReadOffset
+        let result = controlReadBuffer.subdata(in: start..<(start + count))
+        controlReadOffset += count
+        if controlReadOffset == controlReadBuffer.count {
+            controlReadBuffer.removeAll(keepingCapacity: true)
+            controlReadOffset = 0
+        } else if controlReadOffset > Self.controlReadCompactionThreshold {
+            controlReadBuffer.removeSubrange(
+                controlReadBuffer.startIndex..<(controlReadBuffer.startIndex + controlReadOffset))
+            controlReadOffset = 0
+        }
+        return result
+    }
+
+    private func fillControlBuffer(minimumNeeded: Int) async throws {
+        let requestSize = max(Self.controlReadChunkSize, minimumNeeded)
+        let chunk = try await tcp.read(upTo: requestSize)
+        noteControlChannelActivity(byteCount: chunk.count)
+        guard !chunk.isEmpty else { return }
+        if controlBufferedCount == 0 {
+            controlReadBuffer = chunk
+            controlReadOffset = 0
+        } else {
+            controlReadBuffer.append(chunk)
+        }
+    }
+
     private func readControlChannel(exactly count: Int) async throws -> Data {
-        let data = try await tcp.read(exactly: count)
-        noteControlChannelActivity(byteCount: data.count)
-        return data
+        guard count >= 0 else {
+            throw VNCProtocolError.protocolViolation("Negative read length")
+        }
+        guard count <= TCPConnection.maxExactReadBytes else {
+            throw VNCProtocolError.protocolViolation(
+                "Server demanded a \(count)-byte read; refusing "
+                    + "(stream desynchronized or hostile)")
+        }
+        guard count > 0 else { return Data() }
+        guard handshakeComplete else {
+            let data = try await tcp.read(exactly: count)
+            noteControlChannelActivity(byteCount: data.count)
+            return data
+        }
+        if controlBufferedCount >= count {
+            return consumeControlBuffer(count)
+        }
+        if controlBufferedCount == 0 && count >= Self.controlReadChunkSize {
+            let data = try await tcp.read(exactly: count)
+            noteControlChannelActivity(byteCount: data.count)
+            return data
+        }
+        while controlBufferedCount < count {
+            try await fillControlBuffer(minimumNeeded: count - controlBufferedCount)
+        }
+        return consumeControlBuffer(count)
     }
 
     private func readControlChannel(upTo maxCount: Int) async throws -> Data {
+        if handshakeComplete && controlBufferedCount > 0 {
+            return consumeControlBuffer(min(controlBufferedCount, maxCount))
+        }
         let data = try await tcp.read(upTo: maxCount)
         noteControlChannelActivity(byteCount: data.count)
         return data
@@ -2364,9 +2502,21 @@ public actor TransportSession {
 
     /// Framebuffer payloads scale with the negotiated screen, so the limit
     /// does too: twice the current full-screen raw size, floored generously
-    /// for the pre-ServerInit window and mid-negotiation format changes.
+    /// for the pre-ServerInit window and mid-negotiation format changes, and
+    /// capped to `TCPConnection.maxExactReadBytes` (256 MiB) for unframed
+    /// encodings such as Raw.
     private var maxFramebufferPayloadBytes: Int {
-        max(64 * 1024 * 1024, Int(fbWidth) * Int(fbHeight) * pixelFormat.bytesPerPixel * 2)
+        let geometryLimit = Int(fbWidth) * Int(fbHeight) * pixelFormat.bytesPerPixel * 2
+        return min(
+            TCPConnection.maxExactReadBytes,
+            max(64 * 1024 * 1024, geometryLimit))
+    }
+
+    /// Encodings that forward a 4-byte length prefix alongside their body
+    /// (`Zlib`, `ZRLE`, `Apple Adaptive DCT`) reserve 4 bytes for that header
+    /// so the combined buffer never exceeds `TCPConnection.maxExactReadBytes`.
+    private var maxLengthPrefixedFramebufferPayloadBytes: Int {
+        min(maxFramebufferPayloadBytes, TCPConnection.maxExactReadBytes - 4)
     }
 
     /// Cursors, cursor caches, and cut text are small auxiliary payloads.
@@ -2451,6 +2601,12 @@ public actor TransportSession {
         absoluteControlReleaseTask = nil
         framebufferCreditWaiter?.resume()
         framebufferCreditWaiter = nil
+        framebufferUpdateSink = nil
+        controlReadBuffer.removeAll(keepingCapacity: false)
+        controlReadOffset = 0
+        unacknowledgedUpdateBytesQueue.removeAll(keepingCapacity: false)
+        unacknowledgedUpdateBytes = 0
+        appleEncryptedInputCipher = nil
         _ = stateMachine.handle(event: .connectionLost(error))
         emitState()
         await stopAppleMediaUDP()
@@ -2470,6 +2626,7 @@ public actor TransportSession {
         var pendingResize: FramebufferRect?
         var classicAppleDisplayLayout: [AppleDisplayInfo] = []
         var completeAppleDisplayLayout: [AppleDisplayInfo]?
+        var emittedLayoutEvent = false
 
         for _ in 0..<rectCount {
             let rectData = try await readControlChannel(exactly: FramebufferRect.wireSize)
@@ -2509,9 +2666,9 @@ public actor TransportSession {
                     | Int(lenData[lenData.startIndex + 1]) << 16
                     | Int(lenData[lenData.startIndex + 2]) << 8
                     | Int(lenData[lenData.startIndex + 3])
-                guard compressedLen <= maxFramebufferPayloadBytes else {
+                guard compressedLen <= maxLengthPrefixedFramebufferPayloadBytes else {
                     throw oversizedPayloadError(
-                        compressedLen, limit: maxFramebufferPayloadBytes,
+                        compressedLen, limit: maxLengthPrefixedFramebufferPayloadBytes,
                         context: "\(rect.encoding.displayName) rect")
                 }
                 let compressedData = compressedLen > 0
@@ -2534,16 +2691,20 @@ public actor TransportSession {
                     | Int(lengthData[lengthData.startIndex + 1]) << 16
                     | Int(lengthData[lengthData.startIndex + 2]) << 8
                     | Int(lengthData[lengthData.startIndex + 3])
-                guard length <= maxFramebufferPayloadBytes else {
+                guard length <= maxLengthPrefixedFramebufferPayloadBytes else {
                     throw oversizedPayloadError(
-                        length, limit: maxFramebufferPayloadBytes,
+                        length, limit: maxLengthPrefixedFramebufferPayloadBytes,
                         context: "Apple Adaptive DCT record")
                 }
-                var fullPayload = lengthData
                 if length > 0 {
-                    fullPayload.append(try await readControlChannel(exactly: length))
+                    let body = try await readControlChannel(exactly: length)
+                    var fullPayload = Data(capacity: 4 + length)
+                    fullPayload.append(lengthData)
+                    fullPayload.append(body)
+                    pixelData = fullPayload
+                } else {
+                    pixelData = lengthData
                 }
-                pixelData = fullPayload
 
             case .copyRect:
                 // 4 bytes: srcX(2) + srcY(2)
@@ -2565,6 +2726,7 @@ public actor TransportSession {
                 let layout = try ExtendedDesktopSizePayload(data: payload)
                 try await noteStandardDesktopSizeSupport(layout)
                 continuation?.yield(.desktopLayout(layout))
+                emittedLayoutEvent = true
                 pixelData = payload
 
             case .encryptionInfo:
@@ -2812,6 +2974,7 @@ public actor TransportSession {
                     replacingLayout: true)
             }
             continuation?.yield(.appleDisplayLayout(completeAppleDisplayLayout))
+            emittedLayoutEvent = true
         } else if !classicAppleDisplayLayout.isEmpty {
             // ServerDisplayInfo records in one framebuffer update are one
             // complete classic layout snapshot. Commit once after parsing so
@@ -2822,6 +2985,7 @@ public actor TransportSession {
                     replacingLayout: true)
             }
             continuation?.yield(.appleDisplayLayout(classicAppleDisplayLayout))
+            emittedLayoutEvent = true
         }
 
         let receivedPortableFullFrame = rectsWithData.contains(where: { rect, _ in
@@ -2847,7 +3011,9 @@ public actor TransportSession {
         framebufferUpdateCount &+= 1
         framebufferRectCount &+= UInt64(rectsWithData.count)
         framebufferBytesReceived &+= UInt64(4 + rectsWithData.count * FramebufferRect.wireSize)
+        var updatePayloadBytes = 0
         for (rect, payload) in rectsWithData {
+            updatePayloadBytes += payload.count
             framebufferBytesReceived &+= UInt64(payload.count)
             if rect.encoding.isFramebufferContent {
                 var traffic = framebufferEncodingTraffic[rect.encoding] ?? (0, 0)
@@ -2861,7 +3027,6 @@ public actor TransportSession {
         if framebufferRequestSentNanos != 0 {
             let milliseconds = (now &- framebufferRequestSentNanos) / 1_000_000
             if milliseconds >= 100 {
-                let payloadBytes = rectsWithData.reduce(0) { $0 + $1.1.count }
                 let encodings = rectsWithData.map { rect, payload in
                     var description = String(describing: rect.encoding)
                     if rect.encoding == .appleMultiVariantScreenshare,
@@ -2873,13 +3038,31 @@ public actor TransportSession {
                 }.joined(separator: ",")
                 log.info(
                     "Framebuffer server/network wait=\(milliseconds)ms "
-                        + "rects=\(rectsWithData.count) payload=\(payloadBytes)B "
+                        + "rects=\(rectsWithData.count) payload=\(updatePayloadBytes)B "
                         + "encodings=\(encodings)")
             }
             framebufferRequestSentNanos = 0
         }
 
-        continuation?.yield(.framebufferUpdate(rectsWithData))
+        // Track in-flight credit BEFORE delivering to a direct off-MainActor
+        // sink so a fast sink returning credit synchronously or immediately
+        // on another queue can never underflow `unacknowledgedUpdates`.
+        unacknowledgedUpdates += 1
+        unacknowledgedUpdateBytesQueue.append(updatePayloadBytes)
+        unacknowledgedUpdateBytes += updatePayloadBytes
+
+        let deliveredDirectly: Bool
+        if !emittedLayoutEvent,
+           pendingAsyncStreamFramebufferUpdates == 0,
+           let sink = framebufferUpdateSink {
+            deliveredDirectly = sink(rectsWithData)
+        } else {
+            deliveredDirectly = false
+        }
+        if !deliveredDirectly {
+            pendingAsyncStreamFramebufferUpdates += 1
+            continuation?.yield(.framebufferUpdate(rectsWithData))
+        }
 
         // Pipeline the next incremental request the moment this update is
         // fully off the wire, so the server can produce the next update while
@@ -2888,7 +3071,6 @@ public actor TransportSession {
         // while local hardware-cursor shapes remain cursor pseudo-rectangles
         // on the encrypted control channel.
         let rects = rectsWithData.map(\.0)
-        unacknowledgedUpdates += 1
         let actions = stateMachine.handle(event: .receivedFramebufferUpdate(rects))
         for action in actions {
             if case .sendFramebufferUpdateRequest = action,
@@ -3888,11 +4070,23 @@ public actor TransportSession {
                 + error.localizedDescription)
     }
 
+    private var shouldWaitForFramebufferCredit: Bool {
+        if pendingAppleDCTAutoUpdateActivation
+            || pendingAppleClassicAutoUpdateActivation {
+            return unacknowledgedUpdates >= maxUnacknowledgedUpdates
+        }
+        if appleAutoUpdateActive {
+            return unacknowledgedUpdates >= maxAutoUpdateUnacknowledgedUpdates
+                || unacknowledgedUpdateBytes >= maxAutoUpdateUnacknowledgedBytes
+        }
+        return unacknowledgedUpdates >= maxUnacknowledgedUpdates
+    }
+
     private func waitForFramebufferCreditIfNeeded() async {
         guard !virtualDisplayReleaseRequested else { return }
-        guard unacknowledgedUpdates >= maxUnacknowledgedUpdates else { return }
+        guard shouldWaitForFramebufferCredit else { return }
         await withCheckedContinuation { continuation in
-            if unacknowledgedUpdates < maxUnacknowledgedUpdates {
+            if !shouldWaitForFramebufferCredit {
                 continuation.resume()
             } else {
                 precondition(framebufferCreditWaiter == nil)
@@ -3902,7 +4096,7 @@ public actor TransportSession {
     }
 
     private func resumeFramebufferCreditWaiterIfPossible() {
-        guard unacknowledgedUpdates < maxUnacknowledgedUpdates,
+        guard !shouldWaitForFramebufferCredit,
               let waiter = framebufferCreditWaiter else { return }
         framebufferCreditWaiter = nil
         waiter.resume()
@@ -4191,6 +4385,7 @@ public actor TransportSession {
         // Updates have no consumer left, and the read loop must reach the reply.
         framebufferCreditWaiter?.resume()
         framebufferCreditWaiter = nil
+        framebufferUpdateSink = nil
 
         if requestAppleMediaStream {
             // The Mac removes a media viewer's display at disconnect by

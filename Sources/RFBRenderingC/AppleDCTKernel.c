@@ -174,89 +174,323 @@ static void ycbcr_row_bgra(uint32_t *output, const uint8_t *y,
 }
 #endif
 
+static void fill_solid_tile_stride(
+    uint8_t *dst_row0,
+    size_t dst_stride,
+    int width,
+    int height,
+    uint32_t color) {
+#if RFB_DCT_NEON
+    if (width == 8) {
+        uint8x16_t fill = vreinterpretq_u8_u32(vdupq_n_u32(color));
+        for (int row = 0; row < height; ++row) {
+            uint8_t *dst = dst_row0 + (size_t)row * dst_stride;
+            vst1q_u8(dst, fill);
+            vst1q_u8(dst + 16, fill);
+        }
+        return;
+    }
+#endif
+    uint32_t row_pixels[8];
+    for (int col = 0; col < width; ++col) {
+        row_pixels[col] = color;
+    }
+    size_t row_bytes = (size_t)width * 4;
+    for (int row = 0; row < height; ++row) {
+        memcpy(dst_row0 + (size_t)row * dst_stride, row_pixels, row_bytes);
+    }
+}
+
+static void emit_constant_chroma_stride(
+    uint8_t *dst_row0,
+    size_t dst_stride,
+    int width,
+    int height,
+    const uint8_t y_plane[64],
+    uint8_t cb_byte,
+    uint8_t cr_byte) {
+    int cb = (int)cb_byte - 128;
+    int cr = (int)cr_byte - 128;
+    int r_off = (2048 + cr * 5743) >> 12;
+    int g_off = (2048 - cr * 2925 + ((cb * -1410) & ~255)) >> 12;
+    int b_off = (2048 + cb * 7258) >> 12;
+#if RFB_DCT_NEON
+    int16x8_t red = vdupq_n_s16((int16_t)r_off);
+    int16x8_t green = vdupq_n_s16((int16_t)g_off);
+    int16x8_t blue = vdupq_n_s16((int16_t)b_off);
+    uint8x8_t alpha = vdup_n_u8(255);
+    if (width == 8) {
+        for (int row = 0; row < height; ++row) {
+            int16x8_t yy = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(y_plane + row * 8)));
+            uint8x8x4_t bgra = {{vqmovun_s16(vaddq_s16(yy, blue)),
+                                vqmovun_s16(vaddq_s16(yy, green)),
+                                vqmovun_s16(vaddq_s16(yy, red)), alpha}};
+            vst4_u8(dst_row0 + (size_t)row * dst_stride, bgra);
+        }
+        return;
+    }
+    uint32_t row_buf[8];
+    size_t row_bytes = (size_t)width * 4;
+    for (int row = 0; row < height; ++row) {
+        int16x8_t yy = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(y_plane + row * 8)));
+        uint8x8x4_t bgra = {{vqmovun_s16(vaddq_s16(yy, blue)),
+                            vqmovun_s16(vaddq_s16(yy, green)),
+                            vqmovun_s16(vaddq_s16(yy, red)), alpha}};
+        vst4_u8((uint8_t *)row_buf, bgra);
+        memcpy(dst_row0 + (size_t)row * dst_stride, row_buf, row_bytes);
+    }
+#else
+    uint32_t row_buf[8];
+    size_t row_bytes = (size_t)width * 4;
+    for (int row = 0; row < height; ++row) {
+        const uint8_t *y_row = y_plane + row * 8;
+        for (int col = 0; col < width; ++col) {
+            int y = (int)y_row[col];
+            row_buf[col] = 0xff000000u
+                | ((uint32_t)clamp_u8(y + r_off) << 16)
+                | ((uint32_t)clamp_u8(y + g_off) << 8)
+                | (uint32_t)clamp_u8(y + b_off);
+        }
+        memcpy(dst_row0 + (size_t)row * dst_stride, row_buf, row_bytes);
+    }
+#endif
+}
+
+static int dequantize_plane(
+    int16_t dequantized[64],
+    const int16_t *source,
+    const uint16_t *quant
+#if RFB_DCT_NEON && !defined(__OPTIMIZE__)
+    , unsigned *out_magnitude
+#endif
+) {
+#if RFB_DCT_NEON
+    int16x8_t values = vmulq_s16(vld1q_s16(source), vreinterpretq_s16_u16(vld1q_u16(quant)));
+    vst1q_s16(dequantized, values);
+    int16x8_t ac_values = vsetq_lane_s16(0, values, 0);
+#if !defined(__OPTIMIZE__)
+    unsigned magnitude = vaddlvq_u16(vreinterpretq_u16_s16(vabsq_s16(values)));
+#endif
+    for (int i = 8; i < 64; i += 8) {
+        values = vmulq_s16(vld1q_s16(source + i), vreinterpretq_s16_u16(vld1q_u16(quant + i)));
+        vst1q_s16(dequantized + i, values);
+        ac_values = vorrq_s16(ac_values, values);
+#if !defined(__OPTIMIZE__)
+        magnitude += vaddlvq_u16(vreinterpretq_u16_s16(vabsq_s16(values)));
+#endif
+    }
+#if !defined(__OPTIMIZE__)
+    *out_magnitude = magnitude;
+#endif
+    return (int)vmaxvq_u16(vreinterpretq_u16_s16(ac_values));
+#else
+    int ac = 0;
+    for (int i = 0; i < 64; ++i) {
+        int16_t value = (int16_t)((uint32_t)(uint16_t)source[i] * (uint32_t)quant[i]);
+        dequantized[i] = value;
+        if (i != 0) ac |= (uint16_t)value;
+    }
+    return ac;
+#endif
+}
+
+static void run_idct(
+    uint8_t output[64],
+    const int16_t dequantized[64]
+#if RFB_DCT_NEON && !defined(__OPTIMIZE__)
+    , unsigned magnitude
+#endif
+) {
+#if RFB_DCT_NEON
+#if !defined(__OPTIMIZE__)
+    // At -O0 NEON intrinsics spill many intermediates. The scalar routine
+    // is faster there for small blocks. This conservative L1 bound keeps
+    // every 16-bit sum/narrow in the ARM transform in range (including its
+    // DC bias), so scalar and ARM rounding are identical. Larger blocks
+    // must retain the ARM wrapping behavior.
+    if (magnitude <= 2048) idct_block(output, dequantized);
+    else idct_block_neon(output, dequantized);
+#else
+    idct_block_neon(output, dequantized);
+#endif
+#else
+    idct_block(output, dequantized);
+#endif
+}
+
+void rfb_apple_dct_tile_bgra_stride(
+    uint8_t *dst_row0,
+    size_t dst_stride,
+    int width,
+    int height,
+    const int16_t coefficients[192],
+    const uint16_t luma_quantization[64],
+    const uint16_t chroma_quantization[64],
+    uint8_t flags) {
+    if (width <= 0 || height <= 0) return;
+    if (width > 8) width = 8;
+    if (height > 8) height = 8;
+
+    int16_t dequantized[64];
+    uint8_t planes[192];
+    uint8_t constant_value[3] = {0, 0, 0};
+    int constant_planes = 0;
+
+    if ((flags & (RFB_DCT_FLAG_CHROMA_DC_ONLY | RFB_DCT_FLAG_LUMA_DC_ONLY))
+        == (RFB_DCT_FLAG_CHROMA_DC_ONLY | RFB_DCT_FLAG_LUMA_DC_ONLY)) {
+        uint8_t y_dc = idct_dc((int16_t)((uint32_t)(uint16_t)coefficients[0] * (uint32_t)luma_quantization[0]));
+        uint8_t cb_dc = idct_dc((int16_t)((uint32_t)(uint16_t)coefficients[64] * (uint32_t)chroma_quantization[0]));
+        uint8_t cr_dc = idct_dc((int16_t)((uint32_t)(uint16_t)coefficients[128] * (uint32_t)chroma_quantization[0]));
+        fill_solid_tile_stride(dst_row0, dst_stride, width, height, ycbcr_to_bgra(y_dc, cb_dc, cr_dc));
+        return;
+    }
+
+    if (flags & RFB_DCT_FLAG_CHROMA_DC_ONLY) {
+        uint8_t cb_dc = idct_dc((int16_t)((uint32_t)(uint16_t)coefficients[64] * (uint32_t)chroma_quantization[0]));
+        uint8_t cr_dc = idct_dc((int16_t)((uint32_t)(uint16_t)coefficients[128] * (uint32_t)chroma_quantization[0]));
+#if RFB_DCT_NEON && !defined(__OPTIMIZE__)
+        unsigned magnitude = 0;
+        int ac = dequantize_plane(dequantized, coefficients, luma_quantization, &magnitude);
+#else
+        int ac = dequantize_plane(dequantized, coefficients, luma_quantization);
+#endif
+        if (ac == 0) {
+            uint8_t y_dc = idct_dc(dequantized[0]);
+            fill_solid_tile_stride(dst_row0, dst_stride, width, height, ycbcr_to_bgra(y_dc, cb_dc, cr_dc));
+            return;
+        }
+#if RFB_DCT_NEON && !defined(__OPTIMIZE__)
+        run_idct(planes, dequantized, magnitude);
+#else
+        run_idct(planes, dequantized);
+#endif
+        emit_constant_chroma_stride(dst_row0, dst_stride, width, height, planes, cb_dc, cr_dc);
+        return;
+    }
+
+    for (int plane = 0; plane < 3; ++plane) {
+        const uint16_t *quant = plane == 0 ? luma_quantization : chroma_quantization;
+        const int16_t *source = coefficients + plane * 64;
+        if (plane == 0 && (flags & RFB_DCT_FLAG_LUMA_DC_ONLY)) {
+            constant_value[0] = idct_dc((int16_t)((uint32_t)(uint16_t)source[0] * (uint32_t)quant[0]));
+            constant_planes |= 1;
+            continue;
+        }
+#if RFB_DCT_NEON && !defined(__OPTIMIZE__)
+        unsigned magnitude = 0;
+        int ac = dequantize_plane(dequantized, source, quant, &magnitude);
+#else
+        int ac = dequantize_plane(dequantized, source, quant);
+#endif
+        if (ac == 0) {
+            constant_value[plane] = idct_dc(dequantized[0]);
+            constant_planes |= 1 << plane;
+            continue;
+        }
+#if RFB_DCT_NEON && !defined(__OPTIMIZE__)
+        run_idct(planes + plane * 64, dequantized, magnitude);
+#else
+        run_idct(planes + plane * 64, dequantized);
+#endif
+    }
+
+    if (constant_planes == 7) {
+        uint32_t color = ycbcr_to_bgra(constant_value[0], constant_value[1], constant_value[2]);
+        fill_solid_tile_stride(dst_row0, dst_stride, width, height, color);
+        return;
+    }
+
+    if ((constant_planes & 6) == 6) {
+        emit_constant_chroma_stride(
+            dst_row0, dst_stride, width, height, planes, constant_value[1], constant_value[2]);
+        return;
+    }
+
+    // Materialize any remaining constant plane(s) before full YCbCr conversion.
+    for (int plane = 0; plane < 3; ++plane) {
+        if (constant_planes & (1 << plane)) {
+            memset(planes + plane * 64, constant_value[plane], 64);
+        }
+    }
+
+#if RFB_DCT_NEON && defined(__OPTIMIZE__)
+    if (width == 8) {
+        for (int row = 0; row < height; ++row) {
+            int offset = row * 8;
+            ycbcr_row_bgra(
+                (uint32_t *)(dst_row0 + (size_t)row * dst_stride),
+                planes + offset, planes + 64 + offset, planes + 128 + offset);
+        }
+    } else {
+        uint32_t row_buf[8];
+        size_t row_bytes = (size_t)width * 4;
+        for (int row = 0; row < height; ++row) {
+            int offset = row * 8;
+            ycbcr_row_bgra(row_buf, planes + offset, planes + 64 + offset, planes + 128 + offset);
+            memcpy(dst_row0 + (size_t)row * dst_stride, row_buf, row_bytes);
+        }
+    }
+#else
+    uint32_t row_buf[8];
+    size_t row_bytes = (size_t)width * 4;
+    for (int row = 0; row < height; ++row) {
+        int offset = row * 8;
+        for (int col = 0; col < width; ++col) {
+            row_buf[col] = ycbcr_to_bgra(
+                planes[offset + col], planes[64 + offset + col], planes[128 + offset + col]);
+        }
+        memcpy(dst_row0 + (size_t)row * dst_stride, row_buf, row_bytes);
+    }
+#endif
+}
+
 void rfb_apple_dct_tile_bgra(
     uint32_t output[64], const int16_t coefficients[192],
     const uint16_t luma_quantization[64],
     const uint16_t chroma_quantization[64]) {
-    int16_t dequantized[64];
-    uint8_t planes[192];
-    int constant_planes = 0;
-    for (int plane = 0; plane < 3; ++plane) {
-        const uint16_t *quant = plane == 0 ? luma_quantization : chroma_quantization;
-        const int16_t *source = coefficients + plane * 64;
+    rfb_apple_dct_tile_bgra_stride(
+        (uint8_t *)output, 8 * sizeof(uint32_t), 8, 8,
+        coefficients, luma_quantization, chroma_quantization, 0);
+}
+
+void rfb_copy_bgrx_to_opaque_bgra(
+    uint8_t *dst_row0,
+    size_t dst_stride,
+    const uint8_t *src_row0,
+    size_t src_stride,
+    int width,
+    int height) {
+    if (width <= 0 || height <= 0) return;
 #if RFB_DCT_NEON
-        int16x8_t values = vmulq_s16(vld1q_s16(source), vreinterpretq_s16_u16(vld1q_u16(quant)));
-        vst1q_s16(dequantized, values);
-        int16x8_t ac_values = vsetq_lane_s16(0, values, 0);
-#if !defined(__OPTIMIZE__)
-        unsigned magnitude = vaddlvq_u16(vreinterpretq_u16_s16(vabsq_s16(values)));
+    uint8x16_t alpha_mask = vreinterpretq_u8_u32(vdupq_n_u32(0xff000000u));
 #endif
-        for (int i = 8; i < 64; i += 8) {
-            values = vmulq_s16(vld1q_s16(source + i), vreinterpretq_s16_u16(vld1q_u16(quant + i)));
-            vst1q_s16(dequantized + i, values);
-            ac_values = vorrq_s16(ac_values, values);
-#if !defined(__OPTIMIZE__)
-            magnitude += vaddlvq_u16(vreinterpretq_u16_s16(vabsq_s16(values)));
-#endif
-        }
-        int ac = vmaxvq_u16(vreinterpretq_u16_s16(ac_values));
-#else
-        int ac = 0;
-        for (int i = 0; i < 64; ++i) {
-            int16_t value = (int16_t)(source[i] * quant[i]);
-            dequantized[i] = value;
-            if (i != 0) ac |= value;
-        }
-#endif
-        if (ac == 0) {
-            memset(planes + plane * 64, idct_dc(dequantized[0]), 64);
-            constant_planes |= 1 << plane;
-            continue;
-        }
+    for (int row = 0; row < height; ++row) {
+        uint8_t *dst = dst_row0 + (size_t)row * dst_stride;
+        const uint8_t *src = src_row0 + (size_t)row * src_stride;
+        int x = 0;
 #if RFB_DCT_NEON
-#if !defined(__OPTIMIZE__)
-        // At -O0 NEON intrinsics spill many intermediates. The scalar routine
-        // is faster there for small blocks. This conservative L1 bound keeps
-        // every 16-bit sum/narrow in the ARM transform in range (including its
-        // DC bias), so scalar and ARM rounding are identical. Larger blocks
-        // must retain the ARM wrapping behavior.
-        if (magnitude <= 2048) idct_block(planes + plane * 64, dequantized);
-        else idct_block_neon(planes + plane * 64, dequantized);
-#else
-        idct_block_neon(planes + plane * 64, dequantized);
-#endif
-#else
-        idct_block(planes + plane * 64, dequantized);
-#endif
-    }
-    if (constant_planes == 7) {
-        uint32_t color = ycbcr_to_bgra(planes[0], planes[64], planes[128]);
-        for (int i = 0; i < 64; ++i) output[i] = color;
-        return;
-    }
-#if RFB_DCT_NEON
-    if ((constant_planes & 6) == 6) {
-        // Base updates usually contain only a chroma DC predictor. Hoisting
-        // the color offsets avoids repeating multiplies for all 64 pixels.
-        int cb = (int)planes[64] - 128, cr = (int)planes[128] - 128;
-        int16x8_t red = vdupq_n_s16((2048 + cr * 5743) >> 12);
-        int16x8_t green = vdupq_n_s16((2048 - cr * 2925 + ((cb * -1410) & ~255)) >> 12);
-        int16x8_t blue = vdupq_n_s16((2048 + cb * 7258) >> 12);
-        for (int i = 0; i < 64; i += 8) {
-            int16x8_t yy = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(planes + i)));
-            uint8x8x4_t bgra = {{vqmovun_s16(vaddq_s16(yy, blue)),
-                                vqmovun_s16(vaddq_s16(yy, green)),
-                                vqmovun_s16(vaddq_s16(yy, red)), vdup_n_u8(255)}};
-            vst4_u8((uint8_t *)(output + i), bgra);
+        for (; x + 16 <= width; x += 16) {
+            size_t off = (size_t)x * 4;
+            uint8x16_t v0 = vorrq_u8(vld1q_u8(src + off), alpha_mask);
+            uint8x16_t v1 = vorrq_u8(vld1q_u8(src + off + 16), alpha_mask);
+            uint8x16_t v2 = vorrq_u8(vld1q_u8(src + off + 32), alpha_mask);
+            uint8x16_t v3 = vorrq_u8(vld1q_u8(src + off + 48), alpha_mask);
+            vst1q_u8(dst + off, v0);
+            vst1q_u8(dst + off + 16, v1);
+            vst1q_u8(dst + off + 32, v2);
+            vst1q_u8(dst + off + 48, v3);
         }
-        return;
+        for (; x + 4 <= width; x += 4) {
+            size_t off = (size_t)x * 4;
+            vst1q_u8(dst + off, vorrq_u8(vld1q_u8(src + off), alpha_mask));
+        }
+#endif
+        for (; x < width; ++x) {
+            size_t off = (size_t)x * 4;
+            uint32_t pixel;
+            memcpy(&pixel, src + off, 4);
+            pixel |= 0xff000000u;
+            memcpy(dst + off, &pixel, 4);
+        }
     }
-#endif
-#if RFB_DCT_NEON && defined(__OPTIMIZE__)
-    for (int i = 0; i < 64; i += 8)
-        ycbcr_row_bgra(output + i, planes + i, planes + 64 + i, planes + 128 + i);
-#else
-    for (int i = 0; i < 64; ++i)
-        output[i] = ycbcr_to_bgra(planes[i], planes[64 + i], planes[128 + i]);
-#endif
 }

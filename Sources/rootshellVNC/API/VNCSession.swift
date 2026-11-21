@@ -651,8 +651,64 @@ public final class VNCSession {
     /// The height of the remote framebuffer in pixels.
     public var framebufferHeight: Int = 0
 
+    /// Whether the Standard-mode renderer has presented at least one complete
+    /// frame for this connection (or retained one across reconnect). Views
+    /// observe this instead of `currentImage` so per-frame updates never
+    /// invalidate SwiftUI view bodies.
+    public private(set) var hasPresentedStandardPicture = false
+
+    /// Incremented whenever a new Standard-mode frame is published so external
+    /// `@Observable` observers of `currentImage` still receive notifications.
+    private var standardPresentedFrameRevision: UInt64 = 0
+    @ObservationIgnored
+    private var cachedCurrentImage: CGImage?
+    @ObservationIgnored
+    private var cachedCurrentImageRevision: UInt64 = 0
+    @ObservationIgnored
+    private var explicitCurrentImageOverride: (isSet: Bool, image: CGImage?) = (false, nil)
+
     /// The latest rendered framebuffer image, suitable for display.
-    public var currentImage: CGImage?
+    ///
+    /// Lazily materialized and cached per frame revision from the currently
+    /// presented IOSurface so `RemoteDesktopView` pays zero `CGImage` copy
+    /// overhead while external callers and tests retain full compatibility.
+    public var currentImage: CGImage? {
+        get {
+            _ = standardPresentedFrameRevision
+            if explicitCurrentImageOverride.isSet {
+                return explicitCurrentImageOverride.image
+            }
+            guard standardPresentedFrameRevision > 0 else { return nil }
+            if cachedCurrentImageRevision == standardPresentedFrameRevision,
+               let cached = cachedCurrentImage {
+                return cached
+            }
+            let image = standardFramebufferRenderer.makeCurrentCGImage()
+            cachedCurrentImage = image
+            cachedCurrentImageRevision = standardPresentedFrameRevision
+            return image
+        }
+        set {
+            if newValue == nil,
+               !explicitCurrentImageOverride.isSet,
+               standardPresentedFrameRevision == 0 {
+                return
+            }
+            explicitCurrentImageOverride = (true, newValue)
+            cachedCurrentImage = newValue
+            hasPresentedStandardPicture = newValue != nil
+            if let newValue {
+                standardFramebufferRenderer.present(
+                    image: newValue,
+                    cropRegion: presentedFramebufferRegion)
+            } else {
+                standardFramebufferRenderer.reset()
+            }
+            standardPipeline.clearDisplayedSurfaces()
+            standardPresentedFrameRevision &+= 1
+            cachedCurrentImageRevision = standardPresentedFrameRevision
+        }
+    }
 
     /// Drag-and-drop file transfer with a Mac.
     public let fileTransfers = VNCFileTransferController()
@@ -767,7 +823,14 @@ public final class VNCSession {
     // MARK: - Configuration
 
     /// The configuration for this session.
-    public var configuration: VNCConfiguration
+    public var configuration: VNCConfiguration {
+        didSet {
+            if configuration.targetFrameRate != oldValue.targetFrameRate
+                || configuration.enableProtocolTrace != oldValue.enableProtocolTrace {
+                syncStandardPipelineConfiguration()
+            }
+        }
+    }
 
     // MARK: - Host Hooks
 
@@ -835,6 +898,8 @@ public final class VNCSession {
             guard oldValue != suspendsDisplayPresentation else { return }
             videoBandRenderer.setPresentationSuspended(suspendsDisplayPresentation)
             secondaryVideoBandRenderer.setPresentationSuspended(suspendsDisplayPresentation)
+            standardFramebufferRenderer.setPresentationSuspended(suspendsDisplayPresentation)
+            standardPipeline.setSuspended(suspendsDisplayPresentation)
             if !suspendsDisplayPresentation, renderer != nil {
                 scheduleTrailingSnapshot(interval: 0)
             }
@@ -851,13 +916,15 @@ public final class VNCSession {
         suspendsDisplayPresentation = false
         videoBandRenderer.presentPendingBandsIfAny()
         secondaryVideoBandRenderer.presentPendingBandsIfAny()
-        if renderer != nil, trailingSnapshotTask == nil {
+        standardFramebufferRenderer.presentPendingIfAny()
+        if renderer != nil {
             scheduleTrailingSnapshot(interval: 0)
         }
     }
 
     // MARK: - Internal
 
+    @ObservationIgnored
     private var transportSession: TransportSession?
     /// Credentials for the active connection. Kept private so UI code can
     /// offer credential actions without ever reading or displaying the secret.
@@ -916,6 +983,7 @@ public final class VNCSession {
     private var remoteAudioPlayer: AppleRemoteAudioPlayer?
     @ObservationIgnored
     private var appleMediaPlaybackSynchronizer: AppleMediaPlaybackSynchronizer?
+    @ObservationIgnored
     private var eventTask: Task<Void, Never>?
     @ObservationIgnored
     private var remoteDisplayResizeTask: Task<Void, Never>?
@@ -962,6 +1030,13 @@ public final class VNCSession {
     private var pendingClipboardUploads = 0
     private let diagnostics = ConnectionDiagnostics()
     private let logger = VNCLogger(category: "Session")
+    /// GPU renderer for Standard-mode (including Apple Adaptive DCT) updates.
+    /// Presents IOSurface-backed dirty-rect frames directly on a `CALayer`
+    /// without per-frame `CGImage` copies or SwiftUI invalidation.
+    @ObservationIgnored
+    public let standardFramebufferRenderer = StandardFramebufferLayerRenderer()
+    @ObservationIgnored
+    private var standardPipeline: StandardFramebufferPipeline!
     /// GPU renderer for the high-performance HEVC screen bands. The
     /// ``RemoteDesktopView`` displays this directly (zero-copy) instead of
     /// pushing a full-screen CGImage through SwiftUI every frame.
@@ -1005,17 +1080,6 @@ public final class VNCSession {
         qos: .userInitiated)
     @ObservationIgnored
     private var standardFramebufferGeometrySequence: UInt64 = 0
-    @ObservationIgnored
-    private var lastFramebufferRenderDiagnosticNanos: UInt64 = 0
-    /// When the last framebuffer image was published to `currentImage`;
-    /// drives the publish-only targetFrameRate throttle.
-    @ObservationIgnored
-    private var lastImagePublishNanos: UInt64 = 0
-    @ObservationIgnored
-    private var trailingSnapshotTask: Task<Void, Never>?
-    @ObservationIgnored
-    private var initialFramePresentationTracker =
-        StandardInitialFramePresentationTracker()
     /// A zero-sized ServerInit lets Apple display records build the usable
     /// standard-mode union incrementally until a stronger resize source wins.
     @ObservationIgnored
@@ -1029,11 +1093,6 @@ public final class VNCSession {
     private var deferredFramebufferBytes = 0
     private static let maximumDeferredFramebufferBytes = 64 * 1024 * 1024
     private static let maximumDeferredFramebufferRects = 512
-    /// True only after this framebuffer generation has applied a pixel-bearing
-    /// batch that satisfies its initial-coverage gate. Reconciliation must not
-    /// snapshot a merely allocated (or retained retired) renderer before then.
-    @ObservationIgnored
-    private var standardFramebufferHasPresentablePixels = false
     /// Invalidates framebuffer render and snapshot work when a transport or
     /// renderer is replaced. The last complete `currentImage` may remain
     /// visible during reconnect, but no work from its retired generation may
@@ -1080,10 +1139,49 @@ public final class VNCSession {
     /// resolve through Retry, and nothing that merely happens to the app
     /// afterwards, an app switch included, may undo them.
     private var automaticRecoveryDeclined = false
-    /// Retired transports still closing, by server. A new connection to the
-    /// same server waits for them, so a virtual display release cannot land
-    /// on the display the new connection then requests.
-    private static var transportRetirements: [String: Task<Void, Never>] = [:]
+    /// Thread-safe registry of retired transports still closing, by server.
+    /// Synchronously registering here from both `retire(_:)` and `deinit`
+    /// ensures a replacement session dialing the same Mac always waits for
+    /// virtual-display teardown even when the previous session was released
+    /// without calling `disconnect()`.
+    private final class TransportRetirementRegistry: @unchecked Sendable {
+        private let lock = NSLock()
+        private var nextToken: UInt64 = 0
+        private var entries: [String: (token: UInt64, task: Task<Void, Never>)] = [:]
+
+        func retire(_ transport: TransportSession, serverKey: String?) {
+            guard let key = serverKey else {
+                Task { await transport.disconnect() }
+                return
+            }
+            lock.lock()
+            nextToken &+= 1
+            let token = nextToken
+            let previous = entries[key]?.task
+            let retirement = Task { [weak self] in
+                await previous?.value
+                await transport.disconnect()
+                self?.clearIfCurrent(key: key, token: token)
+            }
+            entries[key] = (token, retirement)
+            lock.unlock()
+        }
+
+        func waitForPendingRetirement(serverKey: String) async {
+            let pending = lock.withLock { entries[serverKey]?.task }
+            await pending?.value
+        }
+
+        private func clearIfCurrent(key: String, token: UInt64) {
+            lock.lock()
+            if entries[key]?.token == token {
+                entries[key] = nil
+            }
+            lock.unlock()
+        }
+    }
+
+    private nonisolated static let transportRetirementRegistry = TransportRetirementRegistry()
     @ObservationIgnored
     private var transportServerKey: String?
     /// The session closed its connection ahead of a suspension and owes a
@@ -1153,6 +1251,18 @@ public final class VNCSession {
     public init(configuration: VNCConfiguration = VNCConfiguration()) {
         self.configuration = configuration
         fileTransfers.session = self
+        self.standardPipeline = StandardFramebufferPipeline(
+            queue: framebufferRenderQueue,
+            onSurfaceReady: { [weak self] in
+                Task { @MainActor [weak self] in
+                    self?.drainPendingStandardSurface()
+                }
+            },
+            onSideEffects: { [weak self] effects in
+                Task { @MainActor [weak self] in
+                    await self?.applyStandardPipelineSideEffects(effects)
+                }
+            })
         videoBandRenderer.onFrameCommitted = {
             [weak self] pixelBuffer, streamGeneration in
             self?.considerAppleLoginVisionFrame(
@@ -1167,7 +1277,19 @@ public final class VNCSession {
 
     deinit {
         reconnectTask?.cancel()
+        eventTask?.cancel()
+        inputTask?.cancel()
+        remoteDisplayResizeTask?.cancel()
+        appleLoginVisionTask?.cancel()
+        appleLoginVisionRetryTask?.cancel()
+        appleLoginVisionStabilityTask?.cancel()
         remoteAudioPlayer?.stop()
+        standardPipeline?.invalidate(newGeneration: framebufferPresentationGeneration &+ 1)
+        if let transport = transportSession {
+            Self.transportRetirementRegistry.retire(
+                transport,
+                serverKey: transportServerKey)
+        }
         #if canImport(UIKit)
         backgroundLifecycleTask?.cancel()
         foregroundLifecycleTask?.cancel()
@@ -1226,7 +1348,7 @@ public final class VNCSession {
                 + "\(configuration.effectiveEncodings.contains(.unknown(1105)))")
         appleMediaTilesPerFrameOverride = nil
         lastError = nil
-        currentImage = nil
+        clearStandardPresentedPicture()
         remoteCursor = nil
         remoteCursorPresence = .undescribed
         negotiatedCursorRendering = nil
@@ -1345,7 +1467,7 @@ public final class VNCSession {
         // Clear rendering state
         framebuffer = nil
         renderer = nil
-        currentImage = nil
+        clearStandardPresentedPicture()
         remoteCursor = nil
         remoteCursorPresence = .undescribed
         negotiatedCursorRendering = nil
@@ -2243,6 +2365,8 @@ public final class VNCSession {
             return region
         }
         await installDeferredFramebufferFromRemoteDisplayLayoutIfPossible()
+        standardPipeline.updateDisplayRegions(remoteDisplayRegions)
+        standardFramebufferRenderer.setCropRegion(presentedFramebufferRegion)
         applyDiscoveredRemoteMediaGeometry()
     }
 
@@ -2263,6 +2387,8 @@ public final class VNCSession {
             return region
         }
         await installDeferredFramebufferFromRemoteDisplayLayoutIfPossible()
+        standardPipeline.updateDisplayRegions(remoteDisplayRegions)
+        standardFramebufferRenderer.setCropRegion(presentedFramebufferRegion)
         applyDiscoveredRemoteMediaGeometry()
     }
 
@@ -2413,102 +2539,50 @@ public final class VNCSession {
             renderRects = deferredFramebufferRects + rects
             deferredFramebufferRects.removeAll(keepingCapacity: true)
             deferredFramebufferBytes = 0
+            syncStandardPipelineConfiguration()
         }
         let presentationGeneration = framebufferPresentationGeneration
-
-        // Publish-only throttle: rects are always applied (persistent codec
-        // state) and the transport credit is always returned, but the
-        // full-framebuffer snapshot + image publish is capped at
-        // targetFrameRate. A trailing snapshot guarantees the final state
-        // always renders after a burst.
-        let publishInterval = UInt64(
-            1_000_000_000 / max(1, configuration.targetFrameRate))
-        let renderStarted = DispatchTime.now().uptimeNanoseconds
-        let publishDue = renderStarted &- lastImagePublishNanos >= publishInterval
-        let carriesFramebufferPixels = StandardFramebufferPresentationPolicy
-            .carriesFramebufferPixels(renderRects)
-        let initialFramePresentationAllowed = initialFramePresentationTracker
-            .ingest(
-                renderRects,
-                framebufferWidth: framebufferWidth,
-                framebufferHeight: framebufferHeight,
-                displayRegions: remoteDisplayRegions)
         let displaySuspended = suspendsDisplayPresentation
             || VNCPresentationPolicy.isPresentationProhibited()
-        let takeSnapshot = publishDue
-            && carriesFramebufferPixels
-            && initialFramePresentationAllowed
-            && !displaySuspended
-        let result = await withCheckedContinuation { continuation in
-            framebufferRenderQueue.async {
-                continuation.resume(
-                    returning: renderer.applyBatch(
-                        renderRects,
-                        snapshot: takeSnapshot))
-            }
-        }
+        let outcome = await standardPipeline.processAsyncStreamBatch(
+            renderRects,
+            generation: presentationGeneration,
+            renderer: renderer,
+            transport: transport,
+            displaySuspended: displaySuspended)
+
         // The old renderer must finish its serial codec work, but a transport
         // replacement while it ran retires every observable result from it.
         guard transportSession === transport,
               framebufferPresentationGeneration == presentationGeneration,
-              self.renderer === renderer else { return false }
-        if carriesFramebufferPixels && initialFramePresentationAllowed {
-            standardFramebufferHasPresentablePixels = true
-        }
-        let renderFinished = DispatchTime.now().uptimeNanoseconds
-        let renderMilliseconds = (renderFinished &- renderStarted) / 1_000_000
-        if renderMilliseconds >= 100,
-           (lastFramebufferRenderDiagnosticNanos == 0
-                || renderFinished &- lastFramebufferRenderDiagnosticNanos
-                    >= 1_000_000_000) {
-            lastFramebufferRenderDiagnosticNanos = renderFinished
-            let payloadBytes = renderRects.reduce(0) { $0 + $1.1.count }
-            let encodings = renderRects.map { String(describing: $0.0.encoding) }
-                .joined(separator: ",")
-            logger.info(
-                "Framebuffer decode/snapshot=\(renderMilliseconds)ms "
-                    + "rects=\(renderRects.count) payload=\(payloadBytes)B "
-                    + "encodings=\(encodings)")
+              self.renderer === renderer else {
+            return false
         }
 
-        for issue in result.issues {
+        if let slowLog = outcome.slowRenderDiagnostic {
+            logger.info("\(slowLog)")
+        }
+        for issue in outcome.issues {
             logger.warning("\(issue)")
         }
-        if let width = result.resizedWidth,
-           let height = result.resizedHeight {
-            await applyDesktopResizeMetadata(width: width, height: height)
+        if let width = outcome.resizedWidth,
+           let height = outcome.resizedHeight {
+            await applyDesktopResizeMetadata(
+                width: width,
+                height: height,
+                resizeExistingRenderer: false)
         }
-        // Delivery-time recheck: the device can lock while applyBatch runs on
-        // the render queue, making the pre-render gate sample stale. A
-        // suppressed image falls through to the trailing-snapshot path, whose
-        // task re-gates itself at publish time.
-        if let image = result.image,
-           !suspendsDisplayPresentation,
-           !VNCPresentationPolicy.isPresentationProhibited() {
-            trailingSnapshotTask?.cancel()
-            trailingSnapshotTask = nil
-            currentImage = image
-            lastImagePublishNanos = DispatchTime.now().uptimeNanoseconds
-            considerAppleLoginVisionFrame(
-                .image(image),
-                source: "Standard framebuffer snapshot")
-        } else if (carriesFramebufferPixels && initialFramePresentationAllowed)
-                    || displaySuspended {
-            // Control-only DCT type 2 carries quantization tables, not pixels.
-            // It must never publish the newly allocated black framebuffer or
-            // anchor an image timer before the first image arrives.
-            scheduleTrailingSnapshot(interval: publishInterval)
+        // Delivery-time recheck: drain through the exact same coalescing
+        // handoff slot as direct deliveries so path switches always present
+        // only the newest frame in strict decode order.
+        let presentationBlocked = suspendsDisplayPresentation
+            || VNCPresentationPolicy.isPresentationProhibited()
+        if outcome.hasPendingSurface {
+            drainPendingStandardSurface()
+        } else if outcome.shouldScheduleTrailing, !presentationBlocked {
+            scheduleTrailingSnapshot(interval: outcome.trailingDelayNanoseconds)
         }
-        switch result.cursorUpdate {
-        case .shape(let cursor):
-            remoteCursor = cursor
-            remoteCursorPresence = .described
-        case .hidden:
-            remoteCursor = nil
-            remoteCursorPresence = .hidden
-        case nil:
-            break
-        }
+        applyCursorUpdate(outcome.cursorUpdate)
         return true
     }
 
@@ -2553,14 +2627,16 @@ public final class VNCSession {
     private func applyDesktopResizeMetadata(
         width: UInt16,
         height: UInt16,
-        mediaDisplaySizeOverride: (width: Int, height: Int)? = nil
+        mediaDisplaySizeOverride: (width: Int, height: Int)? = nil,
+        resizeExistingRenderer: Bool = true
     ) async {
         let newWidth = Int(width)
         let newHeight = Int(height)
         guard newWidth > 0, newHeight > 0 else { return }
         let geometryChanged = await applyStandardFramebufferGeometry(
             width: width,
-            height: height)
+            height: height,
+            resizeExistingRenderer: resizeExistingRenderer)
         guard geometryChanged || mediaDisplaySizeOverride != nil else { return }
 
         func mediaDisplaySize(at index: Int) -> (width: Int, height: Int) {
@@ -2623,7 +2699,8 @@ public final class VNCSession {
     @discardableResult
     private func applyStandardFramebufferGeometry(
         width: UInt16,
-        height: UInt16
+        height: UInt16,
+        resizeExistingRenderer: Bool = true
     ) async -> Bool {
         let newWidth = Int(width)
         let newHeight = Int(height)
@@ -2638,8 +2715,16 @@ public final class VNCSession {
         // Must match what the transport sent in SetPixelFormat — decoding
         // with the server's pre-negotiation format would corrupt every rect.
         let pixelFormat = configuration.effectivePixelFormat
-        let installation: (Framebuffer, FramebufferRenderer)? =
-            await withCheckedContinuation { continuation in
+        let installation: (Framebuffer, FramebufferRenderer)?
+        if let existingRenderer, !resizeExistingRenderer {
+            // The batch that announced this resize already applied
+            // `handleDesktopResize` in wire order on `framebufferRenderQueue`.
+            // Do not re-enqueue a delayed resize that could truncate a newer
+            // frame after rapid shrink/grow transitions.
+            _ = existingRenderer
+            installation = nil
+        } else {
+            installation = await withCheckedContinuation { continuation in
                 framebufferRenderQueue.async {
                     if let existingRenderer {
                         existingRenderer.handleDesktopResize(
@@ -2659,6 +2744,7 @@ public final class VNCSession {
                     }
                 }
             }
+        }
         guard sequence == standardFramebufferGeometrySequence,
               presentationGeneration == framebufferPresentationGeneration else {
             return false
@@ -2678,6 +2764,7 @@ public final class VNCSession {
             framebufferWidth = newWidth
             framebufferHeight = newHeight
         }
+        syncStandardPipelineConfiguration()
         return geometryChanged
     }
 
@@ -3248,6 +3335,10 @@ public final class VNCSession {
                 }
             }.value
 
+            // The detached Vision closure has released its retained CVPixelBuffer
+            // (dropping IOSurfaceIsInUse); wake any deferred surface sync immediately.
+            self?.standardPipeline.notifyExternalReaderReleased()
+
             guard let self, !Task.isCancelled,
                   generation == self.appleLoginVisionGeneration else { return }
             self.appleLoginVisionTask = nil
@@ -3505,27 +3596,14 @@ public final class VNCSession {
     /// while the server gets ready to release a virtual display.
     private func retire(_ transport: TransportSession?) {
         guard let transport else { return }
-        guard let key = transportServerKey else {
-            Task { await transport.disconnect() }
-            return
-        }
-        let previous = Self.transportRetirements[key]
-        let retirement = Task {
-            await previous?.value
-            await transport.disconnect()
-        }
-        Self.transportRetirements[key] = retirement
-        Task { @MainActor in
-            await retirement.value
-            if Self.transportRetirements[key] == retirement {
-                Self.transportRetirements[key] = nil
-            }
-        }
+        Self.transportRetirementRegistry.retire(
+            transport,
+            serverKey: transportServerKey)
     }
 
     private func establishTransport(credentials: VNCCredentials) async throws {
         let serverKey = "\(credentials.host):\(credentials.port)"
-        await Self.transportRetirements[serverKey]?.value
+        await Self.transportRetirementRegistry.waitForPendingRetirement(serverKey: serverKey)
         try Task.checkCancellation()
         transportServerKey = serverKey
         // A custom transport is built fresh here for every attempt: the
@@ -3576,6 +3654,11 @@ public final class VNCSession {
                 pointHeight: preparedClientDisplaySize.pointHeight)
         }
 
+        let pipeline = standardPipeline!
+        await transport.setFramebufferUpdateSink { [weak transport, weak pipeline] rects in
+            guard let transport, let pipeline else { return false }
+            return pipeline.enqueueDirect(rects, from: transport)
+        }
         startEventProcessing(transport: transport)
         try await transport.connectReportingAppleClipboardReplies()
     }
@@ -3824,57 +3907,132 @@ public final class VNCSession {
     }
 
     private func scheduleTrailingSnapshot(interval: UInt64) {
-        guard trailingSnapshotTask == nil,
-              !initialFramePresentationTracker.suppressesPresentation,
-              standardFramebufferHasPresentablePixels,
-              let renderer else { return }
-        let presentationGeneration = framebufferPresentationGeneration
-        let cadenceDelay = interval &- min(
-            interval,
-            DispatchTime.now().uptimeNanoseconds &- lastImagePublishNanos)
-        trailingSnapshotTask = Task { [weak self] in
-            try? await Task.sleep(for: .nanoseconds(Int64(cadenceDelay)))
-            guard let self, !Task.isCancelled else { return }
-            guard self.framebufferPresentationGeneration
-                    == presentationGeneration,
-                  self.renderer === renderer else { return }
-            guard !self.initialFramePresentationTracker.suppressesPresentation
-            else {
-                self.trailingSnapshotTask = nil
-                return
-            }
-            let queue = self.framebufferRenderQueue
-            let image = await withCheckedContinuation { continuation in
-                queue.async {
-                    continuation.resume(returning: renderer.snapshot())
-                }
-            }
-            guard !Task.isCancelled,
-                  self.framebufferPresentationGeneration
-                    == presentationGeneration,
-                  self.renderer === renderer else { return }
-            guard !self.initialFramePresentationTracker.suppressesPresentation
-            else {
-                self.trailingSnapshotTask = nil
-                return
-            }
-            // Delivery-time presentation check: the device may have locked
-            // while this task slept. The suspension-clear reconcile schedules
-            // a fresh trailing snapshot.
-            guard !self.suspendsDisplayPresentation,
-                  !VNCPresentationPolicy.isPresentationProhibited() else {
-                self.trailingSnapshotTask = nil
-                return
-            }
-            if let image {
-                self.currentImage = image
-                self.lastImagePublishNanos = DispatchTime.now().uptimeNanoseconds
-                self.considerAppleLoginVisionFrame(
-                    .image(image),
-                    source: "Standard trailing snapshot")
-            }
-            self.trailingSnapshotTask = nil
+        guard let renderer, let transport = transportSession else { return }
+        standardPipeline.scheduleReconciliation(
+            delayNanoseconds: interval,
+            generation: framebufferPresentationGeneration,
+            renderer: renderer,
+            transport: transport)
+    }
+
+    private func drainPendingStandardSurface() {
+        guard let pending = standardPipeline.drainPendingSurface() else { return }
+        guard transportSession === pending.transport,
+              framebufferPresentationGeneration == pending.generation,
+              self.renderer === pending.renderer else {
+            standardPipeline.releaseDrainingSurface(allowRetry: false)
+            return
         }
+        guard !suspendsDisplayPresentation,
+              !VNCPresentationPolicy.isPresentationProhibited() else {
+            // Release the reserved surface and stay idle until
+            // `reconcileDisplayPresentation()` resumes presentation; do not
+            // schedule a repeating timer while the gate is active.
+            standardPipeline.releaseDrainingSurface(allowRetry: false)
+            return
+        }
+        commitStandardSurface(pending.surface, source: "Standard framebuffer surface")
+    }
+
+    private func applyStandardPipelineSideEffects(
+        _ effects: StandardFramebufferPipeline.SideEffects
+    ) async {
+        guard transportSession === effects.transport,
+              framebufferPresentationGeneration == effects.generation,
+              self.renderer === effects.renderer else { return }
+        if let slowLog = effects.slowRenderDiagnostic {
+            logger.info("\(slowLog)")
+        }
+        for issue in effects.issues {
+            logger.warning("\(issue)")
+        }
+        if let width = effects.resizedWidth,
+           let height = effects.resizedHeight {
+            await applyDesktopResizeMetadata(
+                width: width,
+                height: height,
+                resizeExistingRenderer: false)
+        }
+        applyCursorUpdate(effects.cursorUpdate)
+    }
+
+    private func commitStandardSurface(
+        _ surface: FramebufferPresentationSurface,
+        source: String
+    ) {
+        standardFramebufferRenderer.present(
+            surface,
+            cropRegion: presentedFramebufferRegion)
+        standardPipeline.finishSurfaceDelivery(
+            displayed: standardFramebufferRenderer.latestPresentedSurface,
+            previous: standardFramebufferRenderer.previousPresentedSurface)
+        explicitCurrentImageOverride = (false, nil)
+        if !hasPresentedStandardPicture {
+            hasPresentedStandardPicture = true
+        }
+        standardPresentedFrameRevision &+= 1
+        if configuration.promptForLoginPasswordAtLoginWindow,
+           canSendLoginPassword {
+            if let retainedPixelBuffer = surface.makeRetainedPixelBufferForReading() {
+                considerAppleLoginVisionFrame(
+                    .pixelBuffer(retainedPixelBuffer),
+                    source: source)
+            } else if let snapshotImage = surface.makeCGImage() {
+                considerAppleLoginVisionFrame(
+                    .image(snapshotImage),
+                    source: source)
+            }
+        }
+    }
+
+    private func applyCursorUpdate(_ cursorUpdate: RemoteCursorUpdate?) {
+        switch cursorUpdate {
+        case .shape(let cursor):
+            if remoteCursor?.image !== cursor.image {
+                remoteCursor = cursor
+            }
+            if remoteCursorPresence != .described {
+                remoteCursorPresence = .described
+            }
+        case .hidden:
+            if remoteCursor != nil {
+                remoteCursor = nil
+            }
+            if remoteCursorPresence != .hidden {
+                remoteCursorPresence = .hidden
+            }
+        case nil:
+            break
+        }
+    }
+
+    private func clearStandardPresentedPicture() {
+        standardFramebufferRenderer.reset()
+        standardPipeline.clearDisplayedSurfaces()
+        explicitCurrentImageOverride = (false, nil)
+        cachedCurrentImage = nil
+        cachedCurrentImageRevision = 0
+        if hasPresentedStandardPicture {
+            hasPresentedStandardPicture = false
+        }
+        if standardPresentedFrameRevision != 0 {
+            standardPresentedFrameRevision = 0
+        }
+    }
+
+    private func syncStandardPipelineConfiguration() {
+        standardPipeline.configure(
+            generation: framebufferPresentationGeneration,
+            renderer: renderer,
+            transport: transportSession,
+            width: framebufferWidth,
+            height: framebufferHeight,
+            displayRegions: remoteDisplayRegions,
+            targetFrameRate: configuration.targetFrameRate,
+            directSinkArmed: renderer != nil
+                && transportSession != nil
+                && !isTraceEnabled
+                && deferredFramebufferRects.isEmpty)
     }
 
     /// Retire all standard-framebuffer presentation work without clearing the
@@ -3882,13 +4040,9 @@ public final class VNCSession {
     /// the replacement generation establishes complete initial coverage.
     private func invalidateStandardFramebufferPresentation() {
         framebufferPresentationGeneration &+= 1
-        trailingSnapshotTask?.cancel()
-        trailingSnapshotTask = nil
-        initialFramePresentationTracker.reset()
-        standardFramebufferHasPresentablePixels = false
-        lastImagePublishNanos = 0
         deferredFramebufferRects.removeAll(keepingCapacity: true)
         deferredFramebufferBytes = 0
+        standardPipeline.invalidate(newGeneration: framebufferPresentationGeneration)
     }
 
     private static func batchableInputEvent(
@@ -3932,7 +4086,8 @@ public final class VNCSession {
         cleanupTransport(clearCredentials: false)
         connectionState = .reconnecting(attempt: 1, delay: 0)
         retire(transport)
-        await Self.transportRetirements[transportServerKey ?? ""]?.value
+        await Self.transportRetirementRegistry.waitForPendingRetirement(
+            serverKey: transportServerKey ?? "")
     }
 
     /// Reconnect a session that left for a suspension. Returns whether it had.

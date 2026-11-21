@@ -71,9 +71,9 @@ public struct RemoteDesktopView: View {
     private let isFullScreen: Bool
     private let toggleFullScreen: (() -> Void)?
     private let hudMenuExtras: VNCHUDMenuExtras
+    private var screenPlaceholder: AnyView?
     #if canImport(UIKit)
     private var hudAccessory: HUDAccessory?
-    private var screenPlaceholder: AnyView?
     #endif
     private let keyboardAvoidanceMode: VNCKeyboardAvoidanceMode
     /// Edges whose safe area the HUD keeps clear of. A host that covers a
@@ -1167,8 +1167,8 @@ struct HUDButtonChromeModifier: ViewModifier {
     }
 }
 
-/// Owns the hot standard-framebuffer observation so publishing a new image
-/// does not invalidate the parent view that owns the HUD Menu.
+/// Owns the hot standard-framebuffer observation so publishing a new frame
+/// never invalidates the parent view (or even this view) per frame.
 private struct StandardFramebufferContent: View {
     @Bindable var session: VNCSession
     /// False when the host renders its own connected-but-no-frame prompt.
@@ -1177,26 +1177,28 @@ private struct StandardFramebufferContent: View {
     let viewSize: CGSize
 
     var body: some View {
-        if let image = session.currentImage {
-            let displayedImage = cropped(image) ?? image
-            let imageSize = CGSize(
-                width: displayedImage.width,
-                height: displayedImage.height)
-            let fit = RemoteViewportState.fitScale(content: imageSize, into: viewSize)
-            Image(decorative: displayedImage, scale: 1)
-                .interpolation(.high)
-                .resizable()
-                .frame(
-                    width: imageSize.width * fit.width,
-                    height: imageSize.height * fit.height)
-                .overlay {
-                    #if canImport(UIKit) || canImport(AppKit)
-                    VNCEDRImageView(
-                        image: displayedImage,
-                        brightnessGain: brightnessGain)
-                        .allowsHitTesting(false)
-                    #endif
-                }
+        if session.hasPresentedStandardPicture {
+            #if canImport(UIKit) || canImport(AppKit)
+            StandardFramebufferView(
+                renderer: session.standardFramebufferRenderer,
+                cropRegion: session.presentedFramebufferRegion,
+                brightnessGain: brightnessGain)
+                .frame(width: viewSize.width, height: viewSize.height)
+            #else
+            if let image = session.currentImage {
+                let displayedImage = cropped(image) ?? image
+                let imageSize = CGSize(
+                    width: displayedImage.width,
+                    height: displayedImage.height)
+                let fit = RemoteViewportState.fitScale(content: imageSize, into: viewSize)
+                Image(decorative: displayedImage, scale: 1)
+                    .interpolation(.high)
+                    .resizable()
+                    .frame(
+                        width: imageSize.width * fit.width,
+                        height: imageSize.height * fit.height)
+            }
+            #endif
         } else if showsWaitingCard, session.connectionState.isConnected {
             // Handshake finished but no framebuffer content has been
             // published. The reconnect/failure overlays own the other states.
@@ -1209,6 +1211,7 @@ private struct StandardFramebufferContent: View {
         }
     }
 
+    #if !canImport(UIKit) && !canImport(AppKit)
     private func cropped(_ image: CGImage) -> CGImage? {
         guard let region = session.presentedFramebufferRegion else { return nil }
         let imageBounds = CGRect(
@@ -1218,6 +1221,7 @@ private struct StandardFramebufferContent: View {
         guard !crop.isEmpty, crop != imageBounds else { return nil }
         return image.cropping(to: crop)
     }
+    #endif
 }
 
 #if canImport(UIKit)
@@ -1277,94 +1281,6 @@ private struct AdaptiveDisplayView: View {
             .offset(
                 x: origin.x + region.minX * scale.width,
                 y: origin.y + region.minY * scale.height)
-    }
-}
-#endif
-
-#if canImport(UIKit)
-private struct VNCEDRImageView: UIViewRepresentable {
-    let image: CGImage
-    let brightnessGain: Double
-
-    func makeUIView(context: Context) -> VNCEDRImageHostView {
-        let view = VNCEDRImageHostView()
-        view.update(image: image, gain: brightnessGain)
-        return view
-    }
-
-    func updateUIView(_ uiView: VNCEDRImageHostView, context: Context) {
-        uiView.update(image: image, gain: brightnessGain)
-    }
-}
-
-@MainActor
-private final class VNCEDRImageHostView: UIView {
-    private let presenter = VNCBrightnessPresenter(contentsGravity: .resize)
-
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        isUserInteractionEnabled = false
-        backgroundColor = .clear
-        layer.addSublayer(presenter.layer)
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    func update(image: CGImage, gain: Double) {
-        presenter.setSource(image, gain: gain)
-    }
-
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        presenter.layer.frame = bounds
-        CATransaction.commit()
-    }
-}
-#elseif canImport(AppKit)
-private struct VNCEDRImageView: NSViewRepresentable {
-    let image: CGImage
-    let brightnessGain: Double
-
-    func makeNSView(context: Context) -> VNCEDRImageHostView {
-        let view = VNCEDRImageHostView()
-        view.update(image: image, gain: brightnessGain)
-        return view
-    }
-
-    func updateNSView(_ nsView: VNCEDRImageHostView, context: Context) {
-        nsView.update(image: image, gain: brightnessGain)
-    }
-}
-
-@MainActor
-private final class VNCEDRImageHostView: NSView {
-    private let presenter = VNCBrightnessPresenter(contentsGravity: .resize)
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.clear.cgColor
-        layer?.addSublayer(presenter.layer)
-    }
-
-    convenience init() { self.init(frame: .zero) }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    func update(image: CGImage, gain: Double) {
-        presenter.setSource(image, gain: gain)
-    }
-
-    override func layout() {
-        super.layout()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        presenter.layer.frame = bounds
-        CATransaction.commit()
     }
 }
 #endif

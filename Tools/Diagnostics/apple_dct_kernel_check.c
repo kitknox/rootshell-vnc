@@ -75,4 +75,88 @@ int main(void) {
 
     puts("DC, sparse, dense, constant chroma, and wide quantization: exact match");
 
+    // Cross-check direct-to-stride fast paths and edge clipping against reference.
+    {
+        const uint8_t sentinel = 0xA5;
+        uint8_t fb[12 * 64];
+        for (int mode = 0; mode < 4; ++mode) {
+            memset(c, 0, sizeof(c));
+            for (int i = 0; i < 64; ++i) { q[i] = 1 + (next() % 64); qc[i] = 1 + (next() % 64); }
+            c[0] = (int16_t)(next() % 1024) - 512;
+            c[64] = (int16_t)(next() % 512) - 256;
+            c[128] = (int16_t)(next() % 512) - 256;
+            uint8_t flags = 0;
+            if (mode == 0) {
+                flags = RFB_DCT_FLAG_CHROMA_DC_ONLY | RFB_DCT_FLAG_LUMA_DC_ONLY;
+            } else if (mode == 1) {
+                for (int i = 1; i < 20; ++i) c[i] = (int8_t)next();
+                flags = RFB_DCT_FLAG_CHROMA_DC_ONLY;
+            } else if (mode == 2) {
+                for (int i = 1; i < 64; ++i) c[i] = (int8_t)next();
+                for (int i = 65; i < 84; ++i) c[i] = (int8_t)next();
+                flags = 0;
+            } else {
+                for (int i = 1; i < 64; ++i) c[i] = (int8_t)next();
+                for (int i = 65; i < 84; ++i) c[i] = (int8_t)next();
+                for (int i = 129; i < 143; ++i) c[i] = (int8_t)next();
+                flags = 0;
+            }
+            uint32_t expected[64];
+            rfb_apple_dct_tile_bgra(expected, c, q, qc);
+            for (int w = 1; w <= 8; ++w) {
+                for (int h = 1; h <= 8; ++h) {
+                    size_t stride = 44; // non-power-of-two stride
+                    memset(fb, sentinel, sizeof(fb));
+                    rfb_apple_dct_tile_bgra_stride(fb + 8, stride, w, h, c, q, qc, flags);
+                    for (int row = 0; row < h; ++row) {
+                        for (int col = 0; col < w; ++col) {
+                            uint32_t got;
+                            memcpy(&got, fb + 8 + (size_t)row * stride + (size_t)col * 4, 4);
+                            if (got != expected[row * 8 + col]) {
+                                fprintf(stderr, "stride mismatch mode=%d w=%d h=%d r=%d c=%d\n",
+                                        mode, w, h, row, col);
+                                exit(1);
+                            }
+                        }
+                        if (fb[8 + (size_t)row * stride + (size_t)w * 4] != sentinel) {
+                            fprintf(stderr, "stride right overwrite w=%d h=%d\n", w, h);
+                            exit(1);
+                        }
+                    }
+                    if (fb[8 + (size_t)h * stride] != sentinel) {
+                        fprintf(stderr, "stride bottom overwrite w=%d h=%d\n", w, h);
+                        exit(1);
+                    }
+                }
+            }
+        }
+    }
+
+    // Check NEON/scalar BGRX->opaque BGRA copy across unaligned tails and widths.
+    {
+        uint8_t src[4 * 40 * 4];
+        uint8_t dst[4 * 40 * 4];
+        for (size_t i = 0; i < sizeof(src); ++i) src[i] = (uint8_t)next();
+        for (int w = 1; w <= 37; ++w) {
+            memset(dst, 0x5a, sizeof(dst));
+            rfb_copy_bgrx_to_opaque_bgra(dst, 40 * 4, src, 40 * 4, w, 3);
+            for (int row = 0; row < 3; ++row) {
+                for (int col = 0; col < w; ++col) {
+                    size_t off = (size_t)row * 40 * 4 + (size_t)col * 4;
+                    if (dst[off] != src[off] || dst[off + 1] != src[off + 1]
+                        || dst[off + 2] != src[off + 2] || dst[off + 3] != 0xff) {
+                        fprintf(stderr, "bgrx copy mismatch w=%d r=%d c=%d\n", w, row, col);
+                        exit(1);
+                    }
+                }
+                size_t guard_off = (size_t)row * 40 * 4 + (size_t)w * 4;
+                if (dst[guard_off] != 0x5a) {
+                    fprintf(stderr, "bgrx copy overwrite w=%d r=%d\n", w, row);
+                    exit(1);
+                }
+            }
+        }
+    }
+
+    puts("stride fast paths and BGRX opaque copy: exact match");
 }

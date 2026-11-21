@@ -81,7 +81,13 @@ final class VNCBrightnessPresenter {
     ])
     private lazy var kernel = CIColorKernel(source: Self.kernelSource)
 
-    private var latestSource: CIImage?
+    private enum Source {
+        case cgImage(CGImage)
+        case pixelBuffer(CVPixelBuffer)
+        case ioSurface(IOSurfaceRef)
+    }
+
+    private var latestSource: Source?
     private var requestedGain = 1.0
     private var pool: CVPixelBufferPool?
     private var poolSize = CGSize.zero
@@ -102,42 +108,74 @@ final class VNCBrightnessPresenter {
     }
 
     func setSource(_ image: CGImage?, gain: Double) {
-        latestSource = image.map {
-            CIImage(cgImage: $0, options: [.colorSpace: sourceColorSpace])
-        }
+        latestSource = image.map(Source.cgImage)
         requestedGain = gain
-        renderLatestSource()
+        let effective = VNCBrightnessCapability.effectiveGain(gain)
+        if effective <= 1.0 {
+            if isPresentingBoostedContent { clearBoostedContent() }
+            return
+        }
+        renderLatestSource(effectiveGain: effective)
     }
 
     func setSource(_ pixelBuffer: CVPixelBuffer?, gain: Double) {
-        latestSource = pixelBuffer.map {
-            CIImage(cvPixelBuffer: $0, options: [.colorSpace: sourceColorSpace])
-        }
+        latestSource = pixelBuffer.map(Source.pixelBuffer)
         requestedGain = gain
-        renderLatestSource()
+        let effective = VNCBrightnessCapability.effectiveGain(gain)
+        if effective <= 1.0 {
+            if isPresentingBoostedContent { clearBoostedContent() }
+            return
+        }
+        renderLatestSource(effectiveGain: effective)
+    }
+
+    func setSource(_ ioSurface: IOSurfaceRef?, gain: Double) {
+        latestSource = ioSurface.map(Source.ioSurface)
+        requestedGain = gain
+        let effective = VNCBrightnessCapability.effectiveGain(gain)
+        if effective <= 1.0 {
+            if isPresentingBoostedContent { clearBoostedContent() }
+            return
+        }
+        renderLatestSource(effectiveGain: effective)
     }
 
     func setGain(_ gain: Double) {
         guard requestedGain != gain else { return }
         requestedGain = gain
-        renderLatestSource()
+        let effective = VNCBrightnessCapability.effectiveGain(gain)
+        if effective <= 1.0 {
+            if isPresentingBoostedContent { clearBoostedContent() }
+            return
+        }
+        renderLatestSource(effectiveGain: effective)
     }
 
     func reset() {
         latestSource = nil
         requestedGain = 1.0
-        clearBoostedContent()
+        if isPresentingBoostedContent || displayedBuffer != nil {
+            clearBoostedContent()
+        }
         pool = nil
         poolSize = .zero
     }
 
-    private func renderLatestSource() {
-        let gain = VNCBrightnessCapability.effectiveGain(requestedGain)
+    private func renderLatestSource(effectiveGain gain: Double) {
         guard gain > 1.0,
-              let source = latestSource,
+              let sourceModel = latestSource,
               let kernel else {
-            clearBoostedContent()
+            if isPresentingBoostedContent { clearBoostedContent() }
             return
+        }
+        let source: CIImage
+        switch sourceModel {
+        case .cgImage(let image):
+            source = CIImage(cgImage: image, options: [.colorSpace: sourceColorSpace])
+        case .pixelBuffer(let pixelBuffer):
+            source = CIImage(cvPixelBuffer: pixelBuffer, options: [.colorSpace: sourceColorSpace])
+        case .ioSurface(let ioSurface):
+            source = CIImage(ioSurface: ioSurface, options: [.colorSpace: sourceColorSpace])
         }
 
         let sourceExtent = source.extent.integral

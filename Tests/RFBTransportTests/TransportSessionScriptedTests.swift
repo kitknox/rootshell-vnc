@@ -2647,6 +2647,143 @@ final class TransportSessionScriptedTests: XCTestCase {
         return await condition()
     }
 
+    func testAppleAutoUpdatePipelinesUpToThreeUpdatesThroughDirectSink() async throws {
+        let connection = ScriptedRFBConnection()
+        let width: UInt16 = 4
+        let height: UInt16 = 1
+
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: width, height: height, name: "apple-dct-pipeline"))
+        // Initial full DCT type-0 frame finishes bootstrap and enables auto-updates.
+        script.append(Self.framebufferUpdate([(
+            Self.rectangleHeader(
+                x: 0, y: 0, width: width, height: height,
+                encoding: Encoding.appleMultiVariantScreenshare.rawValue),
+            Data([0, 0, 0, 1, 0])
+        )]))
+        await connection.enqueueServerBytes(script)
+
+        let directCounter = LockedIntCounter()
+        let session = TransportSession(
+            host: "scripted.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: Self.appleDCTEncodings,
+            displayCount: 2,
+            connection: connection)
+        await session.setFramebufferUpdateSink { _ in
+            directCounter.increment()
+            return true
+        }
+        try await session.connect()
+
+        // Acknowledge the bootstrap update so appleAutoUpdateActive turns on.
+        let gotBootstrap = await Self.waitUntil { directCounter.value == 1 }
+        XCTAssertTrue(gotBootstrap)
+        try await session.finishDirectFramebufferUpdate()
+
+        let autoUpdate = ClientMessage.appleAutoFramebufferUpdate(
+            intervalMilliseconds: 0,
+            x: 0, y: 0, width: width, height: height
+        ).serialize()
+        let autoEnabled = await Self.waitUntil {
+            let sent = await connection.sentBytes()
+            return Self.occurrenceCount(of: autoUpdate, in: sent) == 1
+        }
+        XCTAssertTrue(autoEnabled)
+
+        // Enqueue 4 small auto-update refinement frames without acknowledging any.
+        // Bounded auto-update pipelining (depth = 3) must deliver 3 immediately
+        // and apply backpressure before reading the 4th.
+        var burst = Data()
+        for _ in 0..<4 {
+            burst.append(Self.framebufferUpdate([(
+                Self.rectangleHeader(
+                    x: 0, y: 0, width: width, height: height,
+                    encoding: Encoding.appleMultiVariantScreenshare.rawValue),
+                Data([0, 0, 0, 4, 1, 0, 0, 0])
+            )]))
+        }
+        await connection.enqueueServerBytes(burst)
+
+        let deliveredThree = await Self.waitUntil { directCounter.value == 4 }
+        XCTAssertTrue(deliveredThree)
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(directCounter.value, 4, "4th in-flight auto-update must wait for credit")
+
+        // Returning one credit releases the 4th update.
+        try await session.finishDirectFramebufferUpdate()
+        let deliveredFourth = await Self.waitUntil { directCounter.value == 5 }
+        XCTAssertTrue(deliveredFourth)
+
+        await session.disconnect()
+    }
+
+    func testBufferedControlReadEnforces256MiBExactReadLimitForOversizedDCTRecord() async throws {
+        let connection = ScriptedRFBConnection()
+        // Huge geometry (16384x4096x4x2 = 512 MiB) would exceed 256 MiB if
+        // maxFramebufferPayloadBytes were not clamped to TCPConnection.maxExactReadBytes.
+        let width: UInt16 = 16_384
+        let height: UInt16 = 4_096
+
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: width, height: height, name: "oversized-dct-limit"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "scripted.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: Self.appleDCTEncodings,
+            connection: connection)
+        try await session.connect()
+
+        // Send a tiny rect followed immediately in the same read chunk by an
+        // oversized 256 MiB DCT record header so `controlReadBuffer` is non-empty
+        // when the oversized length is parsed.
+        var burst = Data()
+        burst.append(Self.framebufferUpdate([
+            (
+                Self.rectangleHeader(
+                    x: 0, y: 0, width: 1, height: 1,
+                    encoding: Encoding.appleMultiVariantScreenshare.rawValue),
+                Data([0, 0, 0, 1, 0])
+            ),
+            (
+                Self.rectangleHeader(
+                    x: 0, y: 0, width: 1, height: 1,
+                    encoding: Encoding.appleMultiVariantScreenshare.rawValue),
+                // Declared payload length = 256 MiB (0x10_00_00_00), with 4 trailing
+                // bytes buffered in the same TCP read chunk.
+                Data([0x10, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xDD])
+            ),
+        ]))
+        await connection.enqueueServerBytes(burst)
+
+        let observedError: VNCProtocolError? = await Self.withTimeout(seconds: 3) {
+            for await event in session.events {
+                if case .error(let error) = event {
+                    return error
+                }
+            }
+            return nil
+        } ?? nil
+
+        guard case .protocolViolation(let message) = observedError else {
+            XCTFail("Expected protocolViolation for oversized buffered DCT record, got \(String(describing: observedError))")
+            await session.disconnect()
+            return
+        }
+        XCTAssertTrue(message.contains("payload bytes") || message.contains("refusing"), "Unexpected error: \(message)")
+        await session.disconnect()
+    }
+
     /// Bound an event-stream wait so a protocol bug fails the test instead of
     /// hanging the suite. Returns nil on timeout.
     private static func withTimeout<Result: Sendable>(
@@ -2663,6 +2800,23 @@ final class TransportSessionScriptedTests: XCTestCase {
             group.cancelAll()
             return first
         }
+    }
+}
+
+private final class LockedIntCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = 0
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func increment() {
+        lock.lock()
+        storage += 1
+        lock.unlock()
     }
 }
 

@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import CoreVideo
 import ImageIO
 import RFBProtocol
 
@@ -34,6 +35,24 @@ public struct FramebufferRenderBatchResult: @unchecked Sendable {
     /// Non-nil only when this update carried a Cursor pseudo-encoding rect.
     public let cursorUpdate: RemoteCursorUpdate?
     public let issues: [String]
+    /// Tight pixel rectangles modified in the framebuffer by this batch.
+    public let dirtyRects: [CGRect]
+
+    public init(
+        image: CGImage?,
+        resizedWidth: UInt16?,
+        resizedHeight: UInt16?,
+        cursorUpdate: RemoteCursorUpdate?,
+        issues: [String],
+        dirtyRects: [CGRect] = []
+    ) {
+        self.image = image
+        self.resizedWidth = resizedWidth
+        self.resizedHeight = resizedHeight
+        self.cursorUpdate = cursorUpdate
+        self.issues = issues
+        self.dirtyRects = dirtyRects
+    }
 }
 
 // MARK: - FramebufferRenderer
@@ -49,6 +68,7 @@ public final class FramebufferRenderer: @unchecked Sendable {
     private var tightDecoder: TightEncodingRenderer
     private var appleDCTDecoder: AppleAdaptiveDCTDecoder
     private var appleCursorCache: [UInt32: RemoteCursor] = [:]
+    private let surfacePool = FramebufferSurfacePool()
 
     public init(framebuffer: Framebuffer, pixelFormat: PixelFormat) {
         self.framebuffer = framebuffer
@@ -63,29 +83,54 @@ public final class FramebufferRenderer: @unchecked Sendable {
     /// Apply a rectangle update to the framebuffer.
     /// `data` contains the encoding-specific payload.
     public func applyRect(rect: FramebufferRect, data: Data) throws {
+        if let dirty = try applyRectTrackingDirty(rect: rect, data: data) {
+            surfacePool.recordDirtyRects(
+                [dirty],
+                width: framebuffer.width,
+                height: framebuffer.height)
+        }
+    }
+
+    private func applyRectTrackingDirty(
+        rect: FramebufferRect,
+        data: Data
+    ) throws -> CGRect? {
         switch rect.encoding {
         case .raw:
             rawDecoder.render(
                 rect: rect, data: data,
                 to: framebuffer, pixelFormat: pixelFormat
             )
+            return CGRect(
+                x: Int(rect.x), y: Int(rect.y),
+                width: Int(rect.width), height: Int(rect.height))
         case .zlib:
             try zlibDecoder.render(
                 rect: rect, data: data,
                 to: framebuffer, pixelFormat: pixelFormat
             )
+            return CGRect(
+                x: Int(rect.x), y: Int(rect.y),
+                width: Int(rect.width), height: Int(rect.height))
         case .zrle:
             try zrleDecoder.render(
                 rect: rect, data: data,
                 to: framebuffer, pixelFormat: pixelFormat
             )
+            return CGRect(
+                x: Int(rect.x), y: Int(rect.y),
+                width: Int(rect.width), height: Int(rect.height))
         case .tight:
             try tightDecoder.render(
                 rect: rect, data: data,
                 to: framebuffer, pixelFormat: pixelFormat
             )
+            return CGRect(
+                x: Int(rect.x), y: Int(rect.y),
+                width: Int(rect.width), height: Int(rect.height))
         case .appleMultiVariantScreenshare:
-            try appleDCTDecoder.render(rect: rect, payload: data, to: framebuffer)
+            return try appleDCTDecoder.render(
+                rect: rect, payload: data, to: framebuffer)
         default:
             throw RenderingError.unsupportedEncoding(rect.encoding)
         }
@@ -97,7 +142,7 @@ public final class FramebufferRenderer: @unchecked Sendable {
     ///
     /// Pass `snapshot: false` to apply rects without paying for the
     /// full-framebuffer image copy — the result's `image` is nil and the
-    /// caller publishes a later snapshot instead.
+    /// caller publishes a later snapshot or IOSurface sync instead.
     public func applyBatch(
         _ rects: [(FramebufferRect, Data)],
         snapshot takeSnapshot: Bool = true
@@ -106,6 +151,7 @@ public final class FramebufferRenderer: @unchecked Sendable {
         var resizedHeight: UInt16?
         var cursorUpdate: RemoteCursorUpdate?
         var issues: [String] = []
+        var dirtyRegion = FramebufferDirtyRegion()
 
         for (rect, data) in rects {
             switch rect.encoding {
@@ -118,13 +164,19 @@ public final class FramebufferRenderer: @unchecked Sendable {
                     | UInt16(data[data.startIndex + 1])
                 let srcY = UInt16(data[data.startIndex + 2]) << 8
                     | UInt16(data[data.startIndex + 3])
-                applyCopyRect(rect: rect, srcX: srcX, srcY: srcY)
+                copyFramebufferRect(rect: rect, srcX: srcX, srcY: srcY)
+                dirtyRegion.insert(
+                    x: Int(rect.x), y: Int(rect.y),
+                    width: Int(rect.width), height: Int(rect.height),
+                    boundsWidth: framebuffer.width,
+                    boundsHeight: framebuffer.height)
 
             case .desktopSize, .extendedDesktopSize:
                 guard rect.isSuccessfulDesktopResize else { continue }
                 handleDesktopResize(width: rect.width, height: rect.height)
                 resizedWidth = rect.width
                 resizedHeight = rect.height
+                dirtyRegion.markFull()
 
             case .cursor, .xCursor:
                 // Cosmetic: the local system pointer adopts this shape.
@@ -161,7 +213,12 @@ public final class FramebufferRenderer: @unchecked Sendable {
 
             default:
                 do {
-                    try applyRect(rect: rect, data: data)
+                    if let dirty = try applyRectTrackingDirty(rect: rect, data: data) {
+                        dirtyRegion.insert(
+                            dirty,
+                            boundsWidth: framebuffer.width,
+                            boundsHeight: framebuffer.height)
+                    }
                 } catch {
                     issues.append(
                         "Failed to apply rect (\(rect.encoding)): "
@@ -170,16 +227,61 @@ public final class FramebufferRenderer: @unchecked Sendable {
             }
         }
 
+        let fbWidth = framebuffer.width
+        let fbHeight = framebuffer.height
+        let dirtyRects = dirtyRegion.cgRects(width: fbWidth, height: fbHeight)
+        if dirtyRegion.isFull {
+            surfacePool.markFullDirty(width: fbWidth, height: fbHeight)
+        } else if !dirtyRects.isEmpty {
+            surfacePool.recordDirtyRects(dirtyRects, width: fbWidth, height: fbHeight)
+        }
+
         return FramebufferRenderBatchResult(
             image: takeSnapshot ? snapshot() : nil,
             resizedWidth: resizedWidth,
             resizedHeight: resizedHeight,
             cursorUpdate: cursorUpdate,
-            issues: issues)
+            issues: issues,
+            dirtyRects: dirtyRects)
+    }
+
+    /// Synchronize the next idle `IOSurface`-backed presentation surface with
+    /// only the rectangles modified since that surface was last synced.
+    public func syncPresentationSurface(
+        excluding displayed: FramebufferPresentationSurface? = nil
+    ) -> FramebufferPresentationSurface? {
+        surfacePool.syncNextSurface(from: framebuffer, excluding: displayed)
+    }
+
+    /// Synchronize the next idle `IOSurface`-backed presentation surface,
+    /// excluding every surface currently reserved for handoff or presentation.
+    public func syncPresentationSurface(
+        excluding busySurfaces: [FramebufferPresentationSurface]
+    ) -> FramebufferPresentationSurface? {
+        surfacePool.syncNextSurface(from: framebuffer, excluding: busySurfaces)
+    }
+
+    /// Synchronize the next idle `IOSurface`-backed presentation surface,
+    /// returning a structured ``FramebufferSurfaceSyncResult`` distinguishing
+    /// busy-slot backpressure from resource allocation/lock failures.
+    public func syncPresentationSurfaceResult(
+        excluding busySurfaces: [FramebufferPresentationSurface] = []
+    ) -> FramebufferSurfaceSyncResult {
+        surfacePool.syncNextSurfaceResult(from: framebuffer, excluding: busySurfaces)
     }
 
     /// Apply a CopyRect (data contains srcX, srcY as 2 UInt16s).
     public func applyCopyRect(rect: FramebufferRect, srcX: UInt16, srcY: UInt16) {
+        copyFramebufferRect(rect: rect, srcX: srcX, srcY: srcY)
+        surfacePool.recordDirtyRects(
+            [CGRect(
+                x: Int(rect.x), y: Int(rect.y),
+                width: Int(rect.width), height: Int(rect.height))],
+            width: framebuffer.width,
+            height: framebuffer.height)
+    }
+
+    private func copyFramebufferRect(rect: FramebufferRect, srcX: UInt16, srcY: UInt16) {
         framebuffer.copyRect(
             srcX: Int(srcX),
             srcY: Int(srcY),
@@ -198,6 +300,7 @@ public final class FramebufferRenderer: @unchecked Sendable {
     /// Handle desktop resize.
     public func handleDesktopResize(width: UInt16, height: UInt16) {
         framebuffer.resize(width: Int(width), height: Int(height))
+        surfacePool.markFullDirty(width: framebuffer.width, height: framebuffer.height)
     }
 }
 

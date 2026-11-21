@@ -366,7 +366,14 @@ public actor TCPConnection: RFBConnection {
             let data = try await inboundQueue.next {
                 channel.read()
             }
-            if !data.isEmpty { receiveBuffer.append(data) }
+            if !data.isEmpty {
+                if bufferedByteCount == 0 {
+                    receiveBuffer = data
+                    receiveOffset = 0
+                } else {
+                    receiveBuffer.append(data)
+                }
+            }
         } catch let error as VNCProtocolError {
             throw error
         } catch {
@@ -375,6 +382,11 @@ public actor TCPConnection: RFBConnection {
     }
 
     private func consumeBuffered(_ count: Int) -> Data {
+        if receiveOffset == 0 && count == receiveBuffer.count {
+            let result = receiveBuffer
+            receiveBuffer = Data()
+            return result
+        }
         let start = receiveBuffer.startIndex + receiveOffset
         let result = receiveBuffer.subdata(in: start..<(start + count))
         receiveOffset += count
@@ -678,10 +690,13 @@ private final class InboundByteStreamHandler: ChannelInboundHandler, @unchecked 
     }
 
     func channelRead(context _: ChannelHandlerContext, data: NIOAny) {
-        var buffer = unwrapInboundIn(data)
-        guard let bytes = buffer.readBytes(length: buffer.readableBytes),
-              !bytes.isEmpty else { return }
-        queue.yield(Data(bytes))
+        let buffer = unwrapInboundIn(data)
+        let count = buffer.readableBytes
+        guard count > 0 else { return }
+        let chunk = buffer.withUnsafeReadableBytes { raw in
+            Data(bytes: raw.baseAddress!, count: raw.count)
+        }
+        queue.yield(chunk)
     }
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
@@ -791,6 +806,7 @@ private final class InboundByteStreamHandler: ChannelInboundHandler, @unchecked 
 private final class InboundByteQueue: @unchecked Sendable {
     private let lock = NSLock()
     private var buffered: [Data] = []
+    private var bufferedHead = 0
     private var waiter: CheckedContinuation<Data, Error>?
     private var terminalError: Error?
 
@@ -813,8 +829,17 @@ private final class InboundByteQueue: @unchecked Sendable {
     func next(onReadNeeded: @escaping @Sendable () -> Void) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
             lock.lock()
-            if !buffered.isEmpty {
-                let data = buffered.removeFirst()
+            if bufferedHead < buffered.count {
+                let data = buffered[bufferedHead]
+                buffered[bufferedHead] = Data()
+                bufferedHead += 1
+                if bufferedHead == buffered.count {
+                    buffered.removeAll(keepingCapacity: true)
+                    bufferedHead = 0
+                } else if bufferedHead >= 64 && bufferedHead * 2 >= buffered.count {
+                    buffered.removeFirst(bufferedHead)
+                    bufferedHead = 0
+                }
                 lock.unlock()
                 continuation.resume(returning: data)
             } else if let terminalError {
