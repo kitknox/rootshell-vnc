@@ -49,6 +49,10 @@ public final class VideoBandLayerRenderer {
     /// without adding a second compositor or touching individual HEVC bands.
     var onFrameCommitted: ((CVPixelBuffer, UInt64) -> Void)?
 
+    /// The last complete surface sent to the display: nil before the first
+    /// frame and after a reset. For host snapshots; read only.
+    public var latestComposedFrame: CVPixelBuffer? { displayedBuffer }
+
     var renderedBandCount: Int { bandBuffers.count }
 
     var renderedBandDimensions: [(width: Int, height: Int)] {

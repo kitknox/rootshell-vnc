@@ -3060,6 +3060,58 @@ final class VideoBandGeometryTests: XCTestCase {
     }
 
     @MainActor
+    func testLatestComposedFrameTracksPresentationAndReset() throws {
+        let renderer = VideoBandLayerRenderer()
+        renderer.setScreenSize(width: 100, height: 100)
+        XCTAssertNil(renderer.latestComposedFrame)
+
+        renderer.setBands([1: try makePixelBuffer(width: 100, height: 100)])
+        let frame = try XCTUnwrap(renderer.latestComposedFrame)
+        XCTAssertEqual(CVPixelBufferGetWidth(frame), 100)
+        XCTAssertEqual(CVPixelBufferGetHeight(frame), 100)
+
+        renderer.reset()
+        XCTAssertNil(renderer.latestComposedFrame, "A reset must not leave an old screen readable")
+    }
+
+    @MainActor
+    func testPresentedFrameIsTheHighPerformanceSurfaceOnceItExists() throws {
+        let session = VNCSession(configuration: VNCConfiguration(videoQualityMode: .adaptive))
+        session.isHighPerformanceMode = true
+        session.videoBandRenderer.setScreenSize(width: 100, height: 60)
+        XCTAssertNil(session.presentedFrame, "No frame yet: nothing to snapshot")
+        XCTAssertFalse(session.isPresentingPicture)
+
+        session.videoBandRenderer.setBands([1: try makePixelBuffer(width: 100, height: 60)])
+        XCTAssertTrue(session.isPresentingPicture, "The first display's frame is a live picture")
+        guard case .surfaces(let surfaces)? = session.presentedFrame else {
+            return XCTFail("High Performance must present its video surface")
+        }
+        XCTAssertEqual(surfaces.count, 1)
+        XCTAssertEqual(surfaces.first?.region, CGRect(x: 0, y: 0, width: 100, height: 60))
+    }
+
+    @MainActor
+    func testPresentedStandardFrameIsCroppedToTheSelectedDisplay() throws {
+        let context = try XCTUnwrap(CGContext(
+            data: nil,
+            width: 32,
+            height: 8,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+        let desktop = try XCTUnwrap(context.makeImage())
+
+        let selected = VNCSession.cropped(desktop, to: CGRect(x: 16, y: 0, width: 16, height: 8))
+        XCTAssertEqual(selected.width, 16, "An unselected display must not reach a snapshot")
+        XCTAssertEqual(selected.height, 8)
+
+        let whole = VNCSession.cropped(desktop, to: nil)
+        XCTAssertEqual(whole.width, 32)
+    }
+
+    @MainActor
     func testCommittedHighPerformanceFrameIdentifiesMediaGeneration() throws {
         let renderer = VideoBandLayerRenderer()
         renderer.setScreenSize(width: 100, height: 100)

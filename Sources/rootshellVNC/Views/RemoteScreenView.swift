@@ -56,6 +56,7 @@ public struct RemoteScreenView: View {
     private let hudMenuExtras: VNCHUDMenuExtras
     #if canImport(UIKit)
     private var hudAccessory: HUDAccessory?
+    private var screenPlaceholder: AnyView?
     #endif
     private let touchHandler: TouchInputHandler
     private let keyboardHandler: KeyboardInputHandler
@@ -130,6 +131,17 @@ public struct RemoteScreenView: View {
         keyboardActive || keyboardCapture.inputViews.accessory != nil
     }
 
+    /// Host content drawn over the remote picture and under the controls,
+    /// in the box the fitted screen occupies. For what the host shows while
+    /// there is no picture; it never takes touches.
+    public func screenPlaceholder<Placeholder: View>(
+        @ViewBuilder _ placeholder: () -> Placeholder
+    ) -> Self {
+        var copy = self
+        copy.screenPlaceholder = AnyView(placeholder())
+        return copy
+    }
+
     #if canImport(UIKit)
     /// Adds host content to the HUD, inside its glass: `beside` the menu
     /// button, taking the button style to match, and `behind` the buttons
@@ -181,6 +193,13 @@ public struct RemoteScreenView: View {
                         .scaleEffect(viewport.scale)
                         .offset(viewport.offset)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+
+                    if let screenPlaceholder {
+                        screenPlaceholder
+                            .frame(width: contentSize.width, height: contentSize.height)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                            .allowsHitTesting(false)
+                    }
 
                     if isInteractive,
                        framebufferSize.width > 0,
