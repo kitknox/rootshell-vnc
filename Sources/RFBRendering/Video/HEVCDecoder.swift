@@ -282,11 +282,15 @@ public final class HEVCDecoder: @unchecked Sendable {
         // hardware that only supports 4:2:0), VideoToolbox silently falls back to
         // a CPU decoder — which is the single biggest CPU cost to look for.
         var raw: CFTypeRef?
-        let propertyStatus = VTSessionCopyProperty(
-            newSession,
-            key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
-            allocator: kCFAllocatorDefault,
-            valueOut: &raw)
+        // Pass an explicitly typed pointer: VTSessionCopyProperty writes a +1
+        // CFTypeRef through it, which the strong `raw` then owns and releases.
+        let propertyStatus = withUnsafeMutablePointer(to: &raw) { valueOut in
+            VTSessionCopyProperty(
+                newSession,
+                key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+                allocator: kCFAllocatorDefault,
+                valueOut: valueOut)
+        }
         let hardware = propertyStatus == noErr ? raw as? Bool : nil
         let dims = CMVideoFormatDescriptionGetDimensions(formatDesc)
         let outputLabel = convertOutputToBGRA ? "BGRA" : "native"
