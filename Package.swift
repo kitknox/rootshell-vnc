@@ -1,6 +1,18 @@
 // swift-tools-version: 6.0
 
+import Foundation
 import PackageDescription
+
+// A gitignored `.optimize-debug` marker builds Debug with release optimization
+// for a local checkout. Remote checkouts never have it, which matters because
+// SwiftPM rejects version-pinned dependencies that use unsafe flags.
+let optimizeDebug = FileManager.default.fileExists(
+    atPath: Context.packageDirectory + "/.optimize-debug"
+)
+let debugSwiftOptimization: [SwiftSetting] = optimizeDebug
+    ? [.unsafeFlags(["-O"], .when(configuration: .debug))] : []
+let debugCOptimization: [CSetting] = optimizeDebug
+    ? [.unsafeFlags(["-Os"], .when(configuration: .debug))] : []
 
 let package = Package(
     name: "rootshellVNC",
@@ -30,7 +42,7 @@ let package = Package(
         .target(
             name: "RFBProtocol",
             dependencies: [],
-            swiftSettings: [.swiftLanguageMode(.v6)],
+            swiftSettings: [.swiftLanguageMode(.v6)] + debugSwiftOptimization,
             linkerSettings: [.linkedLibrary("z")]
         ),
 
@@ -45,19 +57,20 @@ let package = Package(
                 .product(name: "NIOSSL", package: "swift-nio-ssl"),
                 .product(name: "NIOTransportServices", package: "swift-nio-transport-services"),
             ],
-            swiftSettings: [.swiftLanguageMode(.v6)]
+            swiftSettings: [.swiftLanguageMode(.v6)] + debugSwiftOptimization
         ),
 
         // MARK: - RFBRendering (VideoToolbox HEVC decode, framebuffer, display)
         .target(
             name: "RFBRendering",
             dependencies: ["RFBProtocol", "RFBRenderingC"],
-            swiftSettings: [.swiftLanguageMode(.v6)]
+            swiftSettings: [.swiftLanguageMode(.v6)] + debugSwiftOptimization
         ),
         .target(
             name: "RFBRenderingC",
             dependencies: [],
-            publicHeadersPath: "include"
+            publicHeadersPath: "include",
+            cSettings: debugCOptimization
         ),
 
         // MARK: - rootshellVNC (public API facade, SwiftUI views, input handling)
@@ -65,7 +78,7 @@ let package = Package(
             name: "rootshellVNC",
             dependencies: ["RFBProtocol", "RFBTransport", "RFBRendering"],
             resources: [.process("Resources")],
-            swiftSettings: [.swiftLanguageMode(.v6)]
+            swiftSettings: [.swiftLanguageMode(.v6)] + debugSwiftOptimization
         ),
 
         // MARK: - Tests

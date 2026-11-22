@@ -17,3 +17,6 @@ DerivedData/
 # Profiling and diagnostics
 *.profraw
 *.profdata
+
+# Local Debug builds with release optimization (see Package.swift)
+/.optimize-debug
