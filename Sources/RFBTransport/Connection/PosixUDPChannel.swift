@@ -164,12 +164,15 @@ public actor PosixUDPChannel {
     // batch N+1 regularly landed before batch N, reordering RTP packets inside
     // the client. Reordered video packets shred HEVC fragmentation units and
     // read as sequence gaps, i.e. macroblocks that worsen with system load.
+    private enum ReceiveWaiter {
+        case single(CheckedContinuation<PosixUDPDatagram, Error>)
+        case batch(maxCount: Int, CheckedContinuation<[PosixUDPDatagram], Error>)
+    }
+
     private let stateLock = NSLock()
     private nonisolated(unsafe) var pendingDatagrams = BoundedDatagramFIFO(
         capacity: 8192)
-    private nonisolated(unsafe) var receiveWaiters: [
-        CheckedContinuation<PosixUDPDatagram, Error>
-    ] = []
+    private nonisolated(unsafe) var receiveWaiters: [ReceiveWaiter] = []
     private nonisolated(unsafe) var lastBacklogLogNanos: UInt64 = 0
     private nonisolated(unsafe) var backlogHighWater = 0
     private nonisolated(unsafe) var publishedSinceBacklogLog = 0
@@ -371,26 +374,32 @@ public actor PosixUDPChannel {
                 stateLock.unlock()
                 continuation.resume(throwing: VNCProtocolError.connectionClosed)
             } else {
-                receiveWaiters.append(continuation)
+                receiveWaiters.append(.single(continuation))
                 stateLock.unlock()
             }
         }
     }
 
-    /// Receive one ordered socket burst. The first datagram uses the existing
-    /// waiter path; everything already queued behind it is drained under the
-    /// same lock. Large compound HEVC pictures contain hundreds of RTP packets,
-    /// and crossing two Swift actor boundaries per datagram allowed the
-    /// userspace FIFO to overflow under GUI load.
+    /// Receive one ordered socket burst in a single lock acquisition. Large
+    /// compound HEVC pictures contain hundreds of RTP packets, and crossing
+    /// Swift actor boundaries per datagram allowed the userspace FIFO to
+    /// overflow under GUI load.
     public func receiveDatagramBatch(maxCount: Int = 512) async throws -> [PosixUDPDatagram] {
         let limit = max(1, maxCount)
-        let first = try await receiveDatagram()
-        guard limit > 1 else { return [first] }
-
-        let remainder = stateLock.withLock {
-            pendingDatagrams.popFirst(upTo: limit - 1)
+        return try await withCheckedThrowingContinuation { continuation in
+            stateLock.lock()
+            if !pendingDatagrams.isEmpty {
+                let batch = pendingDatagrams.popFirst(upTo: limit)
+                stateLock.unlock()
+                continuation.resume(returning: batch)
+            } else if lockedClosed {
+                stateLock.unlock()
+                continuation.resume(throwing: VNCProtocolError.connectionClosed)
+            } else {
+                receiveWaiters.append(.batch(maxCount: limit, continuation))
+                stateLock.unlock()
+            }
         }
-        return [first] + remainder
     }
 
     /// Send a datagram to the connected peer.
@@ -430,8 +439,13 @@ public actor PosixUDPChannel {
         let waiters = receiveWaiters
         receiveWaiters.removeAll()
         stateLock.unlock()
-        for cont in waiters {
-            cont.resume(throwing: VNCProtocolError.connectionClosed)
+        for waiter in waiters {
+            switch waiter {
+            case .single(let cont):
+                cont.resume(throwing: VNCProtocolError.connectionClosed)
+            case .batch(_, let cont):
+                cont.resume(throwing: VNCProtocolError.connectionClosed)
+            }
         }
     }
 
@@ -439,6 +453,24 @@ public actor PosixUDPChannel {
     public var localPort: UInt16? { boundPort }
 
     // MARK: - Private
+
+    /// Persistent 64 KB receive scratch buffer owned exclusively by `readQueue`
+    /// so every readable event does not zero-initialize a fresh `[UInt8]`.
+    private final class ReadScratchBuffer: @unchecked Sendable {
+        let pointer: UnsafeMutableRawPointer
+        let capacity: Int
+
+        init(capacity: Int = 65_536) {
+            self.capacity = capacity
+            self.pointer = UnsafeMutableRawPointer.allocate(
+                byteCount: capacity,
+                alignment: 16)
+        }
+
+        deinit {
+            pointer.deallocate()
+        }
+    }
 
     private func setBoolOption(_ option: Int32) {
         var value: Int32 = 1
@@ -453,47 +485,85 @@ public actor PosixUDPChannel {
     private func startReadSource() {
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: readQueue)
         let capturedFD = fd
+        let scratch = ReadScratchBuffer()
         source.setEventHandler { [weak self] in
             // Drain the socket as fast as possible into a batch (a Task per
             // datagram was slow enough that the kernel buffer overflowed even
             // on loopback), then publish the batch under the state lock, still
             // on this serial read queue — NEVER via a spawned Task, which has
             // no FIFO guarantee and reordered batches under load.
-            var buffer = [UInt8](repeating: 0, count: 65_536)
             var batch: [PosixUDPDatagram] = []
+            batch.reserveCapacity(32)
+            var lastArrivalNanos: UInt64 = 0
             while true {
-                let n = recv(capturedFD, &buffer, buffer.count, 0)
+                let n = recv(capturedFD, scratch.pointer, scratch.capacity, 0)
                 if n > 0 {
+                    // Preserve per-datagram arrival timestamps so probe-train
+                    // bandwidth estimation never sees zero elapsed duration.
+                    let arrivalNanos = DispatchTime.now().uptimeNanoseconds
+                    lastArrivalNanos = arrivalNanos
                     batch.append(PosixUDPDatagram(
-                        data: Data(buffer[0..<n]),
-                        arrivalNanos: DispatchTime.now().uptimeNanoseconds))
+                        data: Data(bytes: scratch.pointer, count: n),
+                        arrivalNanos: arrivalNanos))
                 } else {
                     break
                 }
             }
             if !batch.isEmpty {
-                self?.publishBatchInOrder(batch)
+                self?.publishBatchInOrder(batch, nowNanos: lastArrivalNanos)
             }
         }
         readSource = source
         source.resume()
     }
 
-    /// Append a drained batch and satisfy any waiting `receive()` calls, all
-    /// under the state lock so socket-drain order is exactly delivery order.
+    /// Append a drained batch and satisfy waiting `receive()` /
+    /// `receiveDatagramBatch()` calls in strict FIFO order, all under the state
+    /// lock so socket-drain order is exactly delivery order.
     /// `nonisolated` — runs on the serial read queue, not the actor.
-    private nonisolated func publishBatchInOrder(_ batch: [PosixUDPDatagram]) {
+    private nonisolated func publishBatchInOrder(
+        _ batch: [PosixUDPDatagram],
+        nowNanos: UInt64
+    ) {
+        enum PendingResume {
+            case single(CheckedContinuation<PosixUDPDatagram, Error>, PosixUDPDatagram)
+            case batch(CheckedContinuation<[PosixUDPDatagram], Error>, [PosixUDPDatagram])
+        }
+
         stateLock.lock()
         lockedReceivedDatagram = true
+
+        // Zero-copy fast path: when no datagrams are queued and the oldest
+        // waiter is a batch waiter large enough for the entire burst, hand off
+        // the array directly without touching the ring buffer.
+        if pendingDatagrams.isEmpty,
+           let firstWaiter = receiveWaiters.first,
+           case .batch(let maxCount, let cont) = firstWaiter,
+           batch.count <= maxCount {
+            receiveWaiters.removeFirst()
+            publishedSinceBacklogLog += batch.count
+            stateLock.unlock()
+            cont.resume(returning: batch)
+            return
+        }
+
         let dropped = pendingDatagrams.append(contentsOf: batch)
         let queuedBeforeDelivery = pendingDatagrams.count
         backlogHighWater = max(backlogHighWater, queuedBeforeDelivery)
         publishedSinceBacklogLog += batch.count
         droppedSinceBacklogLog += dropped
-        let now = DispatchTime.now().uptimeNanoseconds
-        var resumes: [(CheckedContinuation<PosixUDPDatagram, Error>, PosixUDPDatagram)] = []
-        while !receiveWaiters.isEmpty, let datagram = pendingDatagrams.popFirst() {
-            resumes.append((receiveWaiters.removeFirst(), datagram))
+        let now = nowNanos
+        var resumes: [PendingResume] = []
+        while !receiveWaiters.isEmpty, !pendingDatagrams.isEmpty {
+            switch receiveWaiters.removeFirst() {
+            case .single(let cont):
+                if let datagram = pendingDatagrams.popFirst() {
+                    resumes.append(.single(cont, datagram))
+                }
+            case .batch(let maxCount, let cont):
+                let drained = pendingDatagrams.popFirst(upTo: maxCount)
+                resumes.append(.batch(cont, drained))
+            }
         }
         let queued = pendingDatagrams.count
         let oldestDelayMilliseconds = pendingDatagrams.first.map {
@@ -520,8 +590,13 @@ public actor PosixUDPChannel {
                 + "highWater=\(diagnosticHighWater) oldest=\(oldestDelayMilliseconds)ms "
                 + "published=\(diagnosticPublished) dropped=\(diagnosticDropped)")
         }
-        for (cont, datagram) in resumes {
-            cont.resume(returning: datagram)
+        for resume in resumes {
+            switch resume {
+            case .single(let cont, let datagram):
+                cont.resume(returning: datagram)
+            case .batch(let cont, let drained):
+                cont.resume(returning: drained)
+            }
         }
     }
 

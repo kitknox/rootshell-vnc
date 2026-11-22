@@ -1,5 +1,4 @@
 import CommonCrypto
-import CryptoKit
 import Foundation
 import RFBProtocol
 
@@ -19,8 +18,11 @@ public final class AppleSRTPContext: @unchecked Sendable {
     private static let masterKeyLength = 32
     private static let masterSaltLength = 14
 
-    private let authenticationSymmetricKey: SymmetricKey
-    private let saltKey: Data
+    private var hmacTemplate = CCHmacContext()
+    private let saltBytes: (
+        UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+        UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8
+    )
     private var cryptor: CCCryptorRef?
     private let tagLength = 10
     private let lock = NSLock()
@@ -37,8 +39,19 @@ public final class AppleSRTPContext: @unchecked Sendable {
         let masterSalt = Data(mediaKey.dropFirst(Self.masterKeyLength).prefix(Self.masterSaltLength))
         let encryptionKey = try Self.deriveSessionKey(masterKey: masterKey, masterSalt: masterSalt, label: 0x00, length: Self.masterKeyLength)
         let authenticationKey = try Self.deriveSessionKey(masterKey: masterKey, masterSalt: masterSalt, label: 0x01, length: 20)
-        self.authenticationSymmetricKey = SymmetricKey(data: authenticationKey)
-        self.saltKey = try Self.deriveSessionKey(masterKey: masterKey, masterSalt: masterSalt, label: 0x02, length: 14)
+        var template = CCHmacContext()
+        authenticationKey.withUnsafeBytes { keyPtr in
+            CCHmacInit(&template, CCHmacAlgorithm(kCCHmacAlgSHA1), keyPtr.baseAddress, authenticationKey.count)
+        }
+        self.hmacTemplate = template
+        let salt = try Self.deriveSessionKey(masterKey: masterKey, masterSalt: masterSalt, label: 0x02, length: 14)
+        let sBase = salt.startIndex
+        self.saltBytes = (
+            salt[sBase], salt[sBase + 1], salt[sBase + 2], salt[sBase + 3],
+            salt[sBase + 4], salt[sBase + 5], salt[sBase + 6], salt[sBase + 7],
+            salt[sBase + 8], salt[sBase + 9], salt[sBase + 10], salt[sBase + 11],
+            salt[sBase + 12], salt[sBase + 13]
+        )
         self.cryptor = try Self.makeCryptor(key: encryptionKey)
     }
 
@@ -52,59 +65,74 @@ public final class AppleSRTPContext: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
-        guard packet.count >= 12 + tagLength else {
-            throw VNCProtocolError.protocolViolation("SRTP packet too short: \(packet.count)")
+        let totalCount = packet.count
+        guard totalCount >= 12 + tagLength else {
+            throw VNCProtocolError.protocolViolation("SRTP packet too short: \(totalCount)")
         }
 
-        let base = packet.startIndex
-        guard (packet[base] >> 6) == 2 else {
-            throw VNCProtocolError.protocolViolation("SRTP packet has invalid RTP version")
+        return try packet.withUnsafeBytes { rawBuffer -> Data in
+            guard let basePtr = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                throw VNCProtocolError.protocolViolation("SRTP packet buffer unavailable")
+            }
+            let firstByte = basePtr[0]
+            guard (firstByte >> 6) == 2 else {
+                throw VNCProtocolError.protocolViolation("SRTP packet has invalid RTP version")
+            }
+
+            let sequence = UInt16(basePtr[2]) << 8 | UInt16(basePtr[3])
+            let ssrc = UInt32(basePtr[8]) << 24
+                | UInt32(basePtr[9]) << 16
+                | UInt32(basePtr[10]) << 8
+                | UInt32(basePtr[11])
+
+            var state = states[ssrc] ?? SSRCState()
+            let roc = estimatedROC(for: sequence, state: state)
+            let encryptedLength = totalCount - tagLength
+            try verifyAuthentication(basePtr: basePtr, authenticatedLength: encryptedLength, roc: roc)
+
+            let headerLength = try Self.payloadOffset(basePtr: basePtr, totalCount: totalCount)
+            guard headerLength <= encryptedLength else {
+                throw VNCProtocolError.protocolViolation("SRTP packet has invalid payload bounds")
+            }
+
+            let packetIndex = (UInt64(roc) << 16) | UInt64(sequence)
+            let rtp = try decryptPacket(
+                basePtr: basePtr,
+                headerLength: headerLength,
+                encryptedLength: encryptedLength,
+                ssrc: ssrc,
+                packetIndex: packetIndex)
+
+            updateState(&state, sequence: sequence, roc: roc)
+            states[ssrc] = state
+
+            return rtp
         }
-
-        let sequence = UInt16(packet[base + 2]) << 8 | UInt16(packet[base + 3])
-        let ssrc = UInt32(packet[base + 8]) << 24
-            | UInt32(packet[base + 9]) << 16
-            | UInt32(packet[base + 10]) << 8
-            | UInt32(packet[base + 11])
-
-        var state = states[ssrc] ?? SSRCState()
-        let roc = estimatedROC(for: sequence, state: state)
-        try verifyAuthentication(packet: packet, roc: roc)
-
-        let payloadOffset = try Self.payloadOffset(in: packet)
-        let encryptedEnd = packet.endIndex - tagLength
-        guard payloadOffset <= encryptedEnd else {
-            throw VNCProtocolError.protocolViolation("SRTP packet has invalid payload bounds")
-        }
-
-        let packetIndex = (UInt64(roc) << 16) | UInt64(sequence)
-        let rtp = try decryptPacket(
-            packet,
-            payloadOffset: payloadOffset,
-            encryptedEnd: encryptedEnd,
-            ssrc: ssrc,
-            packetIndex: packetIndex)
-
-        updateState(&state, sequence: sequence, roc: roc)
-        states[ssrc] = state
-
-        return rtp
     }
 
-    private func verifyAuthentication(packet: Data, roc: UInt32) throws {
-        let authenticatedEnd = packet.endIndex - tagLength
-        var authenticator = HMAC<Insecure.SHA1>(key: authenticationSymmetricKey)
-        authenticator.update(data: packet[packet.startIndex..<authenticatedEnd])
+    private func verifyAuthentication(
+        basePtr: UnsafePointer<UInt8>,
+        authenticatedLength: Int,
+        roc: UInt32
+    ) throws {
+        var ctx = hmacTemplate
+        CCHmacUpdate(&ctx, basePtr, authenticatedLength)
         var rocBE = roc.bigEndian
         withUnsafeBytes(of: &rocBE) { bytes in
-            authenticator.update(data: bytes)
+            CCHmacUpdate(&ctx, bytes.baseAddress, 4)
         }
-        let mac = authenticator.finalize()
-        let expected = Data(mac.prefix(tagLength))
+        var mac: (
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8
+        ) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
         var difference: UInt8 = 0
-        for offset in 0..<tagLength {
-            difference |= expected[expected.startIndex + offset]
-                ^ packet[authenticatedEnd + offset]
+        withUnsafeMutableBytes(of: &mac) { macPtr in
+            CCHmacFinal(&ctx, macPtr.baseAddress)
+            let expected = macPtr.baseAddress!.assumingMemoryBound(to: UInt8.self)
+            let actual = basePtr.advanced(by: authenticatedLength)
+            for offset in 0..<tagLength {
+                difference |= expected[offset] ^ actual[offset]
+            }
         }
         guard difference == 0 else {
             throw VNCProtocolError.protocolViolation("SRTP authentication failed")
@@ -112,53 +140,81 @@ public final class AppleSRTPContext: @unchecked Sendable {
     }
 
     private func decryptPacket(
-        _ packet: Data,
-        payloadOffset: Data.Index,
-        encryptedEnd: Data.Index,
+        basePtr: UnsafePointer<UInt8>,
+        headerLength: Int,
+        encryptedLength: Int,
         ssrc: UInt32,
         packetIndex: UInt64
     ) throws -> Data {
-        let base = packet.startIndex
-        let headerCount = payloadOffset - base
-        let payloadCount = encryptedEnd - payloadOffset
-        var output = Data(count: encryptedEnd - base)
-        output.replaceSubrange(0..<headerCount, with: packet[base..<payloadOffset])
-        guard payloadCount > 0 else { return output }
-
-        // AES-CM is AES-CTR with a big-endian counter whose low 16 bits are the
-        // per-block counter. RTP payloads are well under 2^16 blocks, so a
-        // single hardware AES-CTR pass (initial counter = block 0) produces the
-        // same keystream as stepping the counter block by block — but with one
-        // CommonCrypto call instead of ~90, which matters at thousands of
-        // packets per second.
-        let iv = counterBlock(ssrc: ssrc, packetIndex: packetIndex, blockCounter: 0)
-
-        guard let cryptor else {
-            throw VNCProtocolError.ioError("AES-CTR context is unavailable")
-        }
-        let resetStatus = iv.withUnsafeBytes { ivPtr in
-            CCCryptorReset(cryptor, ivPtr.baseAddress)
-        }
-        guard resetStatus == kCCSuccess else {
-            throw VNCProtocolError.ioError("AES-CTR reset failed: \(resetStatus)")
-        }
-
-        var moved = 0
-        let updateStatus = output.withUnsafeMutableBytes { outPtr in
-            packet.withUnsafeBytes { inPtr in
-                CCCryptorUpdate(
-                    cryptor,
-                    inPtr.baseAddress?.advanced(by: payloadOffset - base),
-                    payloadCount,
-                    outPtr.baseAddress?.advanced(by: headerCount),
-                    payloadCount,
-                    &moved)
+        let payloadCount = encryptedLength - headerLength
+        let rawOut = UnsafeMutableRawPointer.allocate(
+            byteCount: max(1, encryptedLength),
+            alignment: 1)
+        var transferredOwnership = false
+        defer {
+            if !transferredOwnership {
+                rawOut.deallocate()
             }
         }
-        guard updateStatus == kCCSuccess, moved == payloadCount else {
-            throw VNCProtocolError.ioError("AES-CTR update failed: \(updateStatus)")
+        if headerLength > 0 {
+            rawOut.copyMemory(from: basePtr, byteCount: headerLength)
         }
-        return output
+
+        if payloadCount > 0 {
+            // AES-CM is AES-CTR with a big-endian counter whose low 16 bits are the
+            // per-block counter. RTP payloads are well under 2^16 blocks, so a
+            // single hardware AES-CTR pass (initial counter = block 0) produces the
+            // same keystream as stepping the counter block by block.
+            var iv: (
+                UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8
+            ) = (
+                saltBytes.0,
+                saltBytes.1,
+                saltBytes.2,
+                saltBytes.3,
+                saltBytes.4 ^ UInt8((ssrc >> 24) & 0xff),
+                saltBytes.5 ^ UInt8((ssrc >> 16) & 0xff),
+                saltBytes.6 ^ UInt8((ssrc >> 8) & 0xff),
+                saltBytes.7 ^ UInt8(ssrc & 0xff),
+                saltBytes.8 ^ UInt8((packetIndex >> 40) & 0xff),
+                saltBytes.9 ^ UInt8((packetIndex >> 32) & 0xff),
+                saltBytes.10 ^ UInt8((packetIndex >> 24) & 0xff),
+                saltBytes.11 ^ UInt8((packetIndex >> 16) & 0xff),
+                saltBytes.12 ^ UInt8((packetIndex >> 8) & 0xff),
+                saltBytes.13 ^ UInt8(packetIndex & 0xff),
+                0,
+                0
+            )
+
+            guard let cryptor else {
+                throw VNCProtocolError.ioError("AES-CTR context is unavailable")
+            }
+            let resetStatus = withUnsafeBytes(of: &iv) { ivPtr in
+                CCCryptorReset(cryptor, ivPtr.baseAddress)
+            }
+            guard resetStatus == kCCSuccess else {
+                throw VNCProtocolError.ioError("AES-CTR reset failed: \(resetStatus)")
+            }
+
+            var moved = 0
+            let updateStatus = CCCryptorUpdate(
+                cryptor,
+                basePtr.advanced(by: headerLength),
+                payloadCount,
+                rawOut.advanced(by: headerLength),
+                payloadCount,
+                &moved)
+            guard updateStatus == kCCSuccess, moved == payloadCount else {
+                throw VNCProtocolError.ioError("AES-CTR update failed: \(updateStatus)")
+            }
+        }
+
+        transferredOwnership = true
+        return Data(
+            bytesNoCopy: rawOut,
+            count: encryptedLength,
+            deallocator: .custom { ptr, _ in ptr.deallocate() })
     }
 
     private static func makeCryptor(key: Data) throws -> CCCryptorRef {
@@ -176,32 +232,6 @@ public final class AppleSRTPContext: @unchecked Sendable {
             throw VNCProtocolError.ioError("AES-CTR init failed: \(status)")
         }
         return cryptorRef
-    }
-
-    private func counterBlock(ssrc: UInt32, packetIndex: UInt64, blockCounter: UInt16) -> Data {
-        var block = Data(count: 16)
-        block.replaceSubrange(0..<saltKey.count, with: saltKey)
-
-        block[4] ^= UInt8((ssrc >> 24) & 0xff)
-        block[5] ^= UInt8((ssrc >> 16) & 0xff)
-        block[6] ^= UInt8((ssrc >> 8) & 0xff)
-        block[7] ^= UInt8(ssrc & 0xff)
-
-        let indexBytes = [
-            UInt8((packetIndex >> 40) & 0xff),
-            UInt8((packetIndex >> 32) & 0xff),
-            UInt8((packetIndex >> 24) & 0xff),
-            UInt8((packetIndex >> 16) & 0xff),
-            UInt8((packetIndex >> 8) & 0xff),
-            UInt8(packetIndex & 0xff),
-        ]
-        for i in 0..<6 {
-            block[8 + i] ^= indexBytes[i]
-        }
-
-        block[14] = UInt8((blockCounter >> 8) & 0xff)
-        block[15] = UInt8(blockCounter & 0xff)
-        return block
     }
 
     private func estimatedROC(for sequence: UInt16, state: SSRCState) -> UInt32 {
@@ -240,22 +270,24 @@ public final class AppleSRTPContext: @unchecked Sendable {
         return distance != 0 && distance < 0x8000
     }
 
-    private static func payloadOffset(in packet: Data) throws -> Data.Index {
-        let base = packet.startIndex
-        let csrcCount = Int(packet[base] & 0x0f)
-        let hasExtension = (packet[base] & 0x10) != 0
-        var offset = base + 12 + csrcCount * 4
-        guard offset <= packet.endIndex else {
+    private static func payloadOffset(
+        basePtr: UnsafePointer<UInt8>,
+        totalCount: Int
+    ) throws -> Int {
+        let csrcCount = Int(basePtr[0] & 0x0f)
+        let hasExtension = (basePtr[0] & 0x10) != 0
+        var offset = 12 + csrcCount * 4
+        guard offset <= totalCount else {
             throw VNCProtocolError.protocolViolation("RTP CSRC header exceeds packet length")
         }
 
         if hasExtension {
-            guard offset + 4 <= packet.endIndex else {
+            guard offset + 4 <= totalCount else {
                 throw VNCProtocolError.protocolViolation("RTP extension header exceeds packet length")
             }
-            let extensionLength = Int(UInt16(packet[offset + 2]) << 8 | UInt16(packet[offset + 3]))
+            let extensionLength = Int(UInt16(basePtr[offset + 2]) << 8 | UInt16(basePtr[offset + 3]))
             offset += 4 + extensionLength * 4
-            guard offset <= packet.endIndex else {
+            guard offset <= totalCount else {
                 throw VNCProtocolError.protocolViolation("RTP extension payload exceeds packet length")
             }
         }

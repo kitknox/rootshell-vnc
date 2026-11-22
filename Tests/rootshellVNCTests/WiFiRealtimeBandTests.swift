@@ -325,26 +325,105 @@ final class WiFiRealtimeBandTests: XCTestCase {
 }
 
 /// Sample a grid of pixels; a decoder-concealment "green" frame has G strongly
-/// dominant over R and B across the whole frame.
+/// dominant over R and B across the whole frame. Handles `32BGRA`, uncompressed
+/// bi-planar YCbCr (`444f`, `444v`, `420f`, `420v`), and Apple Silicon
+/// lossless-compressed IOSurface formats (`&8f4`, etc.).
+private let greenCheckCIContext = CIContext(options: [.cacheIntermediates: false])
+
 private func isGreen(_ pb: CVPixelBuffer) -> Bool {
-    guard CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA else { return false }
-    CVPixelBufferLockBaseAddress(pb, .readOnly)
-    defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
-    guard let base = CVPixelBufferGetBaseAddress(pb) else { return false }
+    let format = CVPixelBufferGetPixelFormatType(pb)
     let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
-    let stride = CVPixelBufferGetBytesPerRow(pb)
-    let ptr = base.assumingMemoryBound(to: UInt8.self)
-    var greenish = 0, samples = 0
-    var y = 8
-    while y < h { var x = 8
-        while x < w {
-            let p = y * stride + x * 4
-            let b = Int(ptr[p]), g = Int(ptr[p + 1]), r = Int(ptr[p + 2])
-            if g > 90 && g > r + 40 && g > b + 40 { greenish += 1 }
-            samples += 1
-            x += 64
+    guard w > 0, h > 0 else { return false }
+
+    if format == kCVPixelFormatType_32BGRA {
+        CVPixelBufferLockBaseAddress(pb, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pb) else { return false }
+        let stride = CVPixelBufferGetBytesPerRow(pb)
+        let ptr = base.assumingMemoryBound(to: UInt8.self)
+        var greenish = 0, samples = 0
+        var y = 8
+        while y < h {
+            var x = 8
+            while x < w {
+                let p = y * stride + x * 4
+                let b = Int(ptr[p]), g = Int(ptr[p + 1]), r = Int(ptr[p + 2])
+                if g > 90 && g > r + 40 && g > b + 40 { greenish += 1 }
+                samples += 1
+                x += 64
+            }
+            y += 32
         }
-        y += 32
+        return samples > 0 && greenish * 100 / samples > 80
     }
-    return samples > 0 && greenish * 100 / samples > 80
+
+    // For uncompressed linear bi-planar YCbCr we can sample planes directly;
+    // for lossless-compressed formats (e.g. `&8f4`), downsample via Core Image
+    // into a small 32x16 RGBA grid so compressed tile layouts are never read raw.
+    switch format {
+    case kCVPixelFormatType_444YpCbCr8BiPlanarFullRange,
+         kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange,
+         kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+        CVPixelBufferLockBaseAddress(pb, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        guard CVPixelBufferGetPlaneCount(pb) >= 2,
+              let yBase = CVPixelBufferGetBaseAddressOfPlane(pb, 0),
+              let uvBase = CVPixelBufferGetBaseAddressOfPlane(pb, 1) else {
+            return false
+        }
+        let yStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0)
+        let uvStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 1)
+        let uvWidth = CVPixelBufferGetWidthOfPlane(pb, 1)
+        let uvHeight = CVPixelBufferGetHeightOfPlane(pb, 1)
+        let shiftX = uvWidth < w ? 1 : 0
+        let shiftY = uvHeight < h ? 1 : 0
+        let yPtr = yBase.assumingMemoryBound(to: UInt8.self)
+        let uvPtr = uvBase.assumingMemoryBound(to: UInt8.self)
+        var greenish = 0, samples = 0
+        var y = 8
+        while y < h {
+            var x = 8
+            while x < w {
+                let luma = Double(yPtr[y * yStride + x])
+                let cx = min(x >> shiftX, max(0, uvWidth - 1))
+                let cy = min(y >> shiftY, max(0, uvHeight - 1))
+                let cb = Double(uvPtr[cy * uvStride + cx * 2]) - 128.0
+                let cr = Double(uvPtr[cy * uvStride + cx * 2 + 1]) - 128.0
+                let r = Int(max(0.0, min(255.0, luma + 1.5748 * cr)))
+                let g = Int(max(0.0, min(255.0, luma - 0.1873 * cb - 0.4681 * cr)))
+                let b = Int(max(0.0, min(255.0, luma + 1.8556 * cb)))
+                if g > 90 && g > r + 40 && g > b + 40 { greenish += 1 }
+                samples += 1
+                x += 64
+            }
+            y += 32
+        }
+        return samples > 0 && greenish * 100 / samples > 80
+
+    default:
+        let gridW = 32
+        let gridH = 16
+        let ci = CIImage(cvPixelBuffer: pb)
+        let scaled = ci.transformed(by: CGAffineTransform(
+            scaleX: CGFloat(gridW) / CGFloat(w),
+            y: CGFloat(gridH) / CGFloat(h)))
+        var rgba = [UInt8](repeating: 0, count: gridW * gridH * 4)
+        greenCheckCIContext.render(
+            scaled,
+            toBitmap: &rgba,
+            rowBytes: gridW * 4,
+            bounds: CGRect(x: 0, y: 0, width: gridW, height: gridH),
+            format: .RGBA8,
+            colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
+        var greenish = 0
+        let samples = gridW * gridH
+        for i in 0..<samples {
+            let r = Int(rgba[i * 4])
+            let g = Int(rgba[i * 4 + 1])
+            let b = Int(rgba[i * 4 + 2])
+            if g > 90 && g > r + 40 && g > b + 40 { greenish += 1 }
+        }
+        return samples > 0 && greenish * 100 / samples > 80
+    }
 }

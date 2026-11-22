@@ -188,6 +188,175 @@ final class LiveVideoBenchmarkTests: XCTestCase {
         bench.emitSummary()
     }
 
+    /// Full-stack `VNCSession` High Performance CPU and latency benchmark.
+    /// Exercises the complete app pipeline (UDP -> SRTP -> reorder ->
+    /// OrderedMediaPacketCoalescer -> VideoStreamManager -> HEVCDecoder ->
+    /// DecodedFrameOrderer -> BandFrameCoalescer -> VideoBandLayerRenderer +
+    /// interactive pointer/key input + optional remote audio).
+    ///
+    ///   VNC_HP_SESSION_BENCH=1 VNC_TEST_HOST=... VNC_TEST_USERNAME=... VNC_TEST_PASSWORD='...' \
+    ///   ROOTSHELL_VNC_RENDER_STATS=1 swift test -c release --filter testVNCSessionHighPerformanceProfile
+    @MainActor
+    func testVNCSessionHighPerformanceProfile() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["VNC_HP_SESSION_BENCH"] == "1",
+              let host = env["VNC_TEST_HOST"], !host.isEmpty,
+              let pass = env["VNC_TEST_PASSWORD"], !pass.isEmpty else {
+            throw XCTSkip("Set VNC_HP_SESSION_BENCH=1, VNC_TEST_HOST and VNC_TEST_PASSWORD")
+        }
+        let user = env["VNC_TEST_USERNAME"] ?? ""
+        let port = UInt16(env["VNC_TEST_PORT"] ?? "5900") ?? 5900
+        let seconds = Int(env["VNC_BENCH_SECONDS"] ?? "18") ?? 18
+        let doLogin = env["VNC_BENCH_LOGIN"] == "1"
+        let enableAudio = env["VNC_BENCH_AUDIO"] != "0"
+
+        VNCLogRelay.install(minimumLevel: .debug) { _, category, message in
+            if category == "HEVCDecoder" || category == "RenderStats" || category == "Transport" && message.contains("RCTL bwe=") {
+                print("HPLOG [\(category)] \(message)")
+            }
+        }
+        defer { VNCLogRelay.install(sink: nil) }
+
+        var config = VNCConfiguration(
+            videoQualityMode: .adaptive,
+            displaySizingMode: env["VNC_BENCH_MATCH_CLIENT"] == "1" ? .matchClient : .remoteDisplay,
+            enableRemoteAudio: enableAudio,
+            promptForLoginPasswordAtLoginWindow: doLogin,
+            reconnectionPolicy: VNCReconnectionPolicy(isEnabled: false, maximumAttempts: 0))
+        if let bw = env["VNC_BENCH_BANDWIDTH"], bw == "constrained" {
+            config.highPerformanceBandwidth = .constrained
+        }
+        let session = VNCSession(configuration: config)
+        session.videoBandRenderer.setViewBounds(CGRect(x: 0, y: 0, width: 1488, height: 930))
+        if config.displaySizingMode == .matchClient {
+            let w = Double(env["VNC_BENCH_VIEW_W"] ?? "1488") ?? 1488
+            let h = Double(env["VNC_BENCH_VIEW_H"] ?? "930") ?? 930
+            session.updateRemoteDisplaySize(viewSize: CGSize(width: w, height: h), displayScale: 2)
+        }
+
+        try await session.connect(credentials: VNCCredentials(
+            host: host, port: port, password: pass, username: user))
+        defer { session.disconnect() }
+
+        let readyDeadline = Date().addingTimeInterval(15)
+        while Date() < readyDeadline, session.videoBandRenderer.frameCommitCount < 3 {
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        print("HPBENCH connected fb=\(session.framebufferWidth)x\(session.framebufferHeight) "
+            + "hp=\(session.isHighPerformanceMode) bands=\(session.videoBandRenderer.renderedBandCount) "
+            + "dims=\(session.videoBandRenderer.renderedBandDimensions) "
+            + "commits=\(session.videoBandRenderer.frameCommitCount)")
+        XCTAssertTrue(
+            session.isHighPerformanceMode,
+            "High Performance profile benchmark must negotiate High Performance mode")
+        XCTAssertGreaterThan(
+            session.videoBandRenderer.frameCommitCount,
+            0,
+            "High Performance profile benchmark must commit at least one video frame")
+
+        if doLogin {
+            // Wait briefly for login-window detection and only send the
+            // password when the session actively reports a login prompt so
+            // repeated runs against an unlocked desktop never type into focus.
+            let loginDeadline = Date().addingTimeInterval(3)
+            while Date() < loginDeadline, !session.loginPasswordPromptPending {
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            if session.consumeLoginPasswordPromptRequest() {
+                session.sendLoginPassword()
+                try await Task.sleep(for: .seconds(4))
+            }
+        }
+
+        // Measure steady-state CPU + interactive input latency while driving
+        // continuous pointer motion at ~60 Hz.
+        var rusageStart = rusage()
+        getrusage(RUSAGE_SELF, &rusageStart)
+        let wallStart = DispatchTime.now().uptimeNanoseconds
+        let commitsStart = session.videoBandRenderer.frameCommitCount
+        let startStats = await session.currentStatistics()
+
+        var inputEnqueueToFlushNanos: [UInt64] = []
+        let motionDeadline = ContinuousClock.now + .seconds(seconds)
+        var step = 0
+        let width = max(640, session.framebufferWidth)
+        let height = max(480, session.framebufferHeight)
+        let motionY = UInt16(clamping: height - 20)
+        let centerX = width / 2
+        let radiusX = max(100, width / 3)
+        while ContinuousClock.now < motionDeadline {
+            let phase = Double(step) / 120.0
+            let x = UInt16(clamping: centerX + Int(Double(radiusX) * sin(phase * 2 * .pi)))
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            session.sendPointerEvent(buttonMask: 0, x: x, y: motionY)
+            await session.flushPendingInput()
+            let t1 = DispatchTime.now().uptimeNanoseconds
+            inputEnqueueToFlushNanos.append(t1 &- t0)
+            step += 1
+            try? await Task.sleep(for: .milliseconds(16))
+        }
+
+        let wallEnd = DispatchTime.now().uptimeNanoseconds
+        var rusageEnd = rusage()
+        getrusage(RUSAGE_SELF, &rusageEnd)
+        let commitsEnd = session.videoBandRenderer.frameCommitCount
+        let endStats = await session.currentStatistics()
+
+        func tvSeconds(_ tv: timeval) -> Double {
+            Double(tv.tv_sec) + Double(tv.tv_usec) / 1_000_000.0
+        }
+        let wallSec = Double(wallEnd &- wallStart) / 1_000_000_000.0
+        let userSec = tvSeconds(rusageEnd.ru_utime) - tvSeconds(rusageStart.ru_utime)
+        let sysSec = tvSeconds(rusageEnd.ru_stime) - tvSeconds(rusageStart.ru_stime)
+        let totalCPU = userSec + sysSec
+        let startSnapshot = try XCTUnwrap(
+            startStats,
+            "Session must remain connected to capture start statistics")
+        let endSnapshot = try XCTUnwrap(
+            endStats,
+            "Session must remain connected to capture end statistics")
+        func saturatingDelta(_ end: UInt64, _ start: UInt64) -> UInt64 {
+            end >= start ? end - start : 0
+        }
+        let commits = saturatingDelta(commitsEnd, commitsStart)
+        let decodedDelta = saturatingDelta(endSnapshot.framesDecoded, startSnapshot.framesDecoded)
+        let submittedDelta = saturatingDelta(endSnapshot.framesSubmitted, startSnapshot.framesSubmitted)
+        let bytesDelta = saturatingDelta(
+            endSnapshot.transport.mediaBytesReceived,
+            startSnapshot.transport.mediaBytesReceived)
+        let sortedInput = inputEnqueueToFlushNanos.sorted()
+        func pctMs(_ sorted: [UInt64], _ p: Double) -> Double {
+            guard !sorted.isEmpty else { return 0 }
+            let idx = min(sorted.count - 1, Int(Double(sorted.count) * p))
+            return Double(sorted[idx]) / 1_000_000.0
+        }
+
+        let avgMbps = Double(bytesDelta) * 8.0 / max(0.001, wallSec) / 1_000_000.0
+        let commitFPS = Double(commits) / max(0.001, wallSec)
+        let msCPUPerFrame = commits > 0 ? (totalCPU * 1000.0) / Double(commits) : 0
+        print("================ HP SESSION SUMMARY ================")
+        print(String(format: "wall=%.2fs CPU=%.3fs (user=%.3fs sys=%.3fs, %.1f%% of 1 core)",
+                     wallSec, totalCPU, userSec, sysSec, (totalCPU / max(0.001, wallSec)) * 100.0))
+        print(String(format: "frames: submitted=%llu decoded=%llu commits=%llu (%.1f fps) %.2f ms CPU/commit",
+                     submittedDelta, decodedDelta, commits, commitFPS, msCPUPerFrame))
+        print(String(format: "rx=%.1f Mbps bands=%d partialCommits=%llu",
+                     avgMbps, session.videoBandRenderer.renderedBandCount,
+                     session.videoBandRenderer.partialCommitCount))
+        print(String(format: "input flush latency (n=%d): p50=%.3fms p95=%.3fms p99=%.3fms max=%.3fms",
+                     sortedInput.count,
+                     pctMs(sortedInput, 0.50), pctMs(sortedInput, 0.95),
+                     pctMs(sortedInput, 0.99), pctMs(sortedInput, 1.0)))
+        if let frame = session.videoBandRenderer.latestComposedFrame {
+            let fmt = CVPixelBufferGetPixelFormatType(frame)
+            let fourCC = String(bytes: [
+                UInt8((fmt >> 24) & 0xff), UInt8((fmt >> 16) & 0xff),
+                UInt8((fmt >> 8) & 0xff), UInt8(fmt & 0xff),
+            ], encoding: .ascii) ?? "\(fmt)"
+            print("latestComposedFrame: \(CVPixelBufferGetWidth(frame))x\(CVPixelBufferGetHeight(frame)) fmt=\(fourCC)")
+        }
+        print("====================================================")
+    }
+
     /// Lock-guarded counters; every hot-path touch is a few integer ops.
     private final class BenchState: @unchecked Sendable {
         private let lock = NSLock()

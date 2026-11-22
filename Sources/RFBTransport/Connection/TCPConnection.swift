@@ -414,7 +414,6 @@ public actor TCPConnection: RFBConnection {
         } catch {
             throw VNCProtocolError.ioError("Send error: \(error.localizedDescription)")
         }
-        log.debug("Sent \(data.count) bytes")
     }
 
     public func close() async {

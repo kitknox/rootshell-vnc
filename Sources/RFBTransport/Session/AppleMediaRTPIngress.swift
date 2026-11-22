@@ -31,6 +31,148 @@ struct BoundedRTPSequenceHistory {
     }
 }
 
+/// Thread-safe SRTP batch decryptor shared between the UDP read task and
+/// ``TransportSession``. Running AES-256-CTR + HMAC-SHA1-80 off the transport
+/// actor keeps input sends (`sendInputEvents`, scroll, gesture) uncontended
+/// during high-bitrate HEVC bursts.
+final class AppleMediaSRTPDecryptor: @unchecked Sendable {
+    enum DecryptedItem: Sendable {
+        case decrypted(
+            rtp: Data,
+            wireByteCount: Int,
+            ssrc: UInt32,
+            context: AppleSRTPContext,
+            arrivalNanos: UInt64)
+        case raw(datagram: Data, arrivalNanos: UInt64)
+    }
+
+    struct DecryptedBatch: Sendable {
+        let generation: UInt64
+        let items: [DecryptedItem]
+    }
+
+    private let lock = NSLock()
+    private var contexts: [AppleSRTPContext] = []
+    private var contextBySSRC: [UInt32: AppleSRTPContext] = [:]
+    private var expectsSRTP = false
+    private var generation: UInt64 = 0
+
+    @discardableResult
+    func configure(contexts newContexts: [AppleSRTPContext], expectsSRTP: Bool) -> UInt64 {
+        lock.lock()
+        contexts = newContexts
+        contextBySSRC.removeAll(keepingCapacity: true)
+        self.expectsSRTP = expectsSRTP
+        generation &+= 1
+        let activeGeneration = generation
+        lock.unlock()
+        return activeGeneration
+    }
+
+    func setExpectsSRTP(_ value: Bool) {
+        lock.lock()
+        expectsSRTP = value
+        lock.unlock()
+    }
+
+    @discardableResult
+    func clear() -> UInt64 {
+        lock.lock()
+        contexts.removeAll(keepingCapacity: false)
+        contextBySSRC.removeAll(keepingCapacity: false)
+        expectsSRTP = false
+        generation &+= 1
+        let activeGeneration = generation
+        lock.unlock()
+        return activeGeneration
+    }
+
+    func decryptBatch(_ datagrams: [PosixUDPDatagram]) -> DecryptedBatch {
+        lock.lock()
+        let activeContexts = contexts
+        let activeGeneration = generation
+        var localBySSRC = contextBySSRC
+        lock.unlock()
+
+        guard !datagrams.isEmpty else {
+            return DecryptedBatch(generation: activeGeneration, items: [])
+        }
+
+        if activeContexts.isEmpty {
+            return DecryptedBatch(
+                generation: activeGeneration,
+                items: datagrams.map { .raw(datagram: $0.data, arrivalNanos: $0.arrivalNanos) })
+        }
+
+        var items: [DecryptedItem] = []
+        items.reserveCapacity(datagrams.count)
+        var newlyBound: [(UInt32, AppleSRTPContext)] = []
+
+        for datagram in datagrams {
+            let data = datagram.data
+            guard data.count >= 12 else {
+                items.append(.raw(datagram: data, arrivalNanos: datagram.arrivalNanos))
+                continue
+            }
+            let base = data.startIndex
+            let firstByte = data[base]
+            let secondByte = data[base + 1]
+            // RTCP packets (PT 192...223) or non-RTP v2 packets stay on the raw path.
+            guard (firstByte >> 6) == 2,
+                  secondByte < 192 || secondByte > 223 else {
+                items.append(.raw(datagram: data, arrivalNanos: datagram.arrivalNanos))
+                continue
+            }
+            let ssrc = UInt32(data[base + 8]) << 24
+                | UInt32(data[base + 9]) << 16
+                | UInt32(data[base + 10]) << 8
+                | UInt32(data[base + 11])
+
+            if let cached = localBySSRC[ssrc],
+               let packet = try? cached.unprotect(data) {
+                items.append(.decrypted(
+                    rtp: packet,
+                    wireByteCount: data.count,
+                    ssrc: ssrc,
+                    context: cached,
+                    arrivalNanos: datagram.arrivalNanos))
+                continue
+            }
+
+            var matched = false
+            for context in activeContexts {
+                if let packet = try? context.unprotect(data) {
+                    localBySSRC[ssrc] = context
+                    newlyBound.append((ssrc, context))
+                    items.append(.decrypted(
+                        rtp: packet,
+                        wireByteCount: data.count,
+                        ssrc: ssrc,
+                        context: context,
+                        arrivalNanos: datagram.arrivalNanos))
+                    matched = true
+                    break
+                }
+            }
+            if !matched {
+                items.append(.raw(datagram: data, arrivalNanos: datagram.arrivalNanos))
+            }
+        }
+
+        if !newlyBound.isEmpty {
+            lock.lock()
+            if generation == activeGeneration {
+                for (ssrc, context) in newlyBound {
+                    contextBySSRC[ssrc] = context
+                }
+            }
+            lock.unlock()
+        }
+
+        return DecryptedBatch(generation: activeGeneration, items: items)
+    }
+}
+
 /// Ordered handoff between the transport actor and the media decode queue.
 ///
 /// Packets received before the decoder installs its sink stay here instead of
@@ -39,6 +181,7 @@ struct BoundedRTPSequenceHistory {
 /// the handoff cannot overtake one another.
 struct AppleMediaPacketHandoff {
     typealias Sink = @Sendable (Data, Int?) -> Void
+    typealias BatchSink = @Sendable ([(data: Data, displayIndex: Int?)]) -> Void
 
     struct DrainResult: Equatable {
         let packetCount: Int
@@ -56,6 +199,7 @@ struct AppleMediaPacketHandoff {
     private let maximumPackets: Int
     private let maximumBytes: Int
     private var sink: Sink?
+    private var batchSink: BatchSink?
     private var pending: [(data: Data, displayIndex: Int?)] = []
     private var pendingBytes = 0
     private(set) var overflowed = false
@@ -73,6 +217,10 @@ struct AppleMediaPacketHandoff {
         _ packet: Data,
         displayIndex: Int? = nil
     ) -> DeliveryResult {
+        if let batchSink {
+            batchSink([(packet, displayIndex)])
+            return .delivered
+        }
         if let sink {
             sink(packet, displayIndex)
             return .delivered
@@ -93,7 +241,31 @@ struct AppleMediaPacketHandoff {
         return .buffered
     }
 
+    mutating func deliverBatch(
+        _ packets: [(data: Data, displayIndex: Int?)]
+    ) -> DeliveryResult {
+        guard !packets.isEmpty else { return .delivered }
+        if let batchSink {
+            batchSink(packets)
+            return .delivered
+        }
+        if let sink {
+            for packet in packets {
+                sink(packet.data, packet.displayIndex)
+            }
+            return .delivered
+        }
+        var result: DeliveryResult = .buffered
+        for packet in packets {
+            if deliver(packet.data, displayIndex: packet.displayIndex) == .overflow {
+                result = .overflow
+            }
+        }
+        return result
+    }
+
     mutating func installSink(_ newSink: Sink?) -> DrainResult {
+        batchSink = nil
         sink = newSink
         guard let newSink else {
             return DrainResult(
@@ -117,8 +289,34 @@ struct AppleMediaPacketHandoff {
             droppedPacketCount: droppedPacketCount)
     }
 
+    mutating func installBatchSink(_ newSink: BatchSink?) -> DrainResult {
+        sink = nil
+        batchSink = newSink
+        guard let newSink else {
+            return DrainResult(
+                packetCount: 0,
+                byteCount: 0,
+                overflowed: overflowed,
+                droppedPacketCount: droppedPacketCount)
+        }
+
+        let packets = pending
+        let bytes = pendingBytes
+        pending.removeAll(keepingCapacity: true)
+        pendingBytes = 0
+        if !packets.isEmpty {
+            newSink(packets)
+        }
+        return DrainResult(
+            packetCount: packets.count,
+            byteCount: bytes,
+            overflowed: overflowed,
+            droppedPacketCount: droppedPacketCount)
+    }
+
     mutating func reset() {
         sink = nil
+        batchSink = nil
         pending.removeAll(keepingCapacity: false)
         pendingBytes = 0
         overflowed = false
@@ -167,6 +365,17 @@ struct AppleMediaRTPReorderBuffer {
 
         var packets: [Data] {
             if let preorderedPackets { return preorderedPackets }
+            if released.isEmpty { return [] }
+            if released.count == 1 { return [released[0].data] }
+            let firstSSRC = released[0].ssrc
+            var singleStream = true
+            for index in 1..<released.count where released[index].ssrc != firstSSRC {
+                singleStream = false
+                break
+            }
+            if singleStream {
+                return released.map(\.data)
+            }
             return packetsOrderedByArrivalSlots()
         }
 
@@ -267,12 +476,30 @@ struct AppleMediaRTPReorderBuffer {
     }
 
     var nextDeadlineNanos: UInt64? {
-        streams.values.compactMap { state in
-            guard state.started else { return state.startupDeadlineNanos }
-            return [state.gapDeadlineNanos, state.nextNACKDeadlineNanos]
-                .compactMap { $0 }
-                .min()
-        }.min()
+        var earliest: UInt64?
+        for state in streams.values {
+            let candidate: UInt64?
+            if !state.started {
+                candidate = state.startupDeadlineNanos
+            } else if let gap = state.gapDeadlineNanos, let nack = state.nextNACKDeadlineNanos {
+                candidate = min(gap, nack)
+            } else {
+                candidate = state.gapDeadlineNanos ?? state.nextNACKDeadlineNanos
+            }
+            if let candidate {
+                earliest = earliest.map { min($0, candidate) } ?? candidate
+            }
+        }
+        return earliest
+    }
+
+    private func hasAnyPendingGap() -> Bool {
+        for state in streams.values {
+            if state.gapDeadlineNanos != nil {
+                return true
+            }
+        }
+        return false
     }
 
     mutating func insert(
@@ -281,13 +508,42 @@ struct AppleMediaRTPReorderBuffer {
         sequence: UInt16,
         nowNanos: UInt64
     ) -> Result {
-        var result = flushExpiredRaw(nowNanos: nowNanos)
+        var result: Result
+        if let earliest = nextDeadlineNanos, nowNanos >= earliest {
+            result = flushExpiredRaw(nowNanos: nowNanos)
+        } else {
+            result = Result()
+        }
         nextOrdinal &+= 1
 
-        var state = streams[ssrc] ?? StreamState(
+        // Remove before mutating so `state.pending` stays uniquely referenced
+        // (avoids Dictionary CoW copies on every inserted/drained packet).
+        var state = streams.removeValue(forKey: ssrc) ?? StreamState(
             firstSequence: sequence,
             startupDeadlineNanos: nowNanos &+ startupHoldNanos,
             lastAcceptedArrivalNanos: nowNanos)
+
+        // Steady-state fast path: in-order packet on a started stream with no
+        // buffered future packets. Skips dictionary insert+remove and sorting.
+        if state.started,
+           let next = state.nextSequence,
+           sequence == next,
+           state.pending.isEmpty {
+            state.interruptionPending = false
+            state.lastAcceptedArrivalNanos = nowNanos
+            state.nextSequence = next &+ 1
+            state.gapDeadlineNanos = nil
+            state.nextNACKDeadlineNanos = nil
+            state.nearestFutureSequence = nil
+            noteReleasedFramePacket(packet, state: &state)
+            streams[ssrc] = state
+            if result.released.isEmpty && !hasAnyPendingGap() && compoundGapHeldPackets.isEmpty {
+                result.preorderedPackets = [packet]
+                return result
+            }
+            result.released.append((ssrc, nextOrdinal, packet))
+            return finalizeCompoundGapHold(result)
+        }
 
         if state.pending[sequence] != nil {
             result.duplicateOrLatePacketCount += 1
@@ -379,7 +635,7 @@ struct AppleMediaRTPReorderBuffer {
         var result = Result()
 
         for ssrc in Array(streams.keys) {
-            guard var state = streams[ssrc] else { continue }
+            guard var state = streams.removeValue(forKey: ssrc) else { continue }
             if !state.started, nowNanos >= state.startupDeadlineNanos {
                 start(&state)
             }

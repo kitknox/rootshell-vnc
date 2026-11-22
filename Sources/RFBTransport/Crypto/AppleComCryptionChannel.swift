@@ -80,35 +80,42 @@ final class AppleComCryptionChannel: @unchecked Sendable {
             throw VNCProtocolError.ioError("Apple ComCryption encryptor is unavailable")
         }
 
-        var plaintext = Data(capacity: payload.count + 2 + reservedGapBytes + 15 + 20)
+        let unpaddedLength = 2 + payload.count + reservedGapBytes
+        let remainder = (unpaddedLength + 20) % kCCBlockSizeAES128
+        let paddingLength = remainder == 0 ? 0 : (kCCBlockSizeAES128 - remainder)
+        let plaintextLength = unpaddedLength + paddingLength + 20
+
+        var plaintext = Data(capacity: plaintextLength)
         plaintext.append(UInt8((payload.count >> 8) & 0xFF))
         plaintext.append(UInt8(payload.count & 0xFF))
         plaintext.append(payload)
-        if reservedGapBytes > 0 {
-            plaintext.append(Data(count: reservedGapBytes))
+        let zeroCount = reservedGapBytes + paddingLength
+        if zeroCount > 0 {
+            plaintext.append(contentsOf: repeatElement(UInt8(0), count: zeroCount))
         }
 
-        while (plaintext.count + 20) % kCCBlockSizeAES128 != 0 {
-            plaintext.append(0)
+        var hasher = Insecure.SHA1()
+        var packetIDBE = packetID.bigEndian
+        withUnsafeBytes(of: &packetIDBE) { hasher.update(bufferPointer: $0) }
+        plaintext.withUnsafeBytes { hasher.update(bufferPointer: $0) }
+        let digest = hasher.finalize()
+        digest.withUnsafeBytes { bytes in
+            plaintext.append(bytes.bindMemory(to: UInt8.self))
         }
 
-        var checksumInput = Data(capacity: 4 + plaintext.count)
-        checksumInput.append(UInt8((packetID >> 24) & 0xFF))
-        checksumInput.append(UInt8((packetID >> 16) & 0xFF))
-        checksumInput.append(UInt8((packetID >> 8) & 0xFF))
-        checksumInput.append(UInt8(packetID & 0xFF))
-        checksumInput.append(plaintext)
-        plaintext.append(contentsOf: Insecure.SHA1.hash(data: checksumInput))
-
-        var output = [UInt8](repeating: 0, count: plaintext.count)
+        let rawOut = UnsafeMutableRawPointer.allocate(byteCount: plaintext.count, alignment: 1)
+        var transferred = false
+        defer {
+            if !transferred { rawOut.deallocate() }
+        }
         var outLength = 0
         let status = plaintext.withUnsafeBytes { plaintextPtr in
             CCCryptorUpdate(
                 encryptor,
                 plaintextPtr.baseAddress,
                 plaintext.count,
-                &output,
-                output.count,
+                rawOut,
+                plaintext.count,
                 &outLength
             )
         }
@@ -118,7 +125,11 @@ final class AppleComCryptionChannel: @unchecked Sendable {
                 "Apple ComCryption encrypt failed: status \(status) bytesWritten \(outLength)")
         }
 
-        return Data(output.prefix(outLength))
+        transferred = true
+        return Data(
+            bytesNoCopy: rawOut,
+            count: outLength,
+            deallocator: .custom { ptr, _ in ptr.deallocate() })
     }
 
     func decryptRecord(_ encrypted: Data, expectedPacketID: UInt32) throws -> Record {

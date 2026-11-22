@@ -173,7 +173,19 @@ final class VNCBrightnessPresenter {
         case .cgImage(let image):
             source = CIImage(cgImage: image, options: [.colorSpace: sourceColorSpace])
         case .pixelBuffer(let pixelBuffer):
-            source = CIImage(cvPixelBuffer: pixelBuffer, options: [.colorSpace: sourceColorSpace])
+            let hasNativeColorMetadata = CVPixelBufferGetPlaneCount(pixelBuffer) >= 2
+                || CVBufferCopyAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, nil) != nil
+                || CVBufferCopyAttachment(pixelBuffer, kCVImageBufferCGColorSpaceKey, nil) != nil
+                || CVBufferCopyAttachment(pixelBuffer, kCVImageBufferICCProfileKey, nil) != nil
+                || CVBufferCopyAttachment(pixelBuffer, kCVImageBufferGammaLevelKey, nil) != nil
+            if hasNativeColorMetadata {
+                // Honor the pixel buffer's own YCbCr matrix and color-space
+                // attachments (e.g. `444f`, `&8f4`, Display P3 BGRA); override
+                // with sRGB only for untagged RGB buffers.
+                source = CIImage(cvPixelBuffer: pixelBuffer)
+            } else {
+                source = CIImage(cvPixelBuffer: pixelBuffer, options: [.colorSpace: sourceColorSpace])
+            }
         case .ioSurface(let ioSurface):
             source = CIImage(ioSurface: ioSurface, options: [.colorSpace: sourceColorSpace])
         }

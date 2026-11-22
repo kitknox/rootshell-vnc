@@ -16,18 +16,44 @@ import RFBTransport
 @MainActor
 public final class VideoBandLayerRenderer {
 
+    /// Thread-safe snapshot of desktop dimensions, crop mode, suspension, and
+    /// reset epoch so ``BandFrameCoalescer`` can composite bands off
+    /// `@MainActor`, skip GPU work while suspended, and drop stale frames from
+    /// before a disconnect or reset.
+    struct CompositeConfiguration: Equatable, Sendable {
+        var width: Int = 0
+        var height: Int = 0
+        var centersSinglePicture: Bool = false
+        var isPresentationSuspended: Bool = false
+        var resetEpoch: UInt64 = 0
+    }
+
+    private let compositeConfigLock = NSLock()
+    private nonisolated(unsafe) var lockedCompositeConfig = CompositeConfiguration()
+    /// Shared compositor used both off-MainActor by `BandFrameCoalescer` and
+    /// synchronously by direct `setBands(_:)` callers.
+    nonisolated let sharedCompositor = VideoBandCompositor()
+
+    nonisolated var compositeConfiguration: CompositeConfiguration {
+        compositeConfigLock.lock()
+        defer { compositeConfigLock.unlock() }
+        return lockedCompositeConfig
+    }
+
     private let displayLayer = AVSampleBufferDisplayLayer()
     private let brightnessPresenter = VNCBrightnessPresenter(contentsGravity: .resize)
     /// The layer the host view displays. Boosted IOSurface contents live on
     /// this same layer, preserving the renderer's one atomic display sublayer.
     public var containerLayer: CALayer { brightnessPresenter.layer }
-    private let compositor = CompoundBandSurfaceCompositor()
     private var bandBuffers: [UInt32: CVPixelBuffer] = [:]
     private var previousBandBuffers: [UInt32: CVPixelBuffer] = [:]
     private var displayedBuffer: CVPixelBuffer?
     private var previousDisplayedBuffer: CVPixelBuffer?
+    private var cachedFormatDescription: CMVideoFormatDescription?
     private var screenWidth: CGFloat = 0
     private var screenHeight: CGFloat = 0
+    private var centersSinglePicture = false
+    private var resetEpoch: UInt64 = 0
     private var viewBounds: CGRect = .zero
     /// A media renegotiation can replace every SSRC. Retain the previous
     /// generation on screen while the server negotiates, then remove its
@@ -62,6 +88,7 @@ public final class VideoBandLayerRenderer {
     }
 
     public init() {
+        lockedCompositeConfig.isPresentationSuspended = VNCPresentationPolicy.isPresentationProhibited()
         containerLayer.masksToBounds = true
         containerLayer.contentsScale = pixelScale
         displayLayer.videoGravity = .resize
@@ -92,13 +119,20 @@ public final class VideoBandLayerRenderer {
     public func setScreenSize(width: Int, height: Int) {
         screenWidth = CGFloat(width)
         screenHeight = CGFloat(height)
+        compositeConfigLock.lock()
+        lockedCompositeConfig.width = width
+        lockedCompositeConfig.height = height
+        compositeConfigLock.unlock()
         layout()
     }
 
     /// Low Bandwidth (mode 5) centers the screen in a padded picture; crop its
     /// middle rather than the top-left corner.
     public func setCentersPaddedPicture(_ centers: Bool) {
-        compositor.centersSinglePicture = centers
+        centersSinglePicture = centers
+        compositeConfigLock.lock()
+        lockedCompositeConfig.centersSinglePicture = centers
+        compositeConfigLock.unlock()
     }
 
     public func configureExpectedBandCount(_ count: Int) {
@@ -106,11 +140,16 @@ public final class VideoBandLayerRenderer {
     }
 
     public func reset() {
+        resetEpoch &+= 1
+        compositeConfigLock.lock()
+        lockedCompositeConfig.resetEpoch = resetEpoch
+        compositeConfigLock.unlock()
         bandBuffers.removeAll()
         previousBandBuffers.removeAll()
         displayedBuffer = nil
         previousDisplayedBuffer = nil
-        compositor.reset()
+        cachedFormatDescription = nil
+        sharedCompositor.reset()
         replaceLayersOnNextFrame = false
         hasPendingSuspendedBands = false
         if isPresentationSuspended || VNCPresentationPolicy.isPresentationProhibited() {
@@ -144,11 +183,33 @@ public final class VideoBandLayerRenderer {
     /// `BandFrameCoalescer` freezes the inputs; the compositor then copies the
     /// retained static bands and dirty bands into a single atomic frame.
     public func setBands(_ buffers: [UInt32: CVPixelBuffer]) {
+        presentPreparedBands(
+            buffers,
+            composedFrame: nil,
+            composedConfig: nil)
+    }
+
+    /// Present a band snapshot whose GPU compositing already ran off
+    /// `@MainActor`. Falls back to synchronous compositing if desktop geometry
+    /// or band membership changed while the frame was in flight.
+    func presentPreparedBands(
+        _ buffers: [UInt32: CVPixelBuffer],
+        composedFrame: CVPixelBuffer?,
+        composedConfig: CompositeConfiguration?
+    ) {
+        if let composedConfig, composedConfig.resetEpoch != resetEpoch {
+            // Frame was prepared before a disconnect/reset; discard it so it
+            // cannot repopulate `latestComposedFrame` with a retired session.
+            return
+        }
         guard !buffers.isEmpty else { return }
-        if isPresentationSuspended || VNCPresentationPolicy.isPresentationProhibited() {
+        let prohibited = VNCPresentationPolicy.isPresentationProhibited()
+        if isPresentationSuspended || prohibited {
+            setLockedPresentationSuspended(true)
             recordBandsWhileSuspended(buffers)
             return
         }
+        setLockedPresentationSuspended(false)
         frameCommitCount &+= 1
         lastCommitBandCount = buffers.count
         if buffers.count != expectedBandCount {
@@ -163,7 +224,8 @@ public final class VideoBandLayerRenderer {
             previousBandBuffers.removeAll()
             displayedBuffer = nil
             previousDisplayedBuffer = nil
-            compositor.reset()
+            cachedFormatDescription = nil
+            sharedCompositor.reset()
             replaceLayersOnNextFrame = false
         }
         for (ssrc, pixelBuffer) in buffers {
@@ -171,7 +233,22 @@ public final class VideoBandLayerRenderer {
             bandBuffers[ssrc] = pixelBuffer
         }
         hasPendingSuspendedBands = false
-        presentComposedFrame()
+
+        let currentConfig = CompositeConfiguration(
+            width: Int(screenWidth),
+            height: Int(screenHeight),
+            centersSinglePicture: centersSinglePicture,
+            isPresentationSuspended: isPresentationSuspended)
+        if let composedFrame,
+           let composedConfig,
+           composedConfig.width == currentConfig.width,
+           composedConfig.height == currentConfig.height,
+           composedConfig.centersSinglePicture == currentConfig.centersSinglePicture,
+           buffers.count == bandBuffers.count {
+            commitDisplayFrame(composedFrame)
+        } else {
+            presentComposedFrame()
+        }
     }
 
     /// Stop committing frames to the display while the host is in a state
@@ -187,6 +264,7 @@ public final class VideoBandLayerRenderer {
     public func setPresentationSuspended(_ suspended: Bool) {
         guard isPresentationSuspended != suspended else { return }
         isPresentationSuspended = suspended
+        setLockedPresentationSuspended(suspended || VNCPresentationPolicy.isPresentationProhibited())
         if suspended {
             // Discard queued-but-unpresented samples. Best-effort narrowing:
             // samples carry display-immediately timing so at most ~one frame
@@ -199,6 +277,12 @@ public final class VideoBandLayerRenderer {
         } else {
             presentPendingBandsAfterResume()
         }
+    }
+
+    private func setLockedPresentationSuspended(_ suspended: Bool) {
+        compositeConfigLock.lock()
+        lockedCompositeConfig.isPresentationSuspended = suspended
+        compositeConfigLock.unlock()
     }
 
     /// Present bands retained while presentation was blocked by the host's
@@ -216,7 +300,8 @@ public final class VideoBandLayerRenderer {
             // flush is itself a layer commit, so it waits for resume.
             bandBuffers.removeAll()
             previousBandBuffers.removeAll()
-            compositor.reset()
+            cachedFormatDescription = nil
+            sharedCompositor.reset()
             replaceLayersOnNextFrame = false
             pendingDisplayFlush = true
         }
@@ -232,7 +317,11 @@ public final class VideoBandLayerRenderer {
         // armed (a tab switch driven by remote traffic on a locked device).
         // Leave the pending state set; the next setBands that passes the
         // gate composes from the full retained band set.
-        guard !VNCPresentationPolicy.isPresentationProhibited() else { return }
+        guard !VNCPresentationPolicy.isPresentationProhibited() else {
+            setLockedPresentationSuspended(true)
+            return
+        }
+        setLockedPresentationSuspended(false)
         performPendingDisplayFlushIfNeeded()
         guard hasPendingSuspendedBands, !bandBuffers.isEmpty else { return }
         hasPendingSuspendedBands = false
@@ -263,11 +352,15 @@ public final class VideoBandLayerRenderer {
         let width = Int(screenWidth)
         let height = Int(screenHeight)
         guard width > 0, height > 0,
-              let frame = compositor.compose(
+              let frame = sharedCompositor.compose(
                 bands: bandBuffers,
                 width: width,
-                height: height) else { return }
+                height: height,
+                centersSinglePicture: centersSinglePicture) else { return }
+        commitDisplayFrame(frame)
+    }
 
+    private func commitDisplayFrame(_ frame: CVPixelBuffer) {
         // The display renderer can retain an enqueued sample beyond this call.
         // Keep two explicit generations as well so neither Core Animation nor
         // Core Image can observe a pool surface after it has been recycled.
@@ -280,27 +373,36 @@ public final class VideoBandLayerRenderer {
         if videoRenderer.status == .failed {
             videoRenderer.flush()
         }
-        if let sampleBuffer = Self.makeDisplaySample(from: frame) {
+        if let sampleBuffer = makeDisplaySample(from: frame) {
             videoRenderer.enqueue(sampleBuffer)
         }
         onFrameCommitted?(frame, streamGenerationCount)
     }
 
-    /// Wrap an already-decoded image buffer without copying its pixels. The
-    /// display-immediately attachment lets the coalescer control cadence while
-    /// AVFoundation performs the correct YUV conversion and surface lifetime
-    /// management.
-    private static func makeDisplaySample(
+    /// Wrap an already-decoded image buffer without copying its pixels. Caches
+    /// the `CMVideoFormatDescription` only while Core Media confirms every
+    /// attachment (clean aperture, pixel aspect ratio, ICC profile, color
+    /// primaries, transfer function, and dimensions) matches the new buffer.
+    private func makeDisplaySample(
         from pixelBuffer: CVPixelBuffer
     ) -> CMSampleBuffer? {
-        var formatDescription: CMVideoFormatDescription?
-        guard CMVideoFormatDescriptionCreateForImageBuffer(
-            allocator: kCFAllocatorDefault,
-            imageBuffer: pixelBuffer,
-            formatDescriptionOut: &formatDescription) == noErr,
-              let formatDescription else {
-            return nil
+        let formatDescription: CMVideoFormatDescription
+        if let cached = cachedFormatDescription,
+           CMVideoFormatDescriptionMatchesImageBuffer(cached, imageBuffer: pixelBuffer) {
+            formatDescription = cached
+        } else {
+            var created: CMVideoFormatDescription?
+            guard CMVideoFormatDescriptionCreateForImageBuffer(
+                allocator: kCFAllocatorDefault,
+                imageBuffer: pixelBuffer,
+                formatDescriptionOut: &created) == noErr,
+                  let created else {
+                return nil
+            }
+            cachedFormatDescription = created
+            formatDescription = created
         }
+
         var timing = CMSampleTimingInfo(
             duration: .invalid,
             presentationTimeStamp: .invalid,
@@ -338,7 +440,7 @@ public final class VideoBandLayerRenderer {
     }
 
     /// Position the one stitched desktop surface. Coded band padding has
-    /// already been clipped by `CompoundBandSurfaceCompositor`.
+    /// already been clipped by `VideoBandCompositor`.
     public func layout() {
         guard screenWidth > 0, screenHeight > 0, viewBounds.width > 0, viewBounds.height > 0 else { return }
 
@@ -359,112 +461,12 @@ public final class VideoBandLayerRenderer {
     }
 
     private func reconcilePresentationPath() {
+        let shouldHide = brightnessPresenter.isPresentingBoostedContent
+        guard displayLayer.isHidden != shouldHide else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        displayLayer.isHidden = brightnessPresenter.isPresentingBoostedContent
+        displayLayer.isHidden = shouldHide
         CATransaction.commit()
-    }
-}
-
-/// Public replacement for the private stitched-output stage used by Apple's
-/// compound HEVC pipeline. Input buffers are ordered by their monotonically
-/// assigned SSRCs, placed top-to-bottom, and cropped to the negotiated desktop
-/// height. Core Image performs both YCbCr/RGB conversion (when needed) and the
-/// GPU copy into one IOSurface-backed BGRA frame.
-private final class CompoundBandSurfaceCompositor {
-    private let context = CIContext(options: [.cacheIntermediates: false])
-    private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
-    private var pool: CVPixelBufferPool?
-    private var poolWidth = 0
-    private var poolHeight = 0
-    var centersSinglePicture = false
-
-    func reset() {
-        pool = nil
-        poolWidth = 0
-        poolHeight = 0
-    }
-
-    func compose(
-        bands: [UInt32: CVPixelBuffer],
-        width: Int,
-        height: Int
-    ) -> CVPixelBuffer? {
-        guard !bands.isEmpty,
-              let destination = makeDestination(width: width, height: height)
-        else { return nil }
-
-        let outputBounds = CGRect(x: 0, y: 0, width: width, height: height)
-        var frame = CIImage(color: .black).cropped(to: outputBounds)
-        var top = 0
-        let centered = centersSinglePicture && bands.count == 1
-
-        for (_, pixelBuffer) in bands.sorted(by: { $0.key < $1.key }) {
-            guard top < height else { break }
-            let sourceWidth = CVPixelBufferGetWidth(pixelBuffer)
-            let sourceHeight = CVPixelBufferGetHeight(pixelBuffer)
-            let leftInset = centered ? max(0, (sourceWidth - width) / 2) : 0
-            let topInset = centered ? max(0, (sourceHeight - height) / 2) : 0
-            let validHeight = min(sourceHeight - topInset, height - top)
-            guard sourceWidth > 0, validHeight > 0 else { continue }
-
-            // CIImage uses a bottom-left origin. Coded padding is at the bottom
-            // of the last band, so retain the top valid rows, after any inset.
-            let source = CIImage(cvPixelBuffer: pixelBuffer)
-            let crop = CGRect(
-                x: source.extent.minX + CGFloat(leftInset),
-                y: source.extent.maxY - CGFloat(topInset + validHeight),
-                width: min(CGFloat(width), source.extent.width - CGFloat(leftInset)),
-                height: CGFloat(validHeight))
-            let destinationBottom = height - top - validHeight
-            let placed = source
-                .cropped(to: crop)
-                .transformed(by: CGAffineTransform(
-                    translationX: -crop.minX,
-                    y: CGFloat(destinationBottom) - crop.minY))
-            frame = placed.composited(over: frame)
-            top += sourceHeight
-        }
-
-        context.render(
-            frame,
-            to: destination,
-            bounds: outputBounds,
-            colorSpace: colorSpace)
-        return destination
-    }
-
-    private func makeDestination(width: Int, height: Int) -> CVPixelBuffer? {
-        if pool == nil || poolWidth != width || poolHeight != height {
-            let poolAttributes: [String: Any] = [
-                kCVPixelBufferPoolMinimumBufferCountKey as String: 4,
-            ]
-            let pixelAttributes: [String: Any] = [
-                kCVPixelBufferWidthKey as String: width,
-                kCVPixelBufferHeightKey as String: height,
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
-                kCVPixelBufferMetalCompatibilityKey as String: true,
-            ]
-            var newPool: CVPixelBufferPool?
-            guard CVPixelBufferPoolCreate(
-                kCFAllocatorDefault,
-                poolAttributes as CFDictionary,
-                pixelAttributes as CFDictionary,
-                &newPool) == kCVReturnSuccess,
-                  let newPool else { return nil }
-            pool = newPool
-            poolWidth = width
-            poolHeight = height
-        }
-
-        guard let pool else { return nil }
-        var destination: CVPixelBuffer?
-        guard CVPixelBufferPoolCreatePixelBuffer(
-            kCFAllocatorDefault,
-            pool,
-            &destination) == kCVReturnSuccess else { return nil }
-        return destination
     }
 }
 

@@ -80,7 +80,7 @@ public enum AppleRemoteAudioRTPDepacketizer {
         _ data: Data,
         packetization: AppleRemoteAudioPacketization = .codecAccessUnit
     ) throws -> AppleRemoteAudioRTPPacket {
-        let rtp = try RTPDemuxer().parsePacket(data)
+        let rtp = try RTPDemuxer.parsePacket(data)
         guard rtp.payloadType == payloadType else {
             throw AppleRemoteAudioRTPError.unexpectedPayloadType(rtp.payloadType)
         }

@@ -597,6 +597,10 @@ public actor TransportSession {
     /// video2). Incoming datagrams are matched to a context by SSRC.
     private var appleMediaSRTPContexts: [AppleSRTPContext] = []
     private var appleMediaSRTPContextBySSRC: [UInt32: AppleSRTPContext] = [:]
+    /// Off-actor SRTP batch decryptor used by the UDP receive task so high-rate
+    /// HEVC decryption does not contend with input sends on this actor.
+    private nonisolated let appleMediaSRTPDecryptor = AppleMediaSRTPDecryptor()
+    private var appleMediaSRTPDecryptorGeneration: UInt64 = 0
     private struct AppleMediaFeedbackRoute {
         let receiveContext: AppleSRTPContext
         let sendRTCPContext: AppleSRTCPContext
@@ -5282,6 +5286,7 @@ public actor TransportSession {
         // Encrypted session: SRTP keys will follow on the control channel, so
         // early media datagrams must be buffered, not dropped as undecryptable.
         appleMediaExpectsSRTP = true
+        appleMediaSRTPDecryptor.setExpectsSRTP(true)
         log.debug("Configured Apple media ComCryption from 0x44f encryption info")
     }
 
@@ -6350,6 +6355,9 @@ public actor TransportSession {
         appleMediaSRTPKeys = nil
         appleMediaSRTPContexts.removeAll(keepingCapacity: true)
         appleMediaSRTPContextBySSRC.removeAll(keepingCapacity: true)
+        appleMediaSRTPDecryptorGeneration = appleMediaSRTPDecryptor.configure(
+            contexts: [],
+            expectsSRTP: true)
         appleMediaFeedbackRoutes.removeAll(keepingCapacity: true)
         appleMediaFeedbackRouteByRemoteSSRC.removeAll(keepingCapacity: true)
         appleMediaAudioFeedbackRoute = nil
@@ -6555,13 +6563,22 @@ public actor TransportSession {
         continuation?.yield(.appleMediaUDPStarted(localPort: actualPort))
         log.debug("Started Apple media UDP localPort=\(actualPort) remotePort=\(binding.remotePort)")
 
-        let readTask = Task { [weak self, channel] in
+        let decryptor = appleMediaSRTPDecryptor
+        let captureRawUDPDump = appleMediaUDPDatagramDumpPath != nil
+        let readTask = Task { [weak self, channel, decryptor, captureRawUDPDump] in
             while !Task.isCancelled {
                 do {
                     let datagrams = try await channel.receiveDatagramBatch()
-                    await self?.handleAppleMediaUDPDatagrams(
-                        datagrams,
-                        from: channel)
+                    if captureRawUDPDump {
+                        await self?.handleAppleMediaUDPDatagrams(
+                            datagrams,
+                            from: channel)
+                    } else {
+                        let decryptedBatch = decryptor.decryptBatch(datagrams)
+                        await self?.handleAppleMediaDecryptedBatch(
+                            decryptedBatch,
+                            from: channel)
+                    }
                 } catch is CancellationError {
                     break
                 } catch {
@@ -6625,6 +6642,78 @@ public actor TransportSession {
             datagrams.count)
     }
 
+    /// Process a batch whose SRTP decryption already ran off-actor on the UDP
+    /// read task. Collects released RTP packets and schedules the reorder timer
+    /// once per batch to minimize lock/timer churn and actor hold time.
+    private func handleAppleMediaDecryptedBatch(
+        _ batch: AppleMediaSRTPDecryptor.DecryptedBatch,
+        from channel: PosixUDPChannel
+    ) {
+        let items = batch.items
+        guard !items.isEmpty else { return }
+        let generationMatches = batch.generation == appleMediaSRTPDecryptorGeneration
+        let processingStart = DispatchTime.now().uptimeNanoseconds
+        var batchClockNanos = processingStart
+        var releasedBatch: [(data: Data, displayIndex: Int?)] = []
+        releasedBatch.reserveCapacity(items.count)
+        var needsReorderSchedule = false
+        var latestArrivalNanos = processingStart
+
+        for (index, item) in items.enumerated() {
+            if index > 0 && (index & 63) == 0 {
+                batchClockNanos = DispatchTime.now().uptimeNanoseconds
+            }
+            switch item {
+            case .decrypted(let packet, let wireByteCount, let ssrc, let context, let arrivalNanos):
+                // Reject packets authenticated with retired SRTP keys after a
+                // media renegotiation or teardown so stale SSRCs/frames never
+                // enter the replacement stream's reorder buffer.
+                guard generationMatches,
+                      appleMediaSRTPContexts.contains(where: { $0 === context }) else {
+                    continue
+                }
+                if appleMediaFeedbackRouteByRemoteSSRC[ssrc] == nil {
+                    bindAppleMediaFeedbackRouteIfAvailable(
+                        receiveContext: context,
+                        remoteSSRC: ssrc)
+                }
+                acceptAppleMediaRTPPacket(
+                    packet,
+                    wireByteCount: wireByteCount,
+                    arrivalNanos: arrivalNanos,
+                    processingNanos: batchClockNanos,
+                    from: channel,
+                    releasedBatch: &releasedBatch,
+                    deferReorderSchedule: true)
+                needsReorderSchedule = true
+                latestArrivalNanos = arrivalNanos
+            case .raw(let datagram, let arrivalNanos):
+                if !releasedBatch.isEmpty {
+                    emitAppleMediaRTPBatch(releasedBatch)
+                    releasedBatch.removeAll(keepingCapacity: true)
+                }
+                handleAppleMediaUDPDatagram(
+                    datagram,
+                    arrivalNanos: arrivalNanos,
+                    from: channel)
+            }
+        }
+
+        if !releasedBatch.isEmpty {
+            emitAppleMediaRTPBatch(releasedBatch)
+        }
+        if needsReorderSchedule {
+            scheduleAppleMediaReorderFlush(nowNanos: latestArrivalNanos)
+        }
+
+        let processingEnd = DispatchTime.now().uptimeNanoseconds
+        appleMediaIngressPacketsSinceDiagnostic += items.count
+        appleMediaIngressProcessingNanosSinceDiagnostic &+= processingEnd &- processingStart
+        appleMediaIngressMaximumBatchSinceDiagnostic = max(
+            appleMediaIngressMaximumBatchSinceDiagnostic,
+            items.count)
+    }
+
     private nonisolated func isLoopbackHost(_ host: String) -> Bool {
         host == "localhost" || host == "127.0.0.1" || host == "::1"
     }
@@ -6675,6 +6764,7 @@ public actor TransportSession {
         appleMediaSRTPKeys = nil
         appleMediaSRTPContexts.removeAll()
         appleMediaSRTPContextBySSRC.removeAll()
+        appleMediaSRTPDecryptorGeneration = appleMediaSRTPDecryptor.clear()
         appleMediaFeedbackRoutes.removeAll()
         appleMediaFeedbackRouteByRemoteSSRC.removeAll()
         appleMediaAudioFeedbackRoute = nil
@@ -6766,6 +6856,9 @@ public actor TransportSession {
         if appleMediaLocalSSRC == 0 {
             appleMediaLocalSSRC = generateAppleMediaLocalSSRC()
         }
+        appleMediaSRTPDecryptorGeneration = appleMediaSRTPDecryptor.configure(
+            contexts: appleMediaSRTPContexts,
+            expectsSRTP: appleMediaExpectsSRTP)
         log.debug(
             "Configured \(appleMediaSRTPContexts.count) Apple media SRTP receive contexts, "
                 + "videoFeedbackRoutes=\(appleMediaFeedbackRoutes.count)")
@@ -6856,6 +6949,22 @@ public actor TransportSession {
         }
     }
 
+    /// Install a media sink that receives bursts of routed RTP packets in one
+    /// callback, minimizing cross-queue lock overhead during HEVC keyframes.
+    public func setAppleMediaRoutedRTPBatchSink(
+        _ sink: (@Sendable ([(data: Data, displayIndex: Int?)]) -> Void)?
+    ) {
+        let drained = appleMediaPacketHandoff.installBatchSink(sink)
+        if drained.packetCount > 0 {
+            log.info("Drained \(drained.packetCount) ordered startup RTP packets "
+                + "(\(drained.byteCount) bytes) into the media batch sink")
+        }
+        if drained.overflowed {
+            log.error("Media startup buffer overflowed; dropped \(drained.droppedPacketCount) newest packets")
+            requestAppleMediaRecoveryAfterIngressOverflow()
+        }
+    }
+
     /// Preserve the live control/media session across app suspension while
     /// teaching the RTP reorderer that the next sequence can legitimately be
     /// more than half a UInt16 space ahead.
@@ -6876,6 +6985,20 @@ public actor TransportSession {
             packet,
             displayIndex: displayIndex
         ) == .overflow {
+            log.error("Media ingress overflow while waiting for decoder sink")
+        }
+    }
+
+    private func emitAppleMediaRTPBatch(_ packets: [(data: Data, displayIndex: Int?)]) {
+        guard !packets.isEmpty else { return }
+        #if DEBUG
+        if appleMediaDecodedRTPDumpPath != nil {
+            for packet in packets {
+                dumpAppleMediaDecodedRTPIfRequested(packet.data)
+            }
+        }
+        #endif
+        if appleMediaPacketHandoff.deliverBatch(packets) == .overflow {
             log.error("Media ingress overflow while waiting for decoder sink")
         }
     }
@@ -7058,7 +7181,31 @@ public actor TransportSession {
         _ packet: Data,
         wireByteCount: Int,
         arrivalNanos: UInt64,
+        processingNanos: UInt64? = nil,
         from channel: PosixUDPChannel
+    ) {
+        var ignored: [(data: Data, displayIndex: Int?)] = []
+        acceptAppleMediaRTPPacket(
+            packet,
+            wireByteCount: wireByteCount,
+            arrivalNanos: arrivalNanos,
+            processingNanos: processingNanos,
+            from: channel,
+            releasedBatch: &ignored,
+            deferReorderSchedule: false)
+        if !ignored.isEmpty {
+            emitAppleMediaRTPBatch(ignored)
+        }
+    }
+
+    private func acceptAppleMediaRTPPacket(
+        _ packet: Data,
+        wireByteCount: Int,
+        arrivalNanos: UInt64,
+        processingNanos: UInt64?,
+        from channel: PosixUDPChannel,
+        releasedBatch: inout [(data: Data, displayIndex: Int?)],
+        deferReorderSchedule: Bool
     ) {
         guard let header = parseAppleMediaRTPHeader(packet) else { return }
         guard header.payloadType == 100 else {
@@ -7075,7 +7222,7 @@ public actor TransportSession {
                 appleRCTLTotalBytesReceived &+= UInt64(max(0, wireByteCount))
                 startAppleMediaAudioRTCPFeedbackLoop()
             }
-            emitAppleMediaRTPPacket(packet)
+            releasedBatch.append((packet, nil))
             return
         }
         if testVideoPacketDropCountdown != Int.min {
@@ -7121,9 +7268,9 @@ public actor TransportSession {
             }
         }
 
-        let processingNanos = DispatchTime.now().uptimeNanoseconds
-        let ingressQueueDelayNanos = processingNanos >= arrivalNanos
-            ? processingNanos - arrivalNanos
+        let clockNowNanos = processingNanos ?? DispatchTime.now().uptimeNanoseconds
+        let ingressQueueDelayNanos = clockNowNanos >= arrivalNanos
+            ? clockNowNanos - arrivalNanos
             : 0
         let nowNanos = arrivalNanos
         let unique = updateAppleMediaReceptionStats(
@@ -7190,23 +7337,45 @@ public actor TransportSession {
             }
         }
 
-        let ingestClockNanos = DispatchTime.now().uptimeNanoseconds
-        appleMediaLastVideoIngestNanos = ingestClockNanos
+        appleMediaLastVideoIngestNanos = clockNowNanos
         if appleMediaLastVideoReleaseNanos == 0 {
             // Arm the dead-man from first ingest so a from-birth stall (never
             // a single released packet) is also detected.
-            appleMediaLastVideoReleaseNanos = ingestClockNanos
+            appleMediaLastVideoReleaseNanos = clockNowNanos
         }
         let result = appleMediaRTPReorderBuffer.insert(
             packet: packet,
             ssrc: header.ssrc,
             sequence: header.sequenceNumber,
             nowNanos: nowNanos)
-        processAppleMediaReorderResult(result)
-        scheduleAppleMediaReorderFlush(nowNanos: nowNanos)
+        processAppleMediaReorderResult(
+            result,
+            clockNowNanos: clockNowNanos,
+            releasedBatch: &releasedBatch)
+        if !deferReorderSchedule {
+            scheduleAppleMediaReorderFlush(nowNanos: nowNanos)
+        }
     }
 
-    private func processAppleMediaReorderResult(_ result: AppleMediaRTPReorderBuffer.Result) {
+    private func processAppleMediaReorderResult(
+        _ result: AppleMediaRTPReorderBuffer.Result,
+        clockNowNanos: UInt64? = nil
+    ) {
+        var releasedBatch: [(data: Data, displayIndex: Int?)] = []
+        processAppleMediaReorderResult(
+            result,
+            clockNowNanos: clockNowNanos,
+            releasedBatch: &releasedBatch)
+        if !releasedBatch.isEmpty {
+            emitAppleMediaRTPBatch(releasedBatch)
+        }
+    }
+
+    private func processAppleMediaReorderResult(
+        _ result: AppleMediaRTPReorderBuffer.Result,
+        clockNowNanos: UInt64?,
+        releasedBatch: inout [(data: Data, displayIndex: Int?)]
+    ) {
         for request in result.retransmissionRequests {
             guard let channel = appleMediaVideoSSRCChannels[request.ssrc] else { continue }
             Task { [weak self] in
@@ -7218,15 +7387,16 @@ public actor TransportSession {
         }
 
         for gap in result.gaps {
+            let nowNanos = clockNowNanos ?? DispatchTime.now().uptimeNanoseconds
             appleRCTLLostInterval += gap.missingPacketCount
             noteAppleMediaQualityWindow(
                 received: 0,
                 lost: gap.missingPacketCount,
-                nowNanos: DispatchTime.now().uptimeNanoseconds)
+                nowNanos: nowNanos)
             appleRCTLBurstLostInterval = max(
                 appleRCTLBurstLostInterval,
                 gap.missingPacketCount)
-            if var stats = appleMediaReceptionStats[gap.ssrc] {
+            if var stats = appleMediaReceptionStats.removeValue(forKey: gap.ssrc) {
                 stats.confirmedLost &+= UInt32(clamping: gap.missingPacketCount)
                 appleMediaReceptionStats[gap.ssrc] = stats
             }
@@ -7237,7 +7407,7 @@ public actor TransportSession {
                     appleMediaRateController = created
                     return created
                 }()
-                let now = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+                let now = Double(nowNanos) / 1_000_000_000
                 controller.onConfirmedLoss(count: gap.missingPacketCount, now: now)
                 controller.update(now: now)
             }
@@ -7266,11 +7436,14 @@ public actor TransportSession {
 
         let packets = result.packets
         if !packets.isEmpty {
-            appleMediaLastVideoReleaseNanos = DispatchTime.now().uptimeNanoseconds
+            appleMediaLastVideoReleaseNanos = clockNowNanos ?? DispatchTime.now().uptimeNanoseconds
         }
         for packet in packets {
             acknowledgeAppleMediaLTRIfNeeded(packet)
-            emitAppleMediaRTPPacket(packet)
+            let displayIndex = appleMediaRTPSSRC(packet)
+                .flatMap { appleMediaFeedbackRouteByRemoteSSRC[$0] }
+                .map { max(0, $0.streamIndex - 1) }
+            releasedBatch.append((packet, displayIndex))
         }
     }
 
@@ -7509,7 +7682,11 @@ public actor TransportSession {
     /// Update per-SSRC reception counters used to build Receiver Reports.
     @discardableResult
     private func updateAppleMediaReceptionStats(ssrc: UInt32, sequence: UInt16) -> Bool {
-        var stats = appleMediaReceptionStats[ssrc] ?? AppleMediaReceptionStats()
+        // Remove before mutating so `stats.recentSequences` stays uniquely
+        // referenced (avoids O(N) Set+Array CoW copy on every RTP packet).
+        var stats = appleMediaReceptionStats.removeValue(forKey: ssrc)
+            ?? AppleMediaReceptionStats()
+        defer { appleMediaReceptionStats[ssrc] = stats }
         if !stats.recentSequences.insert(sequence) {
             return false
         }
@@ -7527,7 +7704,6 @@ public actor TransportSession {
             }
             stats.received &+= 1
         }
-        appleMediaReceptionStats[ssrc] = stats
         return true
     }
 

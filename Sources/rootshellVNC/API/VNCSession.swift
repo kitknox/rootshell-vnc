@@ -477,7 +477,7 @@ final class OrderedMediaPacketCoalescer: @unchecked Sendable {
 
     private let queue: DispatchQueue
     private let consume: @Sendable ([Data]) -> Void
-    private let delayNanos: @Sendable (Data) -> UInt64
+    private let delayNanos: (@Sendable (Data) -> UInt64)?
     private let lock = NSLock()
     private var pending: [PendingPacket] = []
     /// Logical start of the live queue. Removing the first element from a
@@ -495,7 +495,7 @@ final class OrderedMediaPacketCoalescer: @unchecked Sendable {
 
     init(
         queue: DispatchQueue,
-        delayNanos: @escaping @Sendable (Data) -> UInt64 = { _ in 0 },
+        delayNanos: (@Sendable (Data) -> UInt64)? = nil,
         consume: @escaping @Sendable ([Data]) -> Void
     ) {
         self.queue = queue
@@ -504,14 +504,64 @@ final class OrderedMediaPacketCoalescer: @unchecked Sendable {
     }
 
     func enqueue(_ packet: Data) {
-        let candidateDeadline = DispatchTime.now().uptimeNanoseconds
-            &+ delayNanos(packet)
+        let delay = delayNanos?(packet) ?? 0
+        let candidateDeadline: UInt64 = delay > 0
+            ? (DispatchTime.now().uptimeNanoseconds &+ delay)
+            : 0
         lock.lock()
         // A changing adaptive cushion must not allow a newer RTP packet to
         // overtake an older one whose longer deadline was already assigned.
         let deadline = max(candidateDeadline, lastDeadlineNanos)
         lastDeadlineNanos = deadline
         pending.append(PendingPacket(deadlineNanos: deadline, data: packet))
+        let shouldSchedule = !drainScheduled
+        if shouldSchedule { drainScheduled = true }
+        let generation = scheduleGeneration
+        let firstDeadline = pending[pendingHead].deadlineNanos
+        lock.unlock()
+
+        if shouldSchedule {
+            scheduleDrain(at: firstDeadline, generation: generation)
+        }
+    }
+
+    func enqueue(contentsOf packets: [Data]) {
+        guard !packets.isEmpty else { return }
+        if let delayNanos {
+            var batchNow: UInt64 = 0
+            lock.lock()
+            for packet in packets {
+                let delay = delayNanos(packet)
+                let candidateDeadline: UInt64
+                if delay > 0 {
+                    if batchNow == 0 {
+                        batchNow = DispatchTime.now().uptimeNanoseconds
+                    }
+                    candidateDeadline = batchNow &+ delay
+                } else {
+                    candidateDeadline = 0
+                }
+                let deadline = max(candidateDeadline, lastDeadlineNanos)
+                lastDeadlineNanos = deadline
+                pending.append(PendingPacket(deadlineNanos: deadline, data: packet))
+            }
+            let shouldSchedule = !drainScheduled
+            if shouldSchedule { drainScheduled = true }
+            let generation = scheduleGeneration
+            let firstDeadline = pending[pendingHead].deadlineNanos
+            lock.unlock()
+
+            if shouldSchedule {
+                scheduleDrain(at: firstDeadline, generation: generation)
+            }
+            return
+        }
+
+        lock.lock()
+        let deadline = lastDeadlineNanos
+        for packet in packets {
+            pending.append(PendingPacket(deadlineNanos: deadline, data: packet))
+        }
         let shouldSchedule = !drainScheduled
         if shouldSchedule { drainScheduled = true }
         let generation = scheduleGeneration
@@ -537,6 +587,12 @@ final class OrderedMediaPacketCoalescer: @unchecked Sendable {
     }
 
     private func scheduleDrain(at deadline: UInt64, generation: UInt64) {
+        if deadline == 0 {
+            queue.async { [self] in
+                drain(generation: generation)
+            }
+            return
+        }
         queue.asyncAfter(
             deadline: DispatchTime(uptimeNanoseconds: deadline)
         ) { [self] in
@@ -559,34 +615,45 @@ final class OrderedMediaPacketCoalescer: @unchecked Sendable {
             return
         }
 
-        let cutoff = DispatchTime.now().uptimeNanoseconds
-            &+ Self.deadlineToleranceNanos
-        var dueEnd = pendingHead
-        while dueEnd < pending.count,
-              pending[dueEnd].deadlineNanos <= cutoff {
-            dueEnd += 1
-        }
-        guard dueEnd > pendingHead else {
-            let nextDeadline = pending[pendingHead].deadlineNanos
-            lock.unlock()
-            scheduleDrain(at: nextDeadline, generation: generation)
-            return
-        }
-
-        let batch = pending[pendingHead..<dueEnd].map(\.data)
-        pendingHead = dueEnd
-        let nextDeadline = pendingHead < pending.count
-            ? pending[pendingHead].deadlineNanos
-            : nil
-        if nextDeadline == nil {
+        let batch: [Data]
+        let nextDeadline: UInt64?
+        if lastDeadlineNanos == 0 {
+            // Fast path: all queued packets are immediate (no audio-sync delay).
+            batch = pending[pendingHead..<pending.count].map(\.data)
             pending.removeAll(keepingCapacity: true)
             pendingHead = 0
             drainScheduled = false
-            lastDeadlineNanos = 0
-        } else if pendingHead >= 4_096,
-                  pendingHead * 2 >= pending.count {
-            pending.removeFirst(pendingHead)
-            pendingHead = 0
+            nextDeadline = nil
+        } else {
+            let cutoff = DispatchTime.now().uptimeNanoseconds
+                &+ Self.deadlineToleranceNanos
+            var dueEnd = pendingHead
+            while dueEnd < pending.count,
+                  pending[dueEnd].deadlineNanos <= cutoff {
+                dueEnd += 1
+            }
+            guard dueEnd > pendingHead else {
+                let pendingDeadline = pending[pendingHead].deadlineNanos
+                lock.unlock()
+                scheduleDrain(at: pendingDeadline, generation: generation)
+                return
+            }
+
+            batch = pending[pendingHead..<dueEnd].map(\.data)
+            pendingHead = dueEnd
+            nextDeadline = pendingHead < pending.count
+                ? pending[pendingHead].deadlineNanos
+                : nil
+            if nextDeadline == nil {
+                pending.removeAll(keepingCapacity: true)
+                pendingHead = 0
+                drainScheduled = false
+                lastDeadlineNanos = 0
+            } else if pendingHead >= 4_096,
+                      pendingHead * 2 >= pending.count {
+                pending.removeFirst(pendingHead)
+                pendingHead = 0
+            }
         }
         lock.unlock()
 
@@ -980,6 +1047,10 @@ public final class VNCSession {
     private var videoStreamManager: VideoStreamManager?
     private var secondaryVideoStreamManager: VideoStreamManager?
     @ObservationIgnored
+    private var primaryBandCoalescer: BandFrameCoalescer?
+    @ObservationIgnored
+    private var secondaryBandCoalescer: BandFrameCoalescer?
+    @ObservationIgnored
     private var remoteAudioPlayer: AppleRemoteAudioPlayer?
     @ObservationIgnored
     private var appleMediaPlaybackSynchronizer: AppleMediaPlaybackSynchronizer?
@@ -1368,6 +1439,7 @@ public final class VNCSession {
         remoteDisplayResizeTask = nil
         lastRequestedClientDisplaySize = nil
         diagnostics.isHighPerformanceMode = false
+        invalidateVideoBandCoalescers()
         videoBandRenderer.reset()
         secondaryVideoBandRenderer.reset()
         diagnostics.reset()
@@ -1483,6 +1555,7 @@ public final class VNCSession {
         remoteDisplayRegionByID = [:]
         remoteDisplayRegionOrder = []
         invalidateStandardFramebufferPresentation()
+        invalidateVideoBandCoalescers()
         videoBandRenderer.reset()
         secondaryVideoBandRenderer.reset()
         videoStreamManager?.stopStream()
@@ -2956,6 +3029,7 @@ public final class VNCSession {
         negotiatedCursorRendering = nil
         diagnostics.isHighPerformanceMode = false
 
+        invalidateVideoBandCoalescers()
         videoStreamManager?.stopStream()
         videoStreamManager = nil
         secondaryVideoStreamManager?.stopStream()
@@ -3811,7 +3885,7 @@ public final class VNCSession {
         guard inputTask == nil else { return }
 
         let generation = inputGeneration
-        inputTask = Task { [weak self, weak transport] in
+        inputTask = Task(priority: .high) { [weak self, weak transport] in
             guard let self, let transport else { return }
             while !Task.isCancelled,
                   self.inputGeneration == generation,
@@ -4327,7 +4401,18 @@ public final class VNCSession {
         configuration.enableProtocolTrace
     }
 
+    private func invalidateVideoBandCoalescers() {
+        primaryBandCoalescer?.invalidate()
+        primaryBandCoalescer = nil
+        secondaryBandCoalescer?.invalidate()
+        secondaryBandCoalescer = nil
+    }
+
     private func startVideoStream(offer: AppleMediaStreamOffer) async {
+        let originatingTransport = transportSession
+        // Retire any active coalescers before resetting renderers and awaiting
+        // transport metadata so an old frame cannot acquire the new resetEpoch.
+        invalidateVideoBandCoalescers()
         let manager = videoStreamManager ?? VideoStreamManager()
         videoStreamManager = manager
         videoBandRenderer.reset()
@@ -4391,8 +4476,12 @@ public final class VNCSession {
         let primarySize = displaySize(at: 0)
         let width = primarySize.width
         let height = primarySize.height
-        let initialTileCount = await transportSession?.currentAppleMediaTilesPerFrame
+        let initialTileCount = await originatingTransport?.currentAppleMediaTilesPerFrame
             ?? Int(AppleMediaVideoMode.negotiatedTilesPerFrame)
+        guard transportSession === originatingTransport,
+              videoStreamManager === manager else {
+            return
+        }
         videoBandRenderer.setScreenSize(width: width, height: height)
         videoBandRenderer.configureExpectedBandCount(initialTileCount)
 
@@ -4403,9 +4492,11 @@ public final class VNCSession {
         // across bands. Instead: stage the newest buffer per band under a lock
         // and drain all staged bands in ONE main-queue hop (FIFO by definition);
         // under main-thread load intermediate frames are simply superseded.
+        primaryBandCoalescer?.invalidate()
         let coalescer = BandFrameCoalescer(
             renderer: renderer,
             expectedSourceCount: initialTileCount)
+        primaryBandCoalescer = coalescer
         // Diagnostic tap: with ROOTSHELL_VNC_FRAME_OUT_DIR set, periodically
         // save the EXACT decoded buffers handed to the renderer, so decode
         // output and on-screen result can be compared for the same session.
@@ -4450,9 +4541,11 @@ public final class VNCSession {
                 width: secondSize.width,
                 height: secondSize.height)
             secondaryVideoBandRenderer.configureExpectedBandCount(initialTileCount)
+            secondaryBandCoalescer?.invalidate()
             let secondCoalescer = BandFrameCoalescer(
                 renderer: secondaryVideoBandRenderer,
                 expectedSourceCount: initialTileCount)
+            secondaryBandCoalescer = secondCoalescer
             let secondDecodedBands = DecodedBandTracker()
             secondManager.onFrameGeometryChange = { [weak self] geometry in
                 Task { @MainActor [weak self] in
@@ -4476,6 +4569,8 @@ public final class VNCSession {
             secondaryCoalescer = secondCoalescer
             secondaryDecodedBands = secondDecodedBands
         } else {
+            secondaryBandCoalescer?.invalidate()
+            secondaryBandCoalescer = nil
             secondaryVideoStreamManager?.stopStream()
             secondaryVideoStreamManager = nil
             secondaryManager = nil
@@ -4817,8 +4912,13 @@ public final class VNCSession {
             let playbackSynchronizer = appleMediaPlaybackSynchronizer
             let generationCoalescer = coalescer
             let generationLog = logger
-            let videoDelay: @Sendable (Data) -> UInt64 = { packet in
-                playbackSynchronizer?.videoDelayNanos(for: packet) ?? 0
+            let videoDelay: (@Sendable (Data) -> UInt64)?
+            if let playbackSynchronizer {
+                videoDelay = { packet in
+                    playbackSynchronizer.videoDelayNanos(for: packet)
+                }
+            } else {
+                videoDelay = nil
             }
             let videoPacketCoalescer = OrderedMediaPacketCoalescer(
                 queue: queue,
@@ -4831,9 +4931,7 @@ public final class VNCSession {
                         stats.noteSubmittedAccessUnits(result.decodedNALUnitCount)
                     }
                 } else {
-                    for packet in packets {
-                        sinkManager.feedRTPData(packet)
-                    }
+                    sinkManager.feedRTPBatch(packets)
                 }
             }
             let secondaryVideoPacketCoalescer = secondaryManager.map { manager in
@@ -4841,9 +4939,7 @@ public final class VNCSession {
                     queue: queue,
                     delayNanos: videoDelay
                 ) { packets in
-                    for packet in packets {
-                        manager.feedRTPData(packet)
-                    }
+                    manager.feedRTPBatch(packets)
                 }
             }
             secondaryManager?.onLossDetected = { [weak transport, weak secondaryManager] ssrc in
@@ -4970,14 +5066,25 @@ public final class VNCSession {
                         height: height)
                 }
             }
-            await transport.setAppleMediaRoutedRTPSink { packet, displayIndex in
-                if AppleRemoteAudioPlayer.canHandleRTPPacket(packet) {
-                    sinkAudioPlayer?.enqueueRTPPacket(packet)
-                } else if displayIndex == 1,
-                          let secondaryVideoPacketCoalescer {
-                    secondaryVideoPacketCoalescer.enqueue(packet)
-                } else {
-                    videoPacketCoalescer.enqueue(packet)
+            await transport.setAppleMediaRoutedRTPBatchSink { packets in
+                var primaryBatch: [Data] = []
+                var secondaryBatch: [Data] = []
+                primaryBatch.reserveCapacity(packets.count)
+                for (packet, displayIndex) in packets {
+                    if AppleRemoteAudioPlayer.canHandleRTPPacket(packet) {
+                        sinkAudioPlayer?.enqueueRTPPacket(packet)
+                    } else if displayIndex == 1,
+                              secondaryVideoPacketCoalescer != nil {
+                        secondaryBatch.append(packet)
+                    } else {
+                        primaryBatch.append(packet)
+                    }
+                }
+                if !primaryBatch.isEmpty {
+                    videoPacketCoalescer.enqueue(contentsOf: primaryBatch)
+                }
+                if !secondaryBatch.isEmpty {
+                    secondaryVideoPacketCoalescer?.enqueue(contentsOf: secondaryBatch)
                 }
             }
         }
@@ -5470,16 +5577,32 @@ final class RenderCommitStats: @unchecked Sendable {
 }
 
 /// Delivers synchronized decoded screen bands to the main-thread renderer.
-/// Complete moving-band sets use one immediate FIFO main-queue hop. A short
-/// deadline prevents a genuinely static/change-gated band from adding stalls.
+/// Multi-band Metal compositing runs on a dedicated `.userInteractive` serial
+/// queue off `@MainActor` so GPU scheduling and completion waits never stall
+/// pointer/keyboard input; `@MainActor` only enqueues the finished surface.
 final class BandFrameCoalescer: @unchecked Sendable {
+    private struct PreparedFrame: @unchecked Sendable {
+        let bands: [UInt32: CVPixelBuffer]
+        let composedFrame: CVPixelBuffer?
+        let composedConfig: VideoBandLayerRenderer.CompositeConfiguration
+        let immediate: Bool
+        let generation: UInt64
+        let scheduledNanos: UInt64
+    }
+
     private let lock = NSLock()
     private var accumulator = AtomicBandFrameAccumulator<CVPixelBuffer>(
         expectedSourceCount: Int(AppleMediaVideoMode.negotiatedTilesPerFrame))
     private var immediateHopScheduled = false
     private var fallbackHopScheduled = false
+    private var mainHopScheduled = false
+    private var invalidated = false
+    private var pendingPresentation: PreparedFrame?
     private var streamGeneration: UInt64 = 0
     private let renderer: VideoBandLayerRenderer
+    private let compositeQueue = DispatchQueue(
+        label: "com.rootshell.vnc.band.composite",
+        qos: .userInteractive)
     /// Half a 60 Hz refresh and roughly one 120 Hz refresh. Normally every
     /// moving band arrives first and is presented immediately; this deadline
     /// applies only when the server suppresses an unchanged band.
@@ -5494,6 +5617,30 @@ final class BandFrameCoalescer: @unchecked Sendable {
             expectedSourceCount: expectedSourceCount)
     }
 
+    /// Test hook: true once background composition has staged a prepared frame
+    /// waiting for its main-thread presentation callback.
+    var hasPendingPresentationForTesting: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingPresentation != nil
+    }
+
+    /// Permanently retire this coalescer on disconnect or stream replacement so
+    /// in-flight composite work and queued main-thread callbacks can never
+    /// repopulate the renderer with a previous desktop.
+    func invalidate() {
+        lock.lock()
+        invalidated = true
+        streamGeneration &+= 1
+        accumulator = AtomicBandFrameAccumulator<CVPixelBuffer>(
+            expectedSourceCount: accumulator.expectedSourceCount)
+        immediateHopScheduled = false
+        fallbackHopScheduled = false
+        mainHopScheduled = false
+        pendingPresentation = nil
+        lock.unlock()
+    }
+
     /// Drop decoded values staged from the retired media generation and queue
     /// the visual handoff before any subsequently submitted frame can queue its
     /// own main-thread hop. The renderer keeps showing its last committed
@@ -5503,17 +5650,37 @@ final class BandFrameCoalescer: @unchecked Sendable {
         expectedSourceCount: Int
     ) {
         lock.lock()
+        guard !invalidated else {
+            lock.unlock()
+            return
+        }
         streamGeneration = generation
         accumulator = AtomicBandFrameAccumulator<CVPixelBuffer>(
             expectedSourceCount: expectedSourceCount)
         immediateHopScheduled = false
         fallbackHopScheduled = false
+        mainHopScheduled = false
+        pendingPresentation = nil
         lock.unlock()
 
-        DispatchQueue.main.async { [renderer] in
-            MainActor.assumeIsolated {
-                renderer.beginStreamGeneration(
-                    expectedBandCount: expectedSourceCount)
+        // Enqueue the renderer reset through `compositeQueue` before any
+        // new-generation frame can stage on `DispatchQueue.main`. Retired
+        // main-queue callbacks check `expectedGeneration == streamGeneration`
+        // and exit without touching the new generation's slot.
+        compositeQueue.async { [self, renderer] in
+            lock.lock()
+            let active = !invalidated && streamGeneration == generation
+            lock.unlock()
+            guard active else { return }
+            DispatchQueue.main.async { [self] in
+                lock.lock()
+                let stillActive = !invalidated && streamGeneration == generation
+                lock.unlock()
+                guard stillActive else { return }
+                MainActor.assumeIsolated {
+                    renderer.beginStreamGeneration(
+                        expectedBandCount: expectedSourceCount)
+                }
             }
         }
     }
@@ -5521,6 +5688,10 @@ final class BandFrameCoalescer: @unchecked Sendable {
     func submit(ssrc: UInt32, pixelBuffer: CVPixelBuffer) {
         RenderCommitStats.shared?.noteFrameIn()
         lock.lock()
+        guard !invalidated else {
+            lock.unlock()
+            return
+        }
         accumulator.submit(source: ssrc, value: pixelBuffer)
         let shouldScheduleImmediate = accumulator.hasSynchronizedFrame
             && !immediateHopScheduled
@@ -5532,19 +5703,18 @@ final class BandFrameCoalescer: @unchecked Sendable {
         lock.unlock()
 
         if shouldScheduleImmediate {
-            scheduleImmediateRendererHop(generation: generation)
+            scheduleImmediateComposite(generation: generation)
         }
         if shouldScheduleFallback {
-            scheduleFallbackRendererHop(generation: generation)
+            scheduleFallbackComposite(generation: generation)
         }
     }
 
-    private func scheduleImmediateRendererHop(generation: UInt64) {
+    private func scheduleImmediateComposite(generation: UInt64) {
         let scheduledNanos = DispatchTime.now().uptimeNanoseconds
-        DispatchQueue.main.async { [self] in
-            let hopLatency = DispatchTime.now().uptimeNanoseconds &- scheduledNanos
+        compositeQueue.async { [self] in
             lock.lock()
-            guard generation == streamGeneration else {
+            guard !invalidated, generation == streamGeneration else {
                 // This hop was queued by the retired media generation. Its
                 // accumulator was deliberately discarded; leave the new
                 // generation's scheduled-hop state untouched.
@@ -5559,34 +5729,29 @@ final class BandFrameCoalescer: @unchecked Sendable {
                 && !fallbackHopScheduled
             if scheduleFallback { fallbackHopScheduled = true }
             lock.unlock()
+
             if let frames, !frames.isEmpty {
-                let started = DispatchTime.now().uptimeNanoseconds
-                MainActor.assumeIsolated {
-                    renderer.setBands(frames)
-                }
-                RenderCommitStats.shared?.noteCommit(
+                composeAndStageForMain(
+                    frames: frames,
                     immediate: true,
-                    bandCount: frames.count,
-                    hopLatencyNanos: hopLatency,
-                    setBandsNanos: DispatchTime.now().uptimeNanoseconds &- started)
+                    generation: generation,
+                    scheduledNanos: scheduledNanos)
             }
             if scheduleNext {
-                scheduleImmediateRendererHop(generation: generation)
+                scheduleImmediateComposite(generation: generation)
             }
             if scheduleFallback {
-                scheduleFallbackRendererHop(generation: generation)
+                scheduleFallbackComposite(generation: generation)
             }
         }
     }
 
-    private func scheduleFallbackRendererHop(generation: UInt64) {
+    private func scheduleFallbackComposite(generation: UInt64) {
         let deadlineNanos = DispatchTime.now().uptimeNanoseconds
             &+ UInt64(8_000_000)
-        DispatchQueue.main.asyncAfter(deadline: .now() + fallbackDelay) { [self] in
-            let now = DispatchTime.now().uptimeNanoseconds
-            let hopLatency = now > deadlineNanos ? now &- deadlineNanos : 0
+        compositeQueue.asyncAfter(deadline: .now() + fallbackDelay) { [self] in
             lock.lock()
-            guard generation == streamGeneration else {
+            guard !invalidated, generation == streamGeneration else {
                 lock.unlock()
                 return
             }
@@ -5594,16 +5759,89 @@ final class BandFrameCoalescer: @unchecked Sendable {
             fallbackHopScheduled = false
             lock.unlock()
             guard let frames, !frames.isEmpty else { return }
-            let started = DispatchTime.now().uptimeNanoseconds
-            MainActor.assumeIsolated {
-                renderer.setBands(frames)
-            }
-            RenderCommitStats.shared?.noteCommit(
+            composeAndStageForMain(
+                frames: frames,
                 immediate: false,
-                bandCount: frames.count,
-                hopLatencyNanos: hopLatency,
-                setBandsNanos: DispatchTime.now().uptimeNanoseconds &- started)
+                generation: generation,
+                scheduledNanos: deadlineNanos)
         }
+    }
+
+    private func composeAndStageForMain(
+        frames: [UInt32: CVPixelBuffer],
+        immediate: Bool,
+        generation: UInt64,
+        scheduledNanos: UInt64
+    ) {
+        let config = renderer.compositeConfiguration
+        let composedFrame: CVPixelBuffer?
+        if config.isPresentationSuspended {
+            // Skip GPU compositing while presentation is suspended; the
+            // renderer retains the latest bands and composes once on resume.
+            composedFrame = nil
+        } else if config.width > 0, config.height > 0 {
+            composedFrame = renderer.sharedCompositor.compose(
+                bands: frames,
+                width: config.width,
+                height: config.height,
+                centersSinglePicture: config.centersSinglePicture)
+        } else {
+            composedFrame = nil
+        }
+
+        lock.lock()
+        guard !invalidated, generation == streamGeneration else {
+            lock.unlock()
+            return
+        }
+        // Latest-wins staging keeps MainActor immune to frame bursts and bounds
+        // the compositor's CVPixelBufferPool to a few in-flight surfaces.
+        pendingPresentation = PreparedFrame(
+            bands: frames,
+            composedFrame: composedFrame,
+            composedConfig: config,
+            immediate: immediate,
+            generation: generation,
+            scheduledNanos: scheduledNanos)
+        let shouldScheduleMain = !mainHopScheduled
+        if shouldScheduleMain { mainHopScheduled = true }
+        lock.unlock()
+
+        if shouldScheduleMain {
+            DispatchQueue.main.async { [self] in
+                drainPendingPresentationOnMain(expectedGeneration: generation)
+            }
+        }
+    }
+
+    private func drainPendingPresentationOnMain(expectedGeneration: UInt64) {
+        lock.lock()
+        guard !invalidated, expectedGeneration == streamGeneration else {
+            lock.unlock()
+            return
+        }
+        let prepared = pendingPresentation
+        pendingPresentation = nil
+        mainHopScheduled = false
+        lock.unlock()
+
+        guard let prepared, prepared.generation == expectedGeneration else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        let hopLatency = now > prepared.scheduledNanos ? now &- prepared.scheduledNanos : 0
+        let started = now
+        let immediate = prepared.immediate
+        let bandCount = prepared.bands.count
+        MainActor.assumeIsolated {
+            renderer.presentPreparedBands(
+                prepared.bands,
+                composedFrame: prepared.composedFrame,
+                composedConfig: prepared.composedConfig)
+        }
+        RenderCommitStats.shared?.noteCommit(
+            immediate: immediate,
+            bandCount: bandCount,
+            hopLatencyNanos: hopLatency,
+            setBandsNanos: DispatchTime.now().uptimeNanoseconds &- started)
     }
 }
 

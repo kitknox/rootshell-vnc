@@ -21,63 +21,68 @@ func appleMediaRTPMediaControlInfo(
     _ packet: Data
 ) -> AppleMediaRTPMediaControlInfo? {
     let minimumRTPHeaderLength = 12
-    guard packet.count >= minimumRTPHeaderLength else { return nil }
-    let base = packet.startIndex
-    let firstByte = packet[base]
-    guard firstByte >> 6 == 2,
-          firstByte & 0x10 != 0 else { return nil }
+    let count = packet.count
+    guard count >= minimumRTPHeaderLength else { return nil }
+    return packet.withUnsafeBytes { rawBuffer -> AppleMediaRTPMediaControlInfo? in
+        guard let ptr = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+            return nil
+        }
+        let firstByte = ptr[0]
+        guard firstByte >> 6 == 2,
+              firstByte & 0x10 != 0 else { return nil }
 
-    let csrcBytes = Int(firstByte & 0x0f) * 4
-    let extensionOffset = base + minimumRTPHeaderLength + csrcBytes
-    guard extensionOffset + 4 <= packet.endIndex else { return nil }
+        let csrcBytes = Int(firstByte & 0x0f) * 4
+        let extensionOffset = minimumRTPHeaderLength + csrcBytes
+        guard extensionOffset + 4 <= count else { return nil }
 
-    let statusAndVersion = packet[extensionOffset]
-    let version = statusAndVersion >> 6
-    // The media-control profile defines versions 1 through 3. Reject zero so
-    // an unrelated extension cannot be mistaken for
-    // media control merely because its flags happen to line up.
-    guard (1...3).contains(version) else { return nil }
+        let statusAndVersion = ptr[extensionOffset]
+        let version = statusAndVersion >> 6
+        // The media-control profile defines versions 1 through 3. Reject zero so
+        // an unrelated extension cannot be mistaken for
+        // media control merely because its flags happen to line up.
+        guard (1...3).contains(version) else { return nil }
 
-    let flagsAndLTRBits = packet[extensionOffset + 1]
-    let extensionWordCount = Int(
-        UInt16(packet[extensionOffset + 2]) << 8
-            | UInt16(packet[extensionOffset + 3]))
-    let extensionEnd = extensionOffset + 4 + extensionWordCount * 4
-    guard extensionEnd <= packet.endIndex else { return nil }
+        let flagsAndLTRBits = ptr[extensionOffset + 1]
+        let extensionWordCount = Int(
+            UInt16(ptr[extensionOffset + 2]) << 8
+                | UInt16(ptr[extensionOffset + 3]))
+        let extensionEnd = extensionOffset + 4 + extensionWordCount * 4
+        guard extensionEnd <= count else { return nil }
 
-    let frameExtensionPresent: UInt8 = 0x01
-    let ltrTimestampPresent: UInt8 = 0x02
-    var cursor = extensionOffset + 4
-    var ltrTimestamp: UInt32?
-    var totalPacketsPerFrame: UInt16?
-    var frameSequenceNumber: UInt16?
+        let frameExtensionPresent: UInt8 = 0x01
+        let ltrTimestampPresent: UInt8 = 0x02
+        var cursor = extensionOffset + 4
+        var ltrTimestamp: UInt32?
+        var totalPacketsPerFrame: UInt16?
+        var frameSequenceNumber: UInt16?
 
-    if flagsAndLTRBits & ltrTimestampPresent != 0 {
-        guard cursor + 4 <= extensionEnd else { return nil }
-        // This optional field is little-endian, unlike the network-byte-order
-        // frame fields below.
-        ltrTimestamp = UInt32(packet[cursor])
-            | UInt32(packet[cursor + 1]) << 8
-            | UInt32(packet[cursor + 2]) << 16
-            | UInt32(packet[cursor + 3]) << 24
-        cursor += 4
+        if flagsAndLTRBits & ltrTimestampPresent != 0 {
+            guard cursor + 4 <= extensionEnd else { return nil }
+            // This optional field is little-endian, unlike the network-byte-order
+            // frame fields below.
+            ltrTimestamp = UInt32(ptr[cursor])
+                | UInt32(ptr[cursor + 1]) << 8
+                | UInt32(ptr[cursor + 2]) << 16
+                | UInt32(ptr[cursor + 3]) << 24
+            cursor += 4
+        }
+
+        if version == 2, flagsAndLTRBits & frameExtensionPresent != 0 {
+            guard cursor + 4 <= extensionEnd else { return nil }
+            totalPacketsPerFrame = UInt16(ptr[cursor]) << 8
+                | UInt16(ptr[cursor + 1])
+            frameSequenceNumber = UInt16(ptr[cursor + 2]) << 8
+                | UInt16(ptr[cursor + 3])
+        }
+
+        return AppleMediaRTPMediaControlInfo(
+            version: version,
+            cameraStatus: statusAndVersion & 0x3f,
+            ltrBits: flagsAndLTRBits >> 4,
+            ltrTimestamp: ltrTimestamp,
+            totalPacketsPerFrame: totalPacketsPerFrame,
+            frameSequenceNumber: frameSequenceNumber)
     }
-
-    if version == 2, flagsAndLTRBits & frameExtensionPresent != 0 {
-        guard cursor + 4 <= extensionEnd else { return nil }
-        totalPacketsPerFrame = UInt16(packet[cursor]) << 8
-            | UInt16(packet[cursor + 1])
-        frameSequenceNumber = UInt16(packet[cursor + 2]) << 8
-            | UInt16(packet[cursor + 3])
-    }
-
-    return AppleMediaRTPMediaControlInfo(
-        version: version,
-        cameraStatus: statusAndVersion & 0x3f,
-        ltrBits: flagsAndLTRBits >> 4,
-        ltrTimestamp: ltrTimestamp,
-        totalPacketsPerFrame: totalPacketsPerFrame,
-        frameSequenceNumber: frameSequenceNumber)
 }
 
 struct AppleMediaLTRFrameAcknowledgement: Equatable {
@@ -140,17 +145,23 @@ struct AppleMediaLTRFrameCompletionTracker {
             return nil
         }
 
+        // Remove before mutating so `frame.rtpSequences` stays uniquely
+        // referenced (avoids O(N^2) Set CoW copies across multi-packet frames).
         var frame: Frame
-        if let active = activeFramesBySSRC[ssrc],
+        if let active = activeFramesBySSRC.removeValue(forKey: ssrc),
            active.frameSequenceNumber == frameSequence,
            active.rtpTimestamp == rtpTimestamp {
             frame = active
         } else {
+            var sequences = Set<UInt16>()
+            // Cap initial reservation so a single packet advertising a large
+            // frame cannot pre-allocate space for tens of thousands of entries.
+            sequences.reserveCapacity(min(Int(totalPackets), 64))
             frame = Frame(
                 frameSequenceNumber: frameSequence,
                 rtpTimestamp: rtpTimestamp,
                 expectedPacketCount: Int(totalPackets),
-                rtpSequences: [])
+                rtpSequences: sequences)
         }
         frame.rtpSequences.insert(rtpSequence)
 
@@ -159,7 +170,6 @@ struct AppleMediaLTRFrameCompletionTracker {
             return nil
         }
 
-        activeFramesBySSRC.removeValue(forKey: ssrc)
         completedFramesBySSRC[ssrc] = CompletedFrame(
             frameSequenceNumber: frameSequence,
             rtpTimestamp: rtpTimestamp)

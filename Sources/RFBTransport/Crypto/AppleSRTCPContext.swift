@@ -1,5 +1,4 @@
 import CommonCrypto
-import CryptoKit
 import Foundation
 import RFBProtocol
 
@@ -18,9 +17,12 @@ public final class AppleSRTCPContext: @unchecked Sendable {
     private static let masterKeyLength = 32
     private static let masterSaltLength = 14
 
-    private let encryptionKey: Data // 32-byte AES-256 session key (label 3)
-    private let authenticationKey: Data // 20-byte HMAC-SHA1 key (label 4)
-    private let saltKey: Data // 14-byte session salt (label 5)
+    private var hmacTemplate = CCHmacContext()
+    private let saltBytes: (
+        UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+        UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8
+    )
+    private var cryptor: CCCryptorRef?
     private let tagLength = 10
 
     private let lock = NSLock()
@@ -34,9 +36,28 @@ public final class AppleSRTCPContext: @unchecked Sendable {
         }
         let masterKey = Data(mediaKey.prefix(Self.masterKeyLength))
         let masterSalt = Data(mediaKey.dropFirst(Self.masterKeyLength).prefix(Self.masterSaltLength))
-        self.encryptionKey = try Self.deriveSessionKey(masterKey: masterKey, masterSalt: masterSalt, label: 0x03, length: Self.masterKeyLength)
-        self.authenticationKey = try Self.deriveSessionKey(masterKey: masterKey, masterSalt: masterSalt, label: 0x04, length: 20)
-        self.saltKey = try Self.deriveSessionKey(masterKey: masterKey, masterSalt: masterSalt, label: 0x05, length: 14)
+        let encryptionKey = try Self.deriveSessionKey(masterKey: masterKey, masterSalt: masterSalt, label: 0x03, length: Self.masterKeyLength)
+        let authenticationKey = try Self.deriveSessionKey(masterKey: masterKey, masterSalt: masterSalt, label: 0x04, length: 20)
+        var template = CCHmacContext()
+        authenticationKey.withUnsafeBytes { keyPtr in
+            CCHmacInit(&template, CCHmacAlgorithm(kCCHmacAlgSHA1), keyPtr.baseAddress, authenticationKey.count)
+        }
+        self.hmacTemplate = template
+        let salt = try Self.deriveSessionKey(masterKey: masterKey, masterSalt: masterSalt, label: 0x05, length: 14)
+        let sBase = salt.startIndex
+        self.saltBytes = (
+            salt[sBase], salt[sBase + 1], salt[sBase + 2], salt[sBase + 3],
+            salt[sBase + 4], salt[sBase + 5], salt[sBase + 6], salt[sBase + 7],
+            salt[sBase + 8], salt[sBase + 9], salt[sBase + 10], salt[sBase + 11],
+            salt[sBase + 12], salt[sBase + 13]
+        )
+        self.cryptor = try Self.makeCryptor(key: encryptionKey)
+    }
+
+    deinit {
+        if let cryptor {
+            CCCryptorRelease(cryptor)
+        }
     }
 
     /// Protect a plaintext RTCP compound packet as SRTCP (E-flag set, encrypted).
@@ -54,24 +75,48 @@ public final class AppleSRTCPContext: @unchecked Sendable {
         sendIndex = (sendIndex + 1) & 0x7fff_ffff
         let index = sendIndex
 
-        let base = rtcp.startIndex
-        let header = Data(rtcp[base..<base + 8])
-        let plaintext = Data(rtcp[base + 8..<rtcp.endIndex])
-        let encrypted = try transform(plaintext, ssrc: senderSSRC, index: index)
+        let bodyCount = rtcp.count - 8
+        let authenticatedLength = 8 + bodyCount + 4
+        let totalLength = authenticatedLength + tagLength
+        var out = Data(count: totalLength)
+        try out.withUnsafeMutableBytes { outRaw in
+            guard let outBase = outRaw.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                throw VNCProtocolError.ioError("SRTCP output buffer unavailable")
+            }
+            try rtcp.withUnsafeBytes { inRaw in
+                guard let inBase = inRaw.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    throw VNCProtocolError.ioError("RTCP input buffer unavailable")
+                }
+                outBase.update(from: inBase, count: 8)
+                if bodyCount > 0 {
+                    try transformLocked(
+                        input: inBase.advanced(by: 8),
+                        output: outBase.advanced(by: 8),
+                        count: bodyCount,
+                        ssrc: senderSSRC,
+                        index: index)
+                }
+            }
+            // SRTCP index word with E-flag set.
+            let indexWord = index | 0x8000_0000
+            let idxOffset = 8 + bodyCount
+            outBase[idxOffset] = UInt8((indexWord >> 24) & 0xff)
+            outBase[idxOffset + 1] = UInt8((indexWord >> 16) & 0xff)
+            outBase[idxOffset + 2] = UInt8((indexWord >> 8) & 0xff)
+            outBase[idxOffset + 3] = UInt8(indexWord & 0xff)
 
-        var out = Data(capacity: 8 + encrypted.count + 4 + tagLength)
-        out.append(header)
-        out.append(encrypted)
-        // SRTCP index word with E-flag set.
-        let indexWord = index | 0x8000_0000
-        out.append(UInt8((indexWord >> 24) & 0xff))
-        out.append(UInt8((indexWord >> 16) & 0xff))
-        out.append(UInt8((indexWord >> 8) & 0xff))
-        out.append(UInt8(indexWord & 0xff))
-
-        let mac = HMAC<Insecure.SHA1>.authenticationCode(
-            for: out, using: SymmetricKey(data: authenticationKey))
-        out.append(contentsOf: mac.prefix(tagLength))
+            var ctx = hmacTemplate
+            CCHmacUpdate(&ctx, outBase, authenticatedLength)
+            var mac: (
+                UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8
+            ) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            withUnsafeMutableBytes(of: &mac) { macPtr in
+                CCHmacFinal(&ctx, macPtr.baseAddress)
+                let macBase = macPtr.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                outBase.advanced(by: authenticatedLength).update(from: macBase, count: tagLength)
+            }
+        }
         return out
     }
 
@@ -80,65 +125,126 @@ public final class AppleSRTCPContext: @unchecked Sendable {
         guard srtcp.count >= 8 + 4 + tagLength else {
             throw VNCProtocolError.protocolViolation("SRTCP packet too short: \(srtcp.count)")
         }
-        let base = srtcp.startIndex
-        let tag = Data(srtcp[srtcp.endIndex - tagLength..<srtcp.endIndex])
-        let authedEnd = srtcp.endIndex - tagLength
-        let authed = Data(srtcp[base..<authedEnd])
-        let mac = HMAC<Insecure.SHA1>.authenticationCode(
-            for: authed, using: SymmetricKey(data: authenticationKey))
-        guard Data(mac.prefix(tagLength)) == tag else {
-            throw VNCProtocolError.protocolViolation("SRTCP authentication failed")
+        lock.lock()
+        defer { lock.unlock() }
+
+        let authenticatedLength = srtcp.count - tagLength
+        let bodyCount = authenticatedLength - 12
+        var out = Data(count: 8 + bodyCount)
+        try out.withUnsafeMutableBytes { outRaw in
+            guard let outBase = outRaw.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                throw VNCProtocolError.ioError("SRTCP output buffer unavailable")
+            }
+            try srtcp.withUnsafeBytes { inRaw in
+                guard let inBase = inRaw.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    throw VNCProtocolError.ioError("SRTCP input buffer unavailable")
+                }
+                var ctx = hmacTemplate
+                CCHmacUpdate(&ctx, inBase, authenticatedLength)
+                var mac: (
+                    UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                    UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8
+                ) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+                var diff: UInt8 = 0
+                withUnsafeMutableBytes(of: &mac) { macPtr in
+                    CCHmacFinal(&ctx, macPtr.baseAddress)
+                    let expected = macPtr.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                    let actual = inBase.advanced(by: authenticatedLength)
+                    for offset in 0..<tagLength {
+                        diff |= expected[offset] ^ actual[offset]
+                    }
+                }
+                guard diff == 0 else {
+                    throw VNCProtocolError.protocolViolation("SRTCP authentication failed")
+                }
+
+                let idxOffset = authenticatedLength - 4
+                let indexWord = UInt32(inBase[idxOffset]) << 24
+                    | UInt32(inBase[idxOffset + 1]) << 16
+                    | UInt32(inBase[idxOffset + 2]) << 8
+                    | UInt32(inBase[idxOffset + 3])
+                let index = indexWord & 0x7fff_ffff
+                let ssrc = UInt32(inBase[4]) << 24
+                    | UInt32(inBase[5]) << 16
+                    | UInt32(inBase[6]) << 8
+                    | UInt32(inBase[7])
+
+                outBase.update(from: inBase, count: 8)
+                if bodyCount > 0 {
+                    try transformLocked(
+                        input: inBase.advanced(by: 8),
+                        output: outBase.advanced(by: 8),
+                        count: bodyCount,
+                        ssrc: ssrc,
+                        index: index)
+                }
+            }
         }
-
-        let indexWordStart = authedEnd - 4
-        let indexWord = UInt32(srtcp[indexWordStart]) << 24
-            | UInt32(srtcp[indexWordStart + 1]) << 16
-            | UInt32(srtcp[indexWordStart + 2]) << 8
-            | UInt32(srtcp[indexWordStart + 3])
-        let index = indexWord & 0x7fff_ffff
-        let ssrc = UInt32(srtcp[base + 4]) << 24
-            | UInt32(srtcp[base + 5]) << 16
-            | UInt32(srtcp[base + 6]) << 8
-            | UInt32(srtcp[base + 7])
-
-        let header = Data(srtcp[base..<base + 8])
-        let ciphertext = Data(srtcp[base + 8..<indexWordStart])
-        let decrypted = try transform(ciphertext, ssrc: ssrc, index: index)
-        return header + decrypted
+        return out
     }
 
     // MARK: - AES-256-CM
 
-    private func transform(_ data: Data, ssrc: UInt32, index: UInt32) throws -> Data {
-        guard !data.isEmpty else { return Data() }
-        var output = Data(capacity: data.count)
-        var offset = 0
-        while offset < data.count {
-            let block = try aesEncrypt(counterBlock(ssrc: ssrc, index: index, blockCounter: UInt16(offset / 16)))
-            let chunk = min(16, data.count - offset)
-            for i in 0..<chunk {
-                output.append(data[data.startIndex + offset + i] ^ block[block.startIndex + i])
-            }
-            offset += chunk
+    private func transformLocked(
+        input: UnsafePointer<UInt8>,
+        output: UnsafeMutablePointer<UInt8>,
+        count: Int,
+        ssrc: UInt32,
+        index: UInt32
+    ) throws {
+        guard count > 0 else { return }
+        guard let cryptor else {
+            throw VNCProtocolError.ioError("SRTCP AES-CTR context is unavailable")
         }
-        return output
+        var iv: (
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8
+        ) = (
+            saltBytes.0,
+            saltBytes.1,
+            saltBytes.2,
+            saltBytes.3,
+            saltBytes.4 ^ UInt8((ssrc >> 24) & 0xff),
+            saltBytes.5 ^ UInt8((ssrc >> 16) & 0xff),
+            saltBytes.6 ^ UInt8((ssrc >> 8) & 0xff),
+            saltBytes.7 ^ UInt8(ssrc & 0xff),
+            saltBytes.8,
+            saltBytes.9,
+            saltBytes.10 ^ UInt8((index >> 24) & 0xff),
+            saltBytes.11 ^ UInt8((index >> 16) & 0xff),
+            saltBytes.12 ^ UInt8((index >> 8) & 0xff),
+            saltBytes.13 ^ UInt8(index & 0xff),
+            0,
+            0
+        )
+        let resetStatus = withUnsafeBytes(of: &iv) { ivPtr in
+            CCCryptorReset(cryptor, ivPtr.baseAddress)
+        }
+        guard resetStatus == kCCSuccess else {
+            throw VNCProtocolError.ioError("SRTCP AES-CTR reset failed: \(resetStatus)")
+        }
+        var moved = 0
+        let updateStatus = CCCryptorUpdate(cryptor, input, count, output, count, &moved)
+        guard updateStatus == kCCSuccess, moved == count else {
+            throw VNCProtocolError.ioError("SRTCP AES-CTR update failed: \(updateStatus)")
+        }
     }
 
-    private func counterBlock(ssrc: UInt32, index: UInt32, blockCounter: UInt16) -> Data {
-        var block = Data(count: 16)
-        block.replaceSubrange(0..<saltKey.count, with: saltKey)
-        block[4] ^= UInt8((ssrc >> 24) & 0xff)
-        block[5] ^= UInt8((ssrc >> 16) & 0xff)
-        block[6] ^= UInt8((ssrc >> 8) & 0xff)
-        block[7] ^= UInt8(ssrc & 0xff)
-        // 48-bit packet index with the 31-bit SRTCP index in the low bytes.
-        block[10] ^= UInt8((index >> 24) & 0xff)
-        block[11] ^= UInt8((index >> 16) & 0xff)
-        block[12] ^= UInt8((index >> 8) & 0xff)
-        block[13] ^= UInt8(index & 0xff)
-        block[14] = UInt8((blockCounter >> 8) & 0xff)
-        block[15] = UInt8(blockCounter & 0xff)
-        return block
+    private static func makeCryptor(key: Data) throws -> CCCryptorRef {
+        let zeroIV = [UInt8](repeating: 0, count: kCCBlockSizeAES128)
+        var cryptorRef: CCCryptorRef?
+        let status = zeroIV.withUnsafeBytes { ivPtr in
+            key.withUnsafeBytes { keyPtr in
+                CCCryptorCreateWithMode(
+                    CCOperation(kCCEncrypt), CCMode(kCCModeCTR), CCAlgorithm(kCCAlgorithmAES),
+                    CCPadding(ccNoPadding), ivPtr.baseAddress, keyPtr.baseAddress, key.count,
+                    nil, 0, 0, CCModeOptions(kCCModeOptionCTR_BE), &cryptorRef)
+            }
+        }
+        guard status == kCCSuccess, let cryptorRef else {
+            throw VNCProtocolError.ioError("SRTCP AES-CTR init failed: \(status)")
+        }
+        return cryptorRef
     }
 
     private static func deriveSessionKey(masterKey: Data, masterSalt: Data, label: UInt8, length: Int) throws -> Data {
@@ -160,10 +266,6 @@ public final class AppleSRTCPContext: @unchecked Sendable {
             counter &+= 1
         }
         return Data(output.prefix(length))
-    }
-
-    private func aesEncrypt(_ block: Data) throws -> Data {
-        try Self.aesEncrypt(block: block, key: encryptionKey)
     }
 
     private static func aesEncrypt(block: Data, key: Data) throws -> Data {

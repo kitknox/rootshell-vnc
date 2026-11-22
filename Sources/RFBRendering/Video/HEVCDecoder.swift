@@ -51,7 +51,7 @@ public final class HEVCDecoder: @unchecked Sendable {
     private struct CallbackBundle {
         let frame: FrameCallback
         let failure: FailureCallback?
-        let outputConverter: HEVCBandOutputConverter
+        let outputConverter: HEVCBandOutputConverter?
     }
 
     // MARK: - Private state
@@ -60,13 +60,16 @@ public final class HEVCDecoder: @unchecked Sendable {
     private var formatDescription: CMFormatDescription?
     private let lock = NSLock()
     private var callbackStorage: UnsafeMutablePointer<CallbackBundle>?
+    private let convertOutputToBGRA: Bool
 
     // MARK: - Init
 
     public init(
         frameCallback: @escaping FrameCallback,
-        failureCallback: FailureCallback? = nil
+        failureCallback: FailureCallback? = nil,
+        convertOutputToBGRA: Bool = false
     ) {
+        self.convertOutputToBGRA = convertOutputToBGRA
         // Allocate the callback trampoline storage once and keep it alive for
         // the decoder's whole lifetime. VideoToolbox may invoke the output
         // callback asynchronously *after* a session is invalidated (e.g. when a
@@ -76,7 +79,7 @@ public final class HEVCDecoder: @unchecked Sendable {
         storage.initialize(to: CallbackBundle(
             frame: frameCallback,
             failure: failureCallback,
-            outputConverter: HEVCBandOutputConverter()))
+            outputConverter: convertOutputToBGRA ? HEVCBandOutputConverter() : nil))
         self.callbackStorage = storage
     }
 
@@ -184,17 +187,19 @@ public final class HEVCDecoder: @unchecked Sendable {
             _waitForAsynchronousFrames(existing)
             _invalidate(existing)
             decompressionSession = nil
-            callbackStorage?.pointee.outputConverter.reset()
+            callbackStorage?.pointee.outputConverter?.reset()
         }
 
-        // The native decoder returns `444f` (full-range bi-planar 4:4:4). Asking
-        // VideoToolbox to return BGRA corrupts dependent compound subframes on
-        // Apple silicon even though the native decoded surfaces are clean.
-        // Preserve the native decode surface here; the callback performs an
-        // explicit public Core Image conversion into an IOSurface-backed BGRA
-        // buffer before the frame reaches presentation.
+        // The native decoder returns `444f` (full-range bi-planar 4:4:4) or
+        // `420f`/`420v`. Asking VideoToolbox to return BGRA corrupts dependent
+        // compound subframes on Apple silicon even though the native decoded
+        // surfaces are clean. Deliver the native surface directly out of the VT
+        // callback so the decode thread never blocks on GPU color conversion;
+        // single-tile presentation consumes it zero-copy and multi-band
+        // compositing converts in one pass off the main thread.
         let pixelBufferAttributes: [String: Any] = [
             kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+            kCVPixelBufferMetalCompatibilityKey as String: true,
         ]
 
         var outputCallback = VTDecompressionOutputCallbackRecord(
@@ -223,12 +228,16 @@ public final class HEVCDecoder: @unchecked Sendable {
                 }
                 guard let pixelBuffer = imageBuffer else { return }
 
-                guard let presentationBuffer = callbacks.outputConverter.convert(pixelBuffer)
-                else {
-                    callbacks.failure?(kCVReturnError, presentationTimeStamp, tag)
-                    return
+                if let converter = callbacks.outputConverter {
+                    guard let presentationBuffer = converter.convert(pixelBuffer)
+                    else {
+                        callbacks.failure?(kCVReturnError, presentationTimeStamp, tag)
+                        return
+                    }
+                    callbacks.frame(presentationBuffer, presentationTimeStamp, tag)
+                } else {
+                    callbacks.frame(pixelBuffer, presentationTimeStamp, tag)
                 }
-                callbacks.frame(presentationBuffer, presentationTimeStamp, tag)
             },
             decompressionOutputRefCon: nil)
         outputCallback.decompressionOutputRefCon = callbackStorage.map(
@@ -280,15 +289,16 @@ public final class HEVCDecoder: @unchecked Sendable {
             valueOut: &raw)
         let hardware = propertyStatus == noErr ? raw as? Bool : nil
         let dims = CMVideoFormatDescriptionGetDimensions(formatDesc)
+        let outputLabel = convertOutputToBGRA ? "BGRA" : "native"
         VNCLogger(category: "HEVCDecoder").info(
             "VT session: \(dims.width)x\(dims.height) "
                 + "hardwareAccelerated=\(hardware.map(String.init) ?? "unknown") "
-                + "requestedOutput=native convertedOutput=BGRA")
+                + "requestedOutput=native convertedOutput=\(outputLabel)")
         if VNCDiagnostics.isEnabled("ROOTSHELL_VNC_TRACE_DECODE") {
             VNCLogger(category: "HEVCDecoder").debug(
                 "VT session: \(dims.width)x\(dims.height) "
                     + "hardwareAccelerated=\(hardware.map(String.init) ?? "unknown") "
-                    + "requestedOutput=native convertedOutput=BGRA")
+                    + "requestedOutput=native convertedOutput=\(outputLabel)")
         }
     }
 
@@ -341,62 +351,68 @@ public final class HEVCDecoder: @unchecked Sendable {
         }
         guard !nalUnits.isEmpty else { return }
 
-        // Convert NAL units to AVCC/HVCC sample format: each NAL is prefixed
-        // with a 4-byte big-endian length.
-        let totalPayloadSize = nalUnits.reduce(0) { $0 + 4 + $1.count }
-        var avccData = Data(capacity: totalPayloadSize)
+        // Write HVCC length-prefixed NAL units directly into a single
+        // CMBlockBuffer allocation, avoiding an intermediate Data copy.
+        var totalPayloadSize = 0
         for nalUnit in nalUnits {
-            let nalLength = UInt32(nalUnit.count)
-            withUnsafeBytes(of: nalLength.bigEndian) { avccData.append(contentsOf: $0) }
-            avccData.append(nalUnit)
+            totalPayloadSize += 4 + nalUnit.count
         }
-
-        // Create CMBlockBuffer from the AVCC data
-        let avccLength = avccData.count
         var blockBuffer: CMBlockBuffer?
-        var status: OSStatus = avccData.withUnsafeBytes { rawBuffer in
-            guard let srcBase = rawBuffer.baseAddress else {
-                return OSStatus(-50) // paramErr
-            }
-
-            // Allocate a CMBlockBuffer with a copy of the data
-            var buffer: CMBlockBuffer?
-            let createStatus = CMBlockBufferCreateWithMemoryBlock(
-                allocator: kCFAllocatorDefault,
-                memoryBlock: nil,
-                blockLength: avccLength,
-                blockAllocator: kCFAllocatorDefault,
-                customBlockSource: nil,
-                offsetToData: 0,
-                dataLength: avccLength,
-                flags: 0,
-                blockBufferOut: &buffer
-            )
-            guard createStatus == kCMBlockBufferNoErr, let buf = buffer else {
-                return createStatus
-            }
-
-            let replaceStatus = CMBlockBufferReplaceDataBytes(
-                with: srcBase,
-                blockBuffer: buf,
-                offsetIntoDestination: 0,
-                dataLength: avccLength
-            )
-            guard replaceStatus == kCMBlockBufferNoErr else {
-                return replaceStatus
-            }
-
-            blockBuffer = buf
-            return noErr
-        }
-
-        guard status == noErr, let block = blockBuffer else {
+        var status = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault,
+            memoryBlock: nil,
+            blockLength: totalPayloadSize,
+            blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil,
+            offsetToData: 0,
+            dataLength: totalPayloadSize,
+            flags: 0,
+            blockBufferOut: &blockBuffer
+        )
+        guard status == kCMBlockBufferNoErr, let block = blockBuffer else {
             throw HEVCDecoderError.blockBufferCreationFailed(status)
+        }
+        status = CMBlockBufferAssureBlockMemory(block)
+        guard status == kCMBlockBufferNoErr else {
+            throw HEVCDecoderError.blockBufferCreationFailed(status)
+        }
+        var dataPointer: UnsafeMutablePointer<CChar>?
+        var lengthAtOffset = 0
+        status = CMBlockBufferGetDataPointer(
+            block,
+            atOffset: 0,
+            lengthAtOffsetOut: &lengthAtOffset,
+            totalLengthOut: nil,
+            dataPointerOut: &dataPointer
+        )
+        guard status == kCMBlockBufferNoErr,
+              let dstBase = dataPointer,
+              lengthAtOffset >= totalPayloadSize else {
+            throw HEVCDecoderError.blockBufferCreationFailed(status)
+        }
+        var writeOffset = 0
+        let dstBytes = UnsafeMutableRawPointer(dstBase).assumingMemoryBound(to: UInt8.self)
+        for nalUnit in nalUnits {
+            let nalCount = nalUnit.count
+            let nalLength = UInt32(nalCount)
+            dstBytes[writeOffset] = UInt8((nalLength >> 24) & 0xff)
+            dstBytes[writeOffset + 1] = UInt8((nalLength >> 16) & 0xff)
+            dstBytes[writeOffset + 2] = UInt8((nalLength >> 8) & 0xff)
+            dstBytes[writeOffset + 3] = UInt8(nalLength & 0xff)
+            writeOffset += 4
+            if nalCount > 0 {
+                nalUnit.withUnsafeBytes { raw in
+                    if let src = raw.baseAddress {
+                        memcpy(dstBytes.advanced(by: writeOffset), src, nalCount)
+                    }
+                }
+                writeOffset += nalCount
+            }
         }
 
         // Create CMSampleBuffer
         var sampleBuffer: CMSampleBuffer?
-        var sampleSize = avccLength
+        var sampleSize = totalPayloadSize
         var timing = CMSampleTimingInfo(
             duration: CMTime.invalid,
             presentationTimeStamp: presentationTime,

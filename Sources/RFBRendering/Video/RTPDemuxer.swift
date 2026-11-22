@@ -140,83 +140,106 @@ public final class RTPDemuxer: @unchecked Sendable {
     ///  Followed by extension header (if X == 1)
     /// ```
     public func parsePacket(_ data: Data) throws -> RTPPacket {
-        guard data.count >= 12 else {
-            throw RTPError.packetTooShort(data.count)
+        try Self.parsePacket(data)
+    }
+
+    /// Parse an RTP packet from raw UDP data without allocating a demuxer or
+    /// copying the payload bytes (the returned payload is a zero-copy slice).
+    public static func parsePacket(_ data: Data) throws -> RTPPacket {
+        let count = data.count
+        guard count >= 12 else {
+            throw RTPError.packetTooShort(count)
         }
 
-        let base = data.startIndex
-
-        let byte0 = data[base]
-        let version = (byte0 >> 6) & 0x03
-        guard version == 2 else {
-            throw RTPError.unsupportedVersion(version)
-        }
-
-        let padding = (byte0 >> 5) & 0x01
-        let hasExtension = (byte0 >> 4) & 0x01
-        let csrcCount = Int(byte0 & 0x0F)
-
-        let byte1 = data[base + 1]
-        let marker = (byte1 >> 7) & 0x01 == 1
-        let payloadType = byte1 & 0x7F
-
-        let sequenceNumber = UInt16(data[base + 2]) << 8
-            | UInt16(data[base + 3])
-
-        let timestamp = UInt32(data[base + 4]) << 24
-            | UInt32(data[base + 5]) << 16
-            | UInt32(data[base + 6]) << 8
-            | UInt32(data[base + 7])
-
-        let ssrc = UInt32(data[base + 8]) << 24
-            | UInt32(data[base + 9]) << 16
-            | UInt32(data[base + 10]) << 8
-            | UInt32(data[base + 11])
-
-        // Calculate payload offset
-        var payloadOffset = 12 + csrcCount * 4
-
-        guard data.count >= payloadOffset else {
-            throw RTPError.packetTooShort(data.count)
-        }
-
-        // Skip extension header if present
-        if hasExtension == 1 {
-            guard data.count >= payloadOffset + 4 else {
-                throw RTPError.packetTooShort(data.count)
+        let parsed: (
+            version: UInt8,
+            payloadType: UInt8,
+            sequenceNumber: UInt16,
+            timestamp: UInt32,
+            ssrc: UInt32,
+            marker: Bool,
+            payloadOffset: Int,
+            payloadEnd: Int
+        ) = try data.withUnsafeBytes { rawBuffer in
+            guard let ptr = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                throw RTPError.packetTooShort(count)
             }
-            // Extension header: 2 bytes profile-specific, 2 bytes length (in 32-bit words)
-            let extensionLength = Int(UInt16(data[base + payloadOffset + 2]) << 8
-                | UInt16(data[base + payloadOffset + 3]))
-            payloadOffset += 4 + extensionLength * 4
-        }
+            let byte0 = ptr[0]
+            let version = (byte0 >> 6) & 0x03
+            guard version == 2 else {
+                throw RTPError.unsupportedVersion(version)
+            }
 
-        guard data.count >= payloadOffset else {
-            throw RTPError.packetTooShort(data.count)
-        }
+            let padding = (byte0 >> 5) & 0x01
+            let hasExtension = (byte0 >> 4) & 0x01
+            let csrcCount = Int(byte0 & 0x0F)
 
-        // Handle padding
-        var payloadEnd = data.count
-        if padding == 1 && data.count > payloadOffset {
-            let paddingLength = Int(data[data.endIndex - 1])
-            payloadEnd = max(payloadOffset, data.count - paddingLength)
+            let byte1 = ptr[1]
+            let marker = (byte1 >> 7) & 0x01 == 1
+            let payloadType = byte1 & 0x7F
+
+            let sequenceNumber = UInt16(ptr[2]) << 8 | UInt16(ptr[3])
+            let timestamp = UInt32(ptr[4]) << 24
+                | UInt32(ptr[5]) << 16
+                | UInt32(ptr[6]) << 8
+                | UInt32(ptr[7])
+            let ssrc = UInt32(ptr[8]) << 24
+                | UInt32(ptr[9]) << 16
+                | UInt32(ptr[10]) << 8
+                | UInt32(ptr[11])
+
+            var payloadOffset = 12 + csrcCount * 4
+            guard count >= payloadOffset else {
+                throw RTPError.packetTooShort(count)
+            }
+
+            if hasExtension == 1 {
+                guard count >= payloadOffset + 4 else {
+                    throw RTPError.packetTooShort(count)
+                }
+                let extensionLength = Int(
+                    UInt16(ptr[payloadOffset + 2]) << 8 | UInt16(ptr[payloadOffset + 3]))
+                payloadOffset += 4 + extensionLength * 4
+            }
+
+            guard count >= payloadOffset else {
+                throw RTPError.packetTooShort(count)
+            }
+
+            var payloadEnd = count
+            if padding == 1 && count > payloadOffset {
+                let paddingLength = Int(ptr[count - 1])
+                payloadEnd = max(payloadOffset, count - paddingLength)
+            }
+
+            return (
+                version,
+                payloadType,
+                sequenceNumber,
+                timestamp,
+                ssrc,
+                marker,
+                payloadOffset,
+                payloadEnd
+            )
         }
 
         let payload: Data
-        if payloadEnd > payloadOffset {
-            payload = Data(data[base + payloadOffset ..< base + payloadEnd])
+        if parsed.payloadEnd > parsed.payloadOffset {
+            let base = data.startIndex
+            payload = data[base + parsed.payloadOffset ..< base + parsed.payloadEnd]
         } else {
             payload = Data()
         }
 
         return RTPPacket(
-            version: version,
-            payloadType: payloadType,
-            sequenceNumber: sequenceNumber,
-            timestamp: timestamp,
-            ssrc: ssrc,
+            version: parsed.version,
+            payloadType: parsed.payloadType,
+            sequenceNumber: parsed.sequenceNumber,
+            timestamp: parsed.timestamp,
+            ssrc: parsed.ssrc,
             payload: payload,
-            marker: marker
+            marker: parsed.marker
         )
     }
 
@@ -358,10 +381,13 @@ public final class RTPDemuxer: @unchecked Sendable {
             let nalByte0 = (byte0 & 0x81) | (fuType << 1)
             let nalByte1 = byte1
 
-            var nalData = Data(capacity: 2 + fragmentData.count)
+            let initialCapacity = isEnd
+                ? 2 + fragmentData.count
+                : max(2 + fragmentData.count, 8_192)
+            var nalData = Data(capacity: initialCapacity)
             nalData.append(nalByte0)
             nalData.append(nalByte1)
-            nalData.append(contentsOf: fragmentData)
+            nalData.append(fragmentData)
 
             if isEnd {
                 // Single-fragment FU (unusual but valid)
@@ -385,16 +411,15 @@ public final class RTPDemuxer: @unchecked Sendable {
             )
             return []
 
-        } else if var state = fuStates[packet.ssrc] {
-            // Fragments are delimited by the FU Start/End bits and per-SSRC
-            // sequence continuity. Preserve the timestamp from the start
-            // packet for the completed access unit.
-            state.nalData.append(contentsOf: fragmentData)
+        } else if var state = fuStates.removeValue(forKey: packet.ssrc) {
+            // Remove from the dictionary before mutating so `state.nalData`
+            // remains uniquely referenced (prevents O(N^2) CoW copies across
+            // hundreds of RTP fragments in a single HEVC slice).
+            state.nalData.append(fragmentData)
             state.lastSequence = packet.sequenceNumber
 
             if isEnd {
                 // FU complete. Use the DON captured from the start fragment.
-                fuStates[packet.ssrc] = nil
                 return [DemuxedNAL(
                     don: state.don,
                     timestamp: state.timestamp,

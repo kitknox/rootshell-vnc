@@ -405,6 +405,51 @@ public final class VideoStreamManager: @unchecked Sendable {
         feedRTPData(data)
     }
 
+    /// Feed a batch of ordered RTP packets with amortized timestamping and
+    /// lock snapshots. Returns the total number of submitted HEVC access units.
+    @discardableResult
+    public func feedRTPBatch(_ packets: [Data]) -> Int {
+        guard !packets.isEmpty else { return 0 }
+        lock.lock()
+        guard _isActive else {
+            lock.unlock()
+            return 0
+        }
+        let demuxerRef = demuxer
+        let usesDON = usesDecodingOrderNumbers
+        lock.unlock()
+
+        let batchNowNanos = DispatchTime.now().uptimeNanoseconds
+        var totalDecoded = 0
+        for data in packets {
+            guard !RTPDemuxer.isRTCPPacket(data) else { continue }
+            do {
+                let packet = try RTPDemuxer.parsePacket(data)
+                guard packet.payloadType == 100 else { continue }
+                let gap = noteVideoPacketAndDetectGap(
+                    ssrc: packet.ssrc,
+                    sequence: packet.sequenceNumber,
+                    nowNanos: batchNowNanos)
+                if gap.detected, !usesDON {
+                    discardPartialSequentialAccessUnit()
+                }
+                if gap.shouldRequestRecovery {
+                    onLossDetected?(packet.ssrc)
+                }
+                let demuxed = demuxerRef.feedPacket(packet)
+                guard !demuxed.isEmpty else { continue }
+                totalDecoded += try submitDemuxedUnits(
+                    demuxed,
+                    usesDON: usesDON)
+            } catch {
+                let freshLoss = gateAllBands(nowNanos: batchNowNanos)
+                if freshLoss { onLossDetected?(nil) }
+                logDroppedPacket(error: error, byteCount: data.count)
+            }
+        }
+        return totalDecoded
+    }
+
     /// Feed an RTP-shaped media packet (UDP or Apple's encrypted TCP fallback).
     @discardableResult
     public func feedRTPData(_ data: Data) -> VideoStreamFeedResult {
@@ -414,6 +459,7 @@ public final class VideoStreamManager: @unchecked Sendable {
             return VideoStreamFeedResult(byteCount: data.count, isActive: false)
         }
         let demuxerRef = demuxer
+        let usesDON = usesDecodingOrderNumbers
         lock.unlock()
 
         guard !RTPDemuxer.isRTCPPacket(data) else {
@@ -421,7 +467,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         }
 
         do {
-            let packet = try demuxerRef.parsePacket(data)
+            let packet = try RTPDemuxer.parsePacket(data)
             // Only the video payload type is HEVC; audio (101) must not reach
             // the decoder.
             guard packet.payloadType == 100 else {
@@ -438,7 +484,7 @@ public final class VideoStreamManager: @unchecked Sendable {
             let gap = noteVideoPacketAndDetectGap(
                 ssrc: packet.ssrc,
                 sequence: packet.sequenceNumber)
-            if gap.detected, !usesDecodingOrderNumbers {
+            if gap.detected, !usesDON {
                 discardPartialSequentialAccessUnit()
             }
             if gap.shouldRequestRecovery {
@@ -453,108 +499,13 @@ public final class VideoStreamManager: @unchecked Sendable {
                     timestamp: packet.timestamp)
             }
 
-            // Parameter sets are not pictures and may share a DON with a later
-            // IRAP, so apply them immediately. Buffer only VCL units by DON.
-            var orderedVCL: [CompoundHEVCDONReorderBuffer.AccessUnit] = []
-            for unit in demuxed {
-                guard unit.nal.count >= 2 else { continue }
-                let type = (unit.nal[unit.nal.startIndex] >> 1) & 0x3f
-                switch type {
-                case 32: handleParameterSet(nalUnit: unit.nal, type: .vps)
-                case 33: handleParameterSet(nalUnit: unit.nal, type: .sps)
-                case 34: handleParameterSet(nalUnit: unit.nal, type: .pps)
-                case 0...31:
-                    if usesDecodingOrderNumbers {
-                        orderedVCL.append(contentsOf:
-                            enqueueAndDrainReorder([unit]).orderedAccessUnits)
-                    } else {
-                        appendSequentialVCL(unit)
-                    }
-                default: break
-                }
-                if !usesDecodingOrderNumbers, unit.endOfAccessUnit,
-                   let complete = finishSequentialAccessUnit(ssrc: unit.ssrc) {
-                    orderedVCL.append(complete)
-                }
-            }
-
             let nalUnitTypes: [UInt8] = demuxed.compactMap { unit in
                 guard unit.nal.count >= 2 else { return nil }
                 return (unit.nal[unit.nal.startIndex] >> 1) & 0x3f
             }
-            var decodedCount = 0
-            for accessUnit in orderedVCL {
-                let nalUnits = accessUnit.nals.map(\.nal)
-                guard let firstNAL = nalUnits.first, firstNAL.count >= 2 else { continue }
-                let nalType = (firstNAL[firstNAL.startIndex] >> 1) & 0x3F
-                switch nalType {
-                case 32...40: continue
-                default:
-                    // One DON is one band access unit. Preserve all of its VCL
-                    // NALs/slices in a single VideoToolbox sample; submitting
-                    // slices separately renders partial pictures.
-                    // IRAP NAL units (16-21) heal their band; non-IRAP VCL from
-                    // a gated band is dropped (its reference chain is broken —
-                    // decoding it would render macroblocks, not fail).
-                    guard shouldDecodeVCL(nalType: nalType, ssrc: accessUnit.ssrc) else { continue }
-                    logMultiNALAccessUnitIfNeeded(
-                        don: accessUnit.don,
-                        count: nalUnits.count)
-                    // A VCL NAL can beat its parameter sets to the decoder in
-                    // the startup burst (each band's ONLY IRAP is in there —
-                    // dropping one leaves the band dead all session). Buffer
-                    // until the format description exists, then drain in order.
-                    guard let decoderRef = decoderForSource(accessUnit.ssrc) else {
-                        // An IDR can race the asynchronous VT error callback.
-                        // Preserve it while the media queue rebuilds the public
-                        // decoder instead of consuming the only recovery frame.
-                        if isDecoderRecoveryPending {
-                            bufferEarlyVCL(
-                                nals: nalUnits,
-                                ssrc: accessUnit.ssrc,
-                                timestamp: accessUnit.timestamp,
-                                don: accessUnit.don)
-                        }
-                        continue
-                    }
-                    guard decoderRef.isReady else {
-                        bufferEarlyVCL(
-                            nals: nalUnits,
-                            ssrc: accessUnit.ssrc,
-                            timestamp: accessUnit.timestamp,
-                            don: accessUnit.don)
-                        continue
-                    }
-                    let pts = CMTime(
-                        value: nextPresentationTimeValue(),
-                        timescale: HEVCPresentationTimeline.timescale)
-                    let recoveryIDRArmed = armRecoveryIDRIfNeeded(
-                        nalType: nalType,
-                        presentationTime: pts)
-                    do {
-                        try decoderRef.decode(
-                            nalUnits: nalUnits,
-                            presentationTime: pts,
-                            frameTag: accessUnit.ssrc)
-                    } catch HEVCDecoderError.decodeFailed(let status) {
-                        if recoveryIDRArmed {
-                            cancelRecoveryIDR(presentationTime: pts)
-                        }
-                        recordSynchronousDecoderFailure(
-                            status: status,
-                            presentationTime: pts,
-                            ssrc: accessUnit.ssrc)
-                        throw HEVCDecoderError.decodeFailed(status)
-                    } catch {
-                        if recoveryIDRArmed {
-                            cancelRecoveryIDR(presentationTime: pts)
-                        }
-                        throw error
-                    }
-                    recordDecodeSubmission()
-                    decodedCount += 1
-                }
-            }
+            let decodedCount = try submitDemuxedUnits(
+                demuxed,
+                usesDON: usesDON)
 
             return VideoStreamFeedResult(
                 byteCount: data.count, isActive: true,
@@ -573,16 +524,122 @@ public final class VideoStreamManager: @unchecked Sendable {
         }
     }
 
+    private func submitDemuxedUnits(
+        _ demuxed: [RTPDemuxer.DemuxedNAL],
+        usesDON: Bool
+    ) throws -> Int {
+        // Parameter sets are not pictures and may share a DON with a later
+        // IRAP, so apply them immediately. Buffer only VCL units by DON.
+        var orderedVCL: [CompoundHEVCDONReorderBuffer.AccessUnit] = []
+        for unit in demuxed {
+            guard unit.nal.count >= 2 else { continue }
+            let type = (unit.nal[unit.nal.startIndex] >> 1) & 0x3f
+            switch type {
+            case 32: handleParameterSet(nalUnit: unit.nal, type: .vps)
+            case 33: handleParameterSet(nalUnit: unit.nal, type: .sps)
+            case 34: handleParameterSet(nalUnit: unit.nal, type: .pps)
+            case 0...31:
+                if usesDON {
+                    orderedVCL.append(contentsOf:
+                        enqueueAndDrainReorder([unit]).orderedAccessUnits)
+                } else {
+                    appendSequentialVCL(unit)
+                }
+            default: break
+            }
+            if !usesDON, unit.endOfAccessUnit,
+               let complete = finishSequentialAccessUnit(ssrc: unit.ssrc) {
+                orderedVCL.append(complete)
+            }
+        }
+
+        var decodedCount = 0
+        for accessUnit in orderedVCL {
+            let nalUnits = accessUnit.nals.map(\.nal)
+            guard let firstNAL = nalUnits.first, firstNAL.count >= 2 else { continue }
+            let nalType = (firstNAL[firstNAL.startIndex] >> 1) & 0x3F
+            switch nalType {
+            case 32...40: continue
+            default:
+                // One DON is one band access unit. Preserve all of its VCL
+                // NALs/slices in a single VideoToolbox sample; submitting
+                // slices separately renders partial pictures.
+                // IRAP NAL units (16-21) heal their band; non-IRAP VCL from
+                // a gated band is dropped (its reference chain is broken —
+                // decoding it would render macroblocks, not fail).
+                guard shouldDecodeVCL(nalType: nalType, ssrc: accessUnit.ssrc) else { continue }
+                logMultiNALAccessUnitIfNeeded(
+                    don: accessUnit.don,
+                    count: nalUnits.count)
+                // A VCL NAL can beat its parameter sets to the decoder in
+                // the startup burst (each band's ONLY IRAP is in there —
+                // dropping one leaves the band dead all session). Buffer
+                // until the format description exists, then drain in order.
+                guard let decoderRef = decoderForSource(accessUnit.ssrc) else {
+                    // An IDR can race the asynchronous VT error callback.
+                    // Preserve it while the media queue rebuilds the public
+                    // decoder instead of consuming the only recovery frame.
+                    if isDecoderRecoveryPending {
+                        bufferEarlyVCL(
+                            nals: nalUnits,
+                            ssrc: accessUnit.ssrc,
+                            timestamp: accessUnit.timestamp,
+                            don: accessUnit.don)
+                    }
+                    continue
+                }
+                guard decoderRef.isReady else {
+                    bufferEarlyVCL(
+                        nals: nalUnits,
+                        ssrc: accessUnit.ssrc,
+                        timestamp: accessUnit.timestamp,
+                        don: accessUnit.don)
+                    continue
+                }
+                let pts = CMTime(
+                    value: nextPresentationTimeValue(),
+                    timescale: HEVCPresentationTimeline.timescale)
+                let recoveryIDRArmed = armRecoveryIDRIfNeeded(
+                    nalType: nalType,
+                    presentationTime: pts)
+                do {
+                    try decoderRef.decode(
+                        nalUnits: nalUnits,
+                        presentationTime: pts,
+                        frameTag: accessUnit.ssrc)
+                } catch HEVCDecoderError.decodeFailed(let status) {
+                    if recoveryIDRArmed {
+                        cancelRecoveryIDR(presentationTime: pts)
+                    }
+                    recordSynchronousDecoderFailure(
+                        status: status,
+                        presentationTime: pts,
+                        ssrc: accessUnit.ssrc)
+                    throw HEVCDecoderError.decodeFailed(status)
+                } catch {
+                    if recoveryIDRArmed {
+                        cancelRecoveryIDR(presentationTime: pts)
+                    }
+                    throw error
+                }
+                recordDecodeSubmission()
+                decodedCount += 1
+            }
+        }
+        return decodedCount
+    }
+
     /// Track per-SSRC video sequence numbers; on a gap, mark the stream
     /// recovering. Returns true when this is a FRESH loss (no recovery already
     /// in flight), so callers kick off recovery once per loss burst.
     private func noteVideoPacketAndDetectGap(
         ssrc: UInt32,
-        sequence: UInt16
+        sequence: UInt16,
+        nowNanos: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) -> (detected: Bool, shouldRequestRecovery: Bool) {
         lock.lock()
         defer { lock.unlock() }
-        let now = DispatchTime.now().uptimeNanoseconds
+        let now = nowNanos
         let followedLongSilence = lastVideoPacketArrivalNanos[ssrc].map {
             now &- $0 >= 1_000_000_000
         } ?? false
@@ -601,18 +658,20 @@ public final class VideoStreamManager: @unchecked Sendable {
         }
         lossStats.gapsDetected += 1
         guard lossRecoveryEnabled else { return (true, false) }
-        return (true, markLossLocked(affectedSSRC: ssrc))
+        return (true, markLossLocked(affectedSSRC: ssrc, nowNanos: now))
     }
 
     /// Mark a loss (used directly for losses whose SSRC is unknown: parse
     /// errors, DON skips). Returns true when this loss STARTED a recovery.
     @discardableResult
-    private func gateAllBands() -> Bool {
+    private func gateAllBands(
+        nowNanos: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         lossStats.gapsDetected += 1
         guard lossRecoveryEnabled else { return false }
-        return markLossLocked(affectedSSRC: nil)
+        return markLossLocked(affectedSSRC: nil, nowNanos: nowNanos)
     }
 
     /// Record a loss under `lock`; returns true when no recovery was in flight.
@@ -630,8 +689,9 @@ public final class VideoStreamManager: @unchecked Sendable {
             awaitingIRAP.formUnion(seenVideoSSRCs)
             if let affectedSSRC { awaitingIRAP.insert(affectedSSRC) }
         } else {
+            let elapsed = now >= lastLossNanos ? now - lastLossNanos : 0
             fresh = lastLossNanos == 0
-                || now &- lastLossNanos >= lossRecoveryRequestCooldownNanos
+                || elapsed >= lossRecoveryRequestCooldownNanos
         }
         // Do not let a continuous cluster of per-band gaps postpone recovery
         // forever. Once one request is sent, the next request becomes eligible
