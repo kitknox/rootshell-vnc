@@ -73,10 +73,18 @@ public final class VideoBandLayerRenderer {
     /// Called after a complete stitched surface has been committed. Consumers
     /// such as one-shot Vision analysis can inspect the exact full image
     /// without adding a second compositor or touching individual HEVC bands.
+    /// The buffer has the same variable pixel format as `latestComposedFrame`.
     var onFrameCommitted: ((CVPixelBuffer, UInt64) -> Void)?
 
     /// The last complete surface sent to the display: nil before the first
     /// frame and after a reset. For host snapshots; read only.
+    ///
+    /// The pixel format is not fixed. Stitched bands are `32BGRA`, but a
+    /// single picture that already matches the desktop is the decoder's own
+    /// surface, presented without a copy: bi-planar YCbCr such as `444f` or
+    /// `420v`. Read it through an API that honors the buffer's format and
+    /// color attachments (`CIImage(cvPixelBuffer:)`, Vision, VideoToolbox);
+    /// never treat the base address as packed BGRA.
     public var latestComposedFrame: CVPixelBuffer? { displayedBuffer }
 
     var renderedBandCount: Int { bandBuffers.count }
@@ -356,7 +364,10 @@ public final class VideoBandLayerRenderer {
                 bands: bandBuffers,
                 width: width,
                 height: height,
-                centersSinglePicture: centersSinglePicture) else { return }
+                centersSinglePicture: centersSinglePicture,
+                // This runs on the main thread: never compile shaders here or
+                // wait for the composite queue to finish compiling them.
+                metalSetup: .background) else { return }
         commitDisplayFrame(frame)
     }
 

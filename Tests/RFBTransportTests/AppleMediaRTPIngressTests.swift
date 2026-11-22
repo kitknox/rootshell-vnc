@@ -32,6 +32,77 @@ final class AppleMediaRTPIngressTests: XCTestCase {
         XCTAssertEqual(received.values, [Data([1]), Data([2])])
     }
 
+    /// A repeated stream offer: the owner's sink for the previous stream is
+    /// detached as the offer is published, and the new stream's first packets
+    /// wait for the replacement sink instead of reaching the retired one.
+    func testOfferScopedBatchSinkIsRetiredAndPacketsWaitForItsReplacement() {
+        let previous = LockedPackets()
+        let replacement = LockedPackets()
+        var handoff = AppleMediaPacketHandoff(maximumPackets: 8, maximumBytes: 128)
+
+        _ = handoff.installBatchSink(
+            { packets in packets.forEach { previous.append($0.data) } },
+            retiresOnStreamOffer: true)
+        XCTAssertEqual(handoff.deliver(Data([1])), .delivered)
+
+        XCTAssertTrue(handoff.retireOfferScopedSink())
+        XCTAssertFalse(handoff.retireOfferScopedSink(), "Nothing is left to retire")
+        XCTAssertEqual(handoff.deliver(Data([2])), .buffered)
+        XCTAssertEqual(handoff.deliverBatch([(Data([3]), nil)]), .buffered)
+
+        let drained = handoff.installBatchSink(
+            { packets in packets.forEach { replacement.append($0.data) } },
+            retiresOnStreamOffer: true)
+        XCTAssertEqual(drained.packetCount, 2)
+        XCTAssertEqual(handoff.deliver(Data([4])), .delivered)
+
+        XCTAssertEqual(previous.values, [Data([1])])
+        XCTAssertEqual(replacement.values, [Data([2]), Data([3]), Data([4])])
+    }
+
+    func testSinkNotScopedToAnOfferStaysAttachedAcrossOffers() {
+        let received = LockedPackets()
+        var handoff = AppleMediaPacketHandoff(maximumPackets: 8, maximumBytes: 128)
+
+        _ = handoff.installBatchSink { packets in packets.forEach { received.append($0.data) } }
+        XCTAssertFalse(handoff.retireOfferScopedSink())
+        XCTAssertEqual(handoff.deliver(Data([1])), .delivered)
+
+        _ = handoff.installSink { packet, _ in received.append(packet) }
+        XCTAssertFalse(handoff.retireOfferScopedSink())
+        XCTAssertEqual(handoff.deliver(Data([2])), .delivered)
+        XCTAssertEqual(received.values, [Data([1]), Data([2])])
+    }
+
+    /// An overflow belongs to the buffering interval it happened in. It is
+    /// reported once, to the sink that receives the truncated backlog, and not
+    /// again to sinks installed after later intervals that lost nothing.
+    func testOverflowIsReportedOnceToTheSinkThatDrainsIt() {
+        var handoff = AppleMediaPacketHandoff(maximumPackets: 2, maximumBytes: 16)
+        XCTAssertEqual(handoff.deliver(Data([1])), .buffered)
+        XCTAssertEqual(handoff.deliver(Data([2])), .buffered)
+        XCTAssertEqual(handoff.deliver(Data([3])), .overflow)
+
+        // Detaching drains nothing and must not use up the report.
+        let detached = handoff.installBatchSink(nil)
+        XCTAssertFalse(detached.overflowed)
+        XCTAssertEqual(detached.droppedPacketCount, 0)
+
+        let first = handoff.installBatchSink({ _ in }, retiresOnStreamOffer: true)
+        XCTAssertTrue(first.overflowed)
+        XCTAssertEqual(first.droppedPacketCount, 1)
+        XCTAssertEqual(first.packetCount, 2)
+
+        // The next offer buffers within bounds.
+        XCTAssertTrue(handoff.retireOfferScopedSink())
+        XCTAssertEqual(handoff.deliver(Data([4])), .buffered)
+        let second = handoff.installBatchSink({ _ in }, retiresOnStreamOffer: true)
+        XCTAssertEqual(second.packetCount, 1)
+        XCTAssertFalse(second.overflowed)
+        XCTAssertEqual(second.droppedPacketCount, 0)
+        XCTAssertFalse(handoff.overflowed)
+    }
+
     func testHandoffPreservesDisplayRouteAcrossStartupDrain() {
         let received = LockedRoutedPackets()
         var handoff = AppleMediaPacketHandoff(maximumPackets: 8, maximumBytes: 128)

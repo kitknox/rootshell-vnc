@@ -37,13 +37,43 @@ struct BoundedRTPSequenceHistory {
 /// during high-bitrate HEVC bursts.
 final class AppleMediaSRTPDecryptor: @unchecked Sendable {
     enum DecryptedItem: Sendable {
+        /// `wire` is the protected datagram `rtp` was recovered from. It stays
+        /// with the item so the session can authenticate the packet again if
+        /// `context` was replaced while the batch waited for the actor.
         case decrypted(
             rtp: Data,
-            wireByteCount: Int,
+            wire: Data,
             ssrc: UInt32,
             context: AppleSRTPContext,
             arrivalNanos: UInt64)
         case raw(datagram: Data, arrivalNanos: UInt64)
+    }
+
+    /// What the session does with a packet that was authenticated off-actor.
+    enum Disposition: Equatable, Sendable {
+        /// The authenticating context is still active: deliver the packet.
+        case accept
+        /// The authenticating context was replaced while the batch was in
+        /// flight. Offer the wire datagram to the current contexts, which
+        /// reject it if the keys really changed.
+        case reauthenticate
+        /// The session holds no contexts: the keys that authenticated this
+        /// packet were retired by a renegotiation or teardown.
+        case drop
+    }
+
+    /// Decide whether a packet authenticated under `batchGeneration` is still
+    /// valid for the session's active SRTP state. A matching generation means
+    /// the batch was decrypted with exactly `activeContexts`.
+    static func disposition(
+        ofPacketAuthenticatedBy context: AppleSRTPContext,
+        batchGeneration: UInt64,
+        activeGeneration: UInt64,
+        activeContexts: [AppleSRTPContext]
+    ) -> Disposition {
+        if batchGeneration == activeGeneration { return .accept }
+        if activeContexts.contains(where: { $0 === context }) { return .accept }
+        return activeContexts.isEmpty ? .drop : .reauthenticate
     }
 
     struct DecryptedBatch: Sendable {
@@ -132,7 +162,7 @@ final class AppleMediaSRTPDecryptor: @unchecked Sendable {
                let packet = try? cached.unprotect(data) {
                 items.append(.decrypted(
                     rtp: packet,
-                    wireByteCount: data.count,
+                    wire: data,
                     ssrc: ssrc,
                     context: cached,
                     arrivalNanos: datagram.arrivalNanos))
@@ -146,7 +176,7 @@ final class AppleMediaSRTPDecryptor: @unchecked Sendable {
                     newlyBound.append((ssrc, context))
                     items.append(.decrypted(
                         rtp: packet,
-                        wireByteCount: data.count,
+                        wire: data,
                         ssrc: ssrc,
                         context: context,
                         arrivalNanos: datagram.arrivalNanos))
@@ -170,6 +200,45 @@ final class AppleMediaSRTPDecryptor: @unchecked Sendable {
         }
 
         return DecryptedBatch(generation: activeGeneration, items: items)
+    }
+}
+
+/// The session's SRTP receive contexts, by media key.
+///
+/// A context carries each source's rollover counter, which only the packets
+/// it has seen can establish: a replacement built from the same key starts at
+/// zero and rejects every packet of a source that has already wrapped its
+/// 16-bit sequence number, permanently. A negotiation rebuilds the session's
+/// SRTP state with unchanged keys after the stream answer, and RTP sequences
+/// start at a random value, so that wrap can fall inside the startup burst.
+/// Rebuilding through this store keeps the context for an unchanged key and
+/// creates one only for a key it has not seen.
+struct AppleMediaSRTPReceiveContextStore {
+    private var active: [Data: AppleSRTPContext] = [:]
+    private var previous: [Data: AppleSRTPContext] = [:]
+
+    /// Start a rebuild: contexts become reusable by key, and any not asked
+    /// for again before `finishRebuild()` are retired.
+    mutating func beginRebuild() {
+        previous = active
+        active.removeAll(keepingCapacity: true)
+    }
+
+    mutating func context(forMediaKey key: Data) throws -> AppleSRTPContext {
+        if let context = active[key] { return context }
+        let context = try previous[key] ?? AppleSRTPContext(mediaKey: key)
+        active[key] = context
+        return context
+    }
+
+    mutating func finishRebuild() {
+        previous.removeAll(keepingCapacity: false)
+    }
+
+    /// Retire every context: the keys themselves are being replaced.
+    mutating func removeAll() {
+        active.removeAll(keepingCapacity: false)
+        previous.removeAll(keepingCapacity: false)
     }
 }
 
@@ -200,6 +269,9 @@ struct AppleMediaPacketHandoff {
     private let maximumBytes: Int
     private var sink: Sink?
     private var batchSink: BatchSink?
+    /// The installed batch sink serves one stream offer; see
+    /// `retireOfferScopedSink()`.
+    private var batchSinkRetiresOnStreamOffer = false
     private var pending: [(data: Data, displayIndex: Int?)] = []
     private var pendingBytes = 0
     private(set) var overflowed = false
@@ -266,13 +338,16 @@ struct AppleMediaPacketHandoff {
 
     mutating func installSink(_ newSink: Sink?) -> DrainResult {
         batchSink = nil
+        batchSinkRetiresOnStreamOffer = false
         sink = newSink
         guard let newSink else {
+            // Nothing is drained, so nothing is reported: an overflow stays
+            // on record for the sink that receives the truncated backlog.
             return DrainResult(
                 packetCount: 0,
                 byteCount: 0,
-                overflowed: overflowed,
-                droppedPacketCount: droppedPacketCount)
+                overflowed: false,
+                droppedPacketCount: 0)
         }
 
         let packets = pending
@@ -282,22 +357,24 @@ struct AppleMediaPacketHandoff {
         for packet in packets {
             newSink(packet.data, packet.displayIndex)
         }
-        return DrainResult(
-            packetCount: packets.count,
-            byteCount: bytes,
-            overflowed: overflowed,
-            droppedPacketCount: droppedPacketCount)
+        return takeDrainResult(packetCount: packets.count, byteCount: bytes)
     }
 
-    mutating func installBatchSink(_ newSink: BatchSink?) -> DrainResult {
+    mutating func installBatchSink(
+        _ newSink: BatchSink?,
+        retiresOnStreamOffer: Bool = false
+    ) -> DrainResult {
         sink = nil
         batchSink = newSink
+        batchSinkRetiresOnStreamOffer = newSink != nil && retiresOnStreamOffer
         guard let newSink else {
+            // Nothing is drained, so nothing is reported: an overflow stays
+            // on record for the sink that receives the truncated backlog.
             return DrainResult(
                 packetCount: 0,
                 byteCount: 0,
-                overflowed: overflowed,
-                droppedPacketCount: droppedPacketCount)
+                overflowed: false,
+                droppedPacketCount: 0)
         }
 
         let packets = pending
@@ -307,16 +384,42 @@ struct AppleMediaPacketHandoff {
         if !packets.isEmpty {
             newSink(packets)
         }
+        return takeDrainResult(packetCount: packets.count, byteCount: bytes)
+    }
+
+    /// Report a drain and close the buffering interval it ended. The overflow
+    /// record describes that interval only: left set, every later sink
+    /// installation would report the same loss again and trigger recovery for
+    /// a stream that lost nothing.
+    private mutating func takeDrainResult(packetCount: Int, byteCount: Int) -> DrainResult {
+        defer {
+            overflowed = false
+            droppedPacketCount = 0
+        }
         return DrainResult(
-            packetCount: packets.count,
-            byteCount: bytes,
+            packetCount: packetCount,
+            byteCount: byteCount,
             overflowed: overflowed,
             droppedPacketCount: droppedPacketCount)
+    }
+
+    /// Detach a sink that was installed for a single stream offer, because
+    /// the next offer is being published. Its owner rebuilds its decoder for
+    /// that offer before installing a replacement; until then packets are
+    /// held here in order, exactly as before the first sink existed, instead
+    /// of reaching a sink whose stream is about to be retired. Returns false,
+    /// changing nothing, for a sink that was not installed that way.
+    mutating func retireOfferScopedSink() -> Bool {
+        guard batchSinkRetiresOnStreamOffer else { return false }
+        batchSink = nil
+        batchSinkRetiresOnStreamOffer = false
+        return true
     }
 
     mutating func reset() {
         sink = nil
         batchSink = nil
+        batchSinkRetiresOnStreamOffer = false
         pending.removeAll(keepingCapacity: false)
         pendingBytes = 0
         overflowed = false

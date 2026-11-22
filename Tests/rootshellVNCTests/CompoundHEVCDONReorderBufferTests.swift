@@ -141,7 +141,8 @@ final class CompoundHEVCDONReorderBufferTests: XCTestCase {
             VideoFrameGeometry(
                 width: 3808,
                 height: 2380,
-                mediaGeneration: 2))
+                mediaGeneration: 2,
+                streamGeneration: connectionGeneration))
         XCTAssertEqual(manager.frameGeometrySnapshot.width, 3808)
         XCTAssertEqual(manager.frameGeometrySnapshot.height, 2380)
         XCTAssertEqual(manager.frameGeometrySnapshot.codedBandHeight, 2380)

@@ -1,6 +1,7 @@
 import CoreGraphics
 import CoreImage
 import CoreMedia
+import CoreText
 import CoreVideo
 import Foundation
 import XCTest
@@ -117,7 +118,215 @@ final class HighPerformanceOptimizationTests: XCTestCase {
         return (Int(p[0]), Int(p[1]), Int(p[2]), Int(p[3]))
     }
 
+    private struct UncheckedSendable<Value>: @unchecked Sendable {
+        let value: Value
+    }
+
+    private final class LockedValue<Value>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: Value?
+        func set(_ value: Value?) { lock.lock(); stored = value; lock.unlock() }
+        var value: Value? { lock.lock(); defer { lock.unlock() }; return stored }
+    }
+
+    private final class LockedCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+        func increment() { lock.lock(); value += 1; lock.unlock() }
+        var count: Int { lock.lock(); defer { lock.unlock() }; return value }
+    }
+
+    /// Service the main run loop (and with it the main dispatch queue) until
+    /// `condition` holds. Waiting on the condition itself keeps a slow machine
+    /// from failing a test that a fixed delay would have cut short.
+    @MainActor
+    private func spinMainRunLoop(
+        timeout: TimeInterval = 10,
+        until condition: () -> Bool
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            guard Date() < deadline else { return false }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.002))
+        }
+        return true
+    }
+
+    private func waitForParkedReceivers(
+        _ count: Int,
+        on channel: PosixUDPChannel,
+        timeout: Duration = .seconds(10)
+    ) async throws {
+        let deadline = ContinuousClock.now + timeout
+        while channel.receiveWaiterCountForTesting < count {
+            guard ContinuousClock.now < deadline else {
+                XCTFail("Timed out waiting for \(count) parked receivers")
+                return
+            }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+    }
+
+    /// V=2, PT=100, SSRC=0x12345678, 2-byte non-VCL payload (AUD type 35).
+    private func makeNonVCLVideoRTP(sequence: UInt16) -> Data {
+        Data([
+            0x80, 100,
+            UInt8(sequence >> 8), UInt8(sequence & 0xff),
+            0x00, 0x00, 0x00, 0x01,
+            0x12, 0x34, 0x56, 0x78,
+            0x46, 0x01,
+        ])
+    }
+
+    /// A dark screen with one centered "Enter Password" line, the phrase the
+    /// login detector treats as conclusive.
+    private func makeLoginPromptBGRA(width: Int, height: Int) throws -> CVPixelBuffer {
+        let buffer = try makeIOSurfaceBGRA(width: width, height: height) { _, _ in (76, 26, 26, 255) }
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        let context = try XCTUnwrap(CGContext(
+            data: CVPixelBufferGetBaseAddress(buffer),
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+            space: try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB)),
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                | CGBitmapInfo.byteOrder32Little.rawValue))
+        let font = CTFontCreateWithName("Helvetica" as CFString, CGFloat(height) / 11, nil)
+        let line = CTLineCreateWithAttributedString(NSAttributedString(
+            string: "Enter Password",
+            attributes: [
+                NSAttributedString.Key(kCTFontAttributeName as String): font,
+                NSAttributedString.Key(kCTForegroundColorAttributeName as String):
+                    CGColor(red: 1, green: 1, blue: 1, alpha: 1),
+            ]))
+        let bounds = CTLineGetBoundsWithOptions(line, [])
+        context.textPosition = CGPoint(
+            x: (CGFloat(width) - bounds.width) / 2,
+            y: CGFloat(height) * 0.45)
+        CTLineDraw(line, context)
+        return buffer
+    }
+
     // MARK: - VideoBandCompositor Tests
+
+    /// The main thread resets the compositor on every disconnect and composes
+    /// synchronously when a prepared frame cannot be used. Neither may wait
+    /// for the composite queue's first-use shader compilation.
+    func testCompositorResetAndBackgroundSetupComposeDoNotWaitForShaderCompilation() throws {
+        let compilationEntered = DispatchSemaphore(value: 0)
+        let releaseCompilation = DispatchSemaphore(value: 0)
+        let compositor = VideoBandCompositor(metalSetupWillBeginForTesting: {
+            compilationEntered.signal()
+            releaseCompilation.wait()
+        })
+        let bands = UncheckedSendable(value: [
+            UInt32(1): try makeIOSurfaceBGRA(width: 32, height: 16) { _, _ in (0, 0, 255, 255) },
+            UInt32(2): try makeIOSurfaceBGRA(width: 32, height: 16) { _, _ in (0, 255, 0, 255) },
+        ])
+
+        // The composite queue's first multi-band frame starts compiling.
+        let compilingFrame = LockedValue<UncheckedSendable<CVPixelBuffer>>()
+        let compilingComposeReturned = expectation(description: "blocking compose returned")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let frame = compositor.compose(bands: bands.value, width: 32, height: 32)
+            compilingFrame.set(frame.map(UncheckedSendable.init(value:)))
+            compilingComposeReturned.fulfill()
+        }
+        XCTAssertEqual(compilationEntered.wait(timeout: .now() + 10), .success)
+
+        // While it is held there, do what the main thread does.
+        let promptFrame = LockedValue<UncheckedSendable<CVPixelBuffer>>()
+        let promptWorkReturned = expectation(description: "reset and non-blocking compose returned")
+        DispatchQueue.global(qos: .userInitiated).async {
+            compositor.reset()
+            let frame = compositor.compose(
+                bands: bands.value,
+                width: 32,
+                height: 32,
+                metalSetup: .background)
+            promptFrame.set(frame.map(UncheckedSendable.init(value:)))
+            promptWorkReturned.fulfill()
+        }
+        wait(for: [promptWorkReturned], timeout: 10)
+        releaseCompilation.signal()
+        wait(for: [compilingComposeReturned], timeout: 30)
+
+        for (label, frame) in [("non-blocking", promptFrame.value), ("blocking", compilingFrame.value)] {
+            let composed = try XCTUnwrap(frame?.value, "\(label) compose produced no frame")
+            let top = try readBGRAPixel(composed, x: 4, y: 4)
+            let bottom = try readBGRAPixel(composed, x: 4, y: 20)
+            XCTAssertGreaterThan(top.r, 200, label)
+            XCTAssertLessThan(top.g, 50, label)
+            XCTAssertGreaterThan(bottom.g, 200, label)
+            XCTAssertLessThan(bottom.r, 50, label)
+        }
+    }
+
+    func testCompositorBackgroundSetupComposesImmediatelyAndStartsMetalSetup() throws {
+        let compositor = VideoBandCompositor()
+        let bands: [UInt32: CVPixelBuffer] = [
+            1: try makeIOSurfaceBGRA(width: 32, height: 16) { _, _ in (0, 0, 255, 255) },
+            2: try makeIOSurfaceBGRA(width: 32, height: 16) { _, _ in (0, 255, 0, 255) },
+        ]
+        let frame = try XCTUnwrap(compositor.compose(
+            bands: bands,
+            width: 32,
+            height: 32,
+            metalSetup: .background))
+        XCTAssertGreaterThan(try readBGRAPixel(frame, x: 4, y: 4).r, 200)
+        XCTAssertGreaterThan(try readBGRAPixel(frame, x: 4, y: 20).g, 200)
+        XCTAssertTrue(
+            compositor.isMetalInitializedForTesting,
+            "A non-blocking compose must start Metal setup so later frames can use it")
+    }
+
+    /// One-tile High Performance presents the decoder's own YCbCr surface, and
+    /// that surface is what the login-window detector is handed.
+    func testLoginDetectorReadsNativeYCbCrSingleTileFrames() throws {
+        let width = 1280
+        let height = 720
+        let prompt = try makeLoginPromptBGRA(width: width, height: height)
+        // Skip only when Vision itself cannot run here. A control frame that
+        // is read but not recognized as a login prompt is a failure.
+        let control: AppleLoginTextAnalysis
+        do {
+            control = try AppleLoginScreenDetector.recognize(pixelBuffer: prompt)
+        } catch {
+            throw XCTSkip("Vision text recognition is unavailable here: \(error)")
+        }
+        XCTAssertTrue(
+            control.isLoginScreen,
+            "BGRA control frame was not recognized as a login prompt: \(control.evidence)")
+
+        let converter = CIContext(options: [.cacheIntermediates: false])
+        let formats: [(name: String, type: OSType)] = [
+            ("444f", kCVPixelFormatType_444YpCbCr8BiPlanarFullRange),
+            ("420f", kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+            ("420v", kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+        ]
+        for format in formats {
+            let native = try makeBiPlanarYCbCr(
+                width: width,
+                height: height,
+                format: format.type,
+                luma: 0,
+                cb: 128,
+                cr: 128)
+            converter.render(CIImage(cvPixelBuffer: prompt), to: native)
+
+            let presented = try XCTUnwrap(VideoBandCompositor().compose(
+                bands: [1: native],
+                width: width,
+                height: height))
+            XCTAssertTrue(presented === native, "\(format.name) must be presented without a copy")
+            let analysis = try AppleLoginScreenDetector.recognize(pixelBuffer: presented)
+            XCTAssertTrue(
+                analysis.isLoginScreen,
+                "Login prompt not recognized in a native \(format.name) frame: \(analysis.evidence)")
+        }
+    }
 
     func testCompositorResetDoesNotCompileMetalShadersWhenUnused() {
         let compositor = VideoBandCompositor()
@@ -203,8 +412,9 @@ final class HighPerformanceOptimizationTests: XCTestCase {
             XCTAssertLessThanOrEqual(abs(botMetal.b - botCI.b), 2)
         }
 
-        // Also verify color-managed visual equivalence when source transfer is Rec.709
-        // (Metal preserves native Rec.709 transfer + attachment; Core Image converts to sRGB).
+        // Also verify equivalence when the source transfer is Rec.709. Both paths
+        // keep the native Rec.709 values and attachment, so the frames must match
+        // as stored and once color-managed into sRGB.
         let rec709Band0 = try makeBiPlanarYCbCr(
             width: 32,
             height: 16,
@@ -237,11 +447,26 @@ final class HighPerformanceOptimizationTests: XCTestCase {
             to: metalRenderedToSRGB,
             bounds: CGRect(x: 0, y: 0, width: 32, height: 32),
             colorSpace: srgb)
+        let ciRenderedToSRGB = try makeIOSurfaceBGRA(width: 32, height: 32) { _, _ in (0, 0, 0, 0) }
+        ciContext.render(
+            CIImage(cvPixelBuffer: ciRec709),
+            to: ciRenderedToSRGB,
+            bounds: CGRect(x: 0, y: 0, width: 32, height: 32),
+            colorSpace: srgb)
         let visualMetal = try readBGRAPixel(metalRenderedToSRGB, x: 16, y: 8)
-        let visualCI = try readBGRAPixel(ciRec709, x: 16, y: 8)
+        let visualCI = try readBGRAPixel(ciRenderedToSRGB, x: 16, y: 8)
         XCTAssertLessThanOrEqual(abs(visualMetal.r - visualCI.r), 2)
         XCTAssertLessThanOrEqual(abs(visualMetal.g - visualCI.g), 2)
         XCTAssertLessThanOrEqual(abs(visualMetal.b - visualCI.b), 2)
+
+        let storedMetal = try readBGRAPixel(metalRec709, x: 16, y: 8)
+        let storedCI = try readBGRAPixel(ciRec709, x: 16, y: 8)
+        XCTAssertLessThanOrEqual(abs(storedMetal.r - storedCI.r), 2)
+        XCTAssertLessThanOrEqual(abs(storedMetal.g - storedCI.g), 2)
+        XCTAssertLessThanOrEqual(abs(storedMetal.b - storedCI.b), 2)
+        XCTAssertEqual(
+            CVBufferCopyAttachment(ciRec709, kCVImageBufferTransferFunctionKey, nil) as? String,
+            CVBufferCopyAttachment(metalRec709, kCVImageBufferTransferFunctionKey, nil) as? String)
     }
 
     func testMetalCompositorPreservesDisplayP3PrimariesAcrossStitchedBands() throws {
@@ -276,6 +501,99 @@ final class HighPerformanceOptimizationTests: XCTestCase {
         let transfer = CVBufferCopyAttachment(stitched, kCVImageBufferTransferFunctionKey, nil) as? String
         XCTAssertEqual(primaries, kCVImageBufferColorPrimaries_P3_D65 as String)
         XCTAssertEqual(transfer, kCVImageBufferTransferFunction_sRGB as String)
+    }
+
+    /// The main thread composes with Core Image until the Metal pipelines are
+    /// ready. On a static desktop that first frame can stay up indefinitely,
+    /// so it has to carry the same pixels and color tags Metal would produce.
+    func testCoreImageFallbackMatchesMetalForWideGamutBands() throws {
+        let compositor = VideoBandCompositor()
+        guard compositor.isMetalAvailable else {
+            throw XCTSkip("Metal unavailable in this environment")
+        }
+
+        // Saturated values that lie outside sRGB once read as Display P3.
+        func band(cb: UInt8, cr: UInt8) throws -> CVPixelBuffer {
+            try makeBiPlanarYCbCr(
+                width: 32,
+                height: 16,
+                format: kCVPixelFormatType_444YpCbCr8BiPlanarFullRange,
+                ycbcrMatrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                primaries: kCVImageBufferColorPrimaries_P3_D65,
+                transfer: kCVImageBufferTransferFunction_sRGB,
+                luma: 110,
+                cb: cb,
+                cr: cr)
+        }
+        let bands: [UInt32: CVPixelBuffer] = [1: try band(cb: 90, cr: 235), 2: try band(cb: 235, cr: 90)]
+
+        let metal = try XCTUnwrap(compositor.compose(bands: bands, width: 32, height: 32))
+        let coreImage = try XCTUnwrap(compositor.composeWithCoreImageForTesting(
+            bands: bands,
+            width: 32,
+            height: 32))
+
+        for key in [kCVImageBufferColorPrimariesKey, kCVImageBufferTransferFunctionKey] {
+            XCTAssertEqual(
+                CVBufferCopyAttachment(coreImage, key, nil) as? String,
+                CVBufferCopyAttachment(metal, key, nil) as? String,
+                "Core Image frame must carry the same \(key) as the Metal frame")
+        }
+        for y in [4, 20] {
+            let expected = try readBGRAPixel(metal, x: 8, y: y)
+            let actual = try readBGRAPixel(coreImage, x: 8, y: y)
+            XCTAssertEqual(actual.r, expected.r, accuracy: 3, "row \(y) red")
+            XCTAssertEqual(actual.g, expected.g, accuracy: 3, "row \(y) green")
+            XCTAssertEqual(actual.b, expected.b, accuracy: 3, "row \(y) blue")
+        }
+    }
+
+    /// BGRA bands carry no YCbCr matrix, which Core Video wants before it will
+    /// describe a buffer's color space. The fallback must not need one.
+    func testCoreImageFallbackMatchesMetalForWideGamutBGRABands() throws {
+        let compositor = VideoBandCompositor()
+        guard compositor.isMetalAvailable else {
+            throw XCTSkip("Metal unavailable in this environment")
+        }
+
+        func band(_ color: (b: UInt8, g: UInt8, r: UInt8)) throws -> CVPixelBuffer {
+            let buffer = try makeIOSurfaceBGRA(width: 32, height: 16) { _, _ in
+                (color.b, color.g, color.r, 255)
+            }
+            CVBufferSetAttachment(
+                buffer,
+                kCVImageBufferColorPrimariesKey,
+                kCVImageBufferColorPrimaries_P3_D65,
+                .shouldPropagate)
+            CVBufferSetAttachment(
+                buffer,
+                kCVImageBufferTransferFunctionKey,
+                kCVImageBufferTransferFunction_sRGB,
+                .shouldPropagate)
+            return buffer
+        }
+        // Fully saturated Display P3 primaries, outside the sRGB gamut.
+        let bands: [UInt32: CVPixelBuffer] = [1: try band((0, 0, 255)), 2: try band((0, 255, 0))]
+
+        let metal = try XCTUnwrap(compositor.compose(bands: bands, width: 32, height: 32))
+        let coreImage = try XCTUnwrap(compositor.composeWithCoreImageForTesting(
+            bands: bands,
+            width: 32,
+            height: 32))
+
+        for key in [kCVImageBufferColorPrimariesKey, kCVImageBufferTransferFunctionKey] {
+            XCTAssertEqual(
+                CVBufferCopyAttachment(coreImage, key, nil) as? String,
+                CVBufferCopyAttachment(metal, key, nil) as? String,
+                "Core Image frame must carry the same \(key) as the Metal frame")
+        }
+        for y in [4, 20] {
+            let expected = try readBGRAPixel(metal, x: 8, y: y)
+            let actual = try readBGRAPixel(coreImage, x: 8, y: y)
+            XCTAssertEqual(actual.r, expected.r, accuracy: 3, "row \(y) red")
+            XCTAssertEqual(actual.g, expected.g, accuracy: 3, "row \(y) green")
+            XCTAssertEqual(actual.b, expected.b, accuracy: 3, "row \(y) blue")
+        }
     }
 
     func testMetalCompositorPreservesExplicitGammaLevelAndMatchesCoreImage() throws {
@@ -549,6 +867,237 @@ final class HighPerformanceOptimizationTests: XCTestCase {
             "Error + sequence gap in the same RTP batch must respect loss recovery cooldown")
     }
 
+    /// `stopStream()` arrives between two packets of a batch. The loss callback
+    /// runs at exactly such a point: after its packet, with no lock held.
+    func testFeedRTPBatchStopsFeedingAStreamStoppedMidBatch() {
+        let manager = VideoStreamManager()
+        let lossCallbacks = LockedCounter()
+        manager.onLossDetected = { [weak manager] _ in
+            lossCallbacks.increment()
+            manager?.stopStream()
+        }
+        manager.startStream(
+            streamID: 1,
+            width: 64,
+            height: 64,
+            usesDecodingOrderNumbers: false,
+            numberOfTiles: 1) { _, _ in }
+
+        // 1 -> 3 is a gap and stops the stream; 10 -> 20 is another gap that
+        // only a batch still feeding the stopped stream would notice.
+        manager.feedRTPBatch([1, 3, 10, 20].map(makeNonVCLVideoRTP(sequence:)))
+
+        XCTAssertFalse(manager.isStreamActive)
+        XCTAssertEqual(
+            lossCallbacks.count,
+            1,
+            "A stopped stream must not request recovery for the rest of its batch")
+        XCTAssertEqual(
+            manager.lossStatsSnapshot.gapsDetected,
+            0,
+            "The rest of the batch must not touch state reset by stopStream()")
+    }
+
+    func testFeedRTPBatchDoesNotLeakARetiredBatchIntoARestartedStream() {
+        let manager = VideoStreamManager()
+        let lossCallbacks = LockedCounter()
+        manager.onLossDetected = { [weak manager] _ in
+            lossCallbacks.increment()
+            manager?.startStream(
+                streamID: 2,
+                width: 64,
+                height: 64,
+                usesDecodingOrderNumbers: false,
+                numberOfTiles: 1) { _, _ in }
+        }
+        manager.startStream(
+            streamID: 1,
+            width: 64,
+            height: 64,
+            usesDecodingOrderNumbers: false,
+            numberOfTiles: 1) { _, _ in }
+        defer { manager.stopStream() }
+
+        manager.feedRTPBatch([1, 3, 10, 20].map(makeNonVCLVideoRTP(sequence:)))
+
+        XCTAssertTrue(manager.isStreamActive)
+        XCTAssertEqual(
+            lossCallbacks.count,
+            1,
+            "The retired stream's packets must not raise losses on its replacement")
+        XCTAssertEqual(
+            manager.lossStatsSnapshot.gapsDetected,
+            0,
+            "The replacement stream must start with clean loss state")
+    }
+
+    /// A restart from another thread must not land in the middle of a packet,
+    /// between the stream check and the parameter-set or decoder updates that
+    /// follow it. Hold a packet in flight and require the restart to wait.
+    func testStreamRestartWaitsForThePacketInFlight() {
+        let manager = VideoStreamManager()
+        let packetHeld = DispatchSemaphore(value: 0)
+        let releasePacket = DispatchSemaphore(value: 0)
+        let restartReturned = DispatchSemaphore(value: 0)
+        let packetsSeen = LockedCounter()
+        manager.packetInFlightHookForTesting = {
+            packetsSeen.increment()
+            guard packetsSeen.count == 1 else { return }
+            packetHeld.signal()
+            releasePacket.wait()
+        }
+        manager.startStream(
+            streamID: 1,
+            width: 64,
+            height: 64,
+            usesDecodingOrderNumbers: false,
+            numberOfTiles: 1) { _, _ in }
+        defer { manager.stopStream() }
+
+        let fed = expectation(description: "batch fed")
+        let packets = [1, 3, 10, 20].map(makeNonVCLVideoRTP(sequence:))
+        DispatchQueue.global(qos: .userInitiated).async {
+            manager.feedRTPBatch(packets)
+            fed.fulfill()
+        }
+        XCTAssertEqual(packetHeld.wait(timeout: .now() + 10), .success)
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            manager.startStream(
+                streamID: 2,
+                width: 64,
+                height: 64,
+                usesDecodingOrderNumbers: false,
+                numberOfTiles: 1) { _, _ in }
+            restartReturned.signal()
+        }
+        XCTAssertEqual(
+            restartReturned.wait(timeout: .now() + 0.3),
+            .timedOut,
+            "startStream must not replace the stream while a packet is being processed")
+
+        releasePacket.signal()
+        XCTAssertEqual(restartReturned.wait(timeout: .now() + 10), .success)
+        wait(for: [fed], timeout: 10)
+
+        XCTAssertTrue(manager.isStreamActive)
+        XCTAssertEqual(
+            manager.lossStatsSnapshot.gapsDetected,
+            0,
+            "The retired batch must not reach the replacement stream")
+    }
+
+    /// Owner callbacks run with no lock held, so a handler may hand the stop
+    /// to another thread and wait for it, as one dispatching synchronously to
+    /// the main queue would. The stop is dispatched asynchronously so that it
+    /// really runs on a different thread from the one feeding packets.
+    func testLossCallbackMayStopTheStreamOnAnotherThreadAndWait() {
+        let manager = VideoStreamManager()
+        let lossCallbacks = LockedCounter()
+        let stopsThatTimedOut = LockedCounter()
+        manager.onLossDetected = { [weak manager] _ in
+            lossCallbacks.increment()
+            guard let manager else { return }
+            let stopped = DispatchSemaphore(value: 0)
+            DispatchQueue.global(qos: .userInitiated).async {
+                manager.stopStream()
+                stopped.signal()
+            }
+            if stopped.wait(timeout: .now() + 5) == .timedOut {
+                stopsThatTimedOut.increment()
+            }
+        }
+        manager.startStream(
+            streamID: 1,
+            width: 64,
+            height: 64,
+            usesDecodingOrderNumbers: false,
+            numberOfTiles: 1) { _, _ in }
+
+        let fed = expectation(description: "batch fed without deadlock")
+        let packets = [1, 3, 10, 20].map(makeNonVCLVideoRTP(sequence:))
+        DispatchQueue.global(qos: .userInitiated).async {
+            manager.feedRTPBatch(packets)
+            fed.fulfill()
+        }
+        wait(for: [fed], timeout: 30)
+
+        XCTAssertEqual(
+            stopsThatTimedOut.count,
+            0,
+            "stopStream() on another thread must not wait for the loss handler to return")
+        XCTAssertFalse(manager.isStreamActive)
+        XCTAssertEqual(lossCallbacks.count, 1)
+    }
+
+    /// One manager serves successive streams and restarts its media
+    /// generation at 1 for each, so a geometry update has to name the stream
+    /// that produced it.
+    func testGeometryUpdateCarriesItsStreamGeneration() throws {
+        let manager = VideoStreamManager()
+        func start(streamID: UInt32) {
+            manager.startStream(
+                streamID: streamID,
+                width: 64,
+                height: 64,
+                usesDecodingOrderNumbers: false,
+                numberOfTiles: 1) { _, _ in }
+        }
+        start(streamID: 1)
+        defer { manager.stopStream() }
+        let first = try XCTUnwrap(manager.acceptCodedDimensions(width: 128, height: 96))
+        XCTAssertEqual(first.streamGeneration, manager.decodeProgress.streamGeneration)
+
+        start(streamID: 2)
+        let second = try XCTUnwrap(manager.acceptCodedDimensions(width: 128, height: 96))
+        XCTAssertEqual(second.streamGeneration, manager.decodeProgress.streamGeneration)
+        XCTAssertEqual(first.mediaGeneration, second.mediaGeneration)
+        XCTAssertNotEqual(first.streamGeneration, second.streamGeneration)
+        XCTAssertNotEqual(first, second)
+    }
+
+    func testFeedMethodsKeepTheirOneArgumentForms() {
+        let manager = VideoStreamManager()
+        let feedOne: (Data) -> VideoStreamFeedResult = manager.feedRTPData
+        let feedMany: ([Data]) -> Int = manager.feedRTPBatch
+        XCTAssertFalse(feedOne(makeNonVCLVideoRTP(sequence: 1)).isActive)
+        XCTAssertEqual(feedMany([makeNonVCLVideoRTP(sequence: 1)]), 0)
+    }
+
+    /// A repeated media offer restarts the same manager. A packet source made
+    /// for the previous stream can still deliver afterwards (a drain delayed
+    /// for audio sync); bound to its generation, it must be ignored.
+    func testFeedBoundToARetiredStreamGenerationIsDropped() {
+        let manager = VideoStreamManager()
+        let lossCallbacks = LockedCounter()
+        manager.onLossDetected = { _ in lossCallbacks.increment() }
+        func start(streamID: UInt32) {
+            manager.startStream(
+                streamID: streamID,
+                width: 64,
+                height: 64,
+                usesDecodingOrderNumbers: false,
+                numberOfTiles: 1) { _, _ in }
+        }
+        start(streamID: 1)
+        defer { manager.stopStream() }
+        let retiredGeneration = manager.decodeProgress.streamGeneration
+        start(streamID: 2)
+        let currentGeneration = manager.decodeProgress.streamGeneration
+        XCTAssertNotEqual(retiredGeneration, currentGeneration)
+
+        let gapBatch = [1, 5].map(makeNonVCLVideoRTP(sequence:))
+        manager.feedRTPBatch(gapBatch, streamGeneration: retiredGeneration)
+        XCTAssertFalse(
+            manager.feedRTPData(gapBatch[0], streamGeneration: retiredGeneration).isActive)
+        XCTAssertEqual(manager.lossStatsSnapshot.gapsDetected, 0)
+        XCTAssertEqual(lossCallbacks.count, 0)
+
+        manager.feedRTPBatch(gapBatch, streamGeneration: currentGeneration)
+        XCTAssertEqual(manager.lossStatsSnapshot.gapsDetected, 1)
+        XCTAssertEqual(lossCallbacks.count, 1)
+    }
+
     func testMetalCompositorStitchesFourBGRABandsAndCropsBottomPadding() throws {
         let compositor = VideoBandCompositor()
         let colors: [(UInt8, UInt8, UInt8)] = [
@@ -609,12 +1158,11 @@ final class HighPerformanceOptimizationTests: XCTestCase {
         coalescer.submit(ssrc: 1, pixelBuffer: b0)
         coalescer.submit(ssrc: 2, pixelBuffer: b1)
 
-        // Drain compositeQueue + main queue.
-        let exp = expectation(description: "suspended delivery")
-        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.08) {
-            DispatchQueue.main.async { exp.fulfill() }
-        }
-        wait(for: [exp], timeout: 2.0)
+        // The composite queue stages the band set and the main thread records
+        // it for resume. Wait for that hand-off itself rather than a delay.
+        XCTAssertTrue(
+            spinMainRunLoop { renderer.renderedBandCount == 2 },
+            "Bands submitted while suspended must still reach the renderer")
 
         XCTAssertEqual(renderer.frameCommitCount, 0)
         XCTAssertNil(renderer.latestComposedFrame)
@@ -647,11 +1195,18 @@ final class HighPerformanceOptimizationTests: XCTestCase {
         coalescer.submit(ssrc: 10, pixelBuffer: new0)
         coalescer.submit(ssrc: 11, pixelBuffer: new1)
 
-        let exp = expectation(description: "generation handoff")
-        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.15) {
-            DispatchQueue.main.async { exp.fulfill() }
-        }
-        wait(for: [exp], timeout: 2.0)
+        // Wait for the replacement generation's frame to be committed (the
+        // first Metal pipeline build on a cold machine can take a while), then
+        // run whatever is still queued on the main thread behind it so a
+        // retired callback has had every chance to interfere.
+        XCTAssertTrue(
+            spinMainRunLoop {
+                renderer.streamGenerationCount == 1 && renderer.frameCommitCount >= 1
+            },
+            "The replacement generation must be presented")
+        let drained = expectation(description: "main queue drained")
+        DispatchQueue.main.async { drained.fulfill() }
+        wait(for: [drained], timeout: 10)
 
         // Renderer must have reset its band map before applying the new SSRCs,
         // so only the 2 new bands exist (never 4 mixed old+new bands).
@@ -757,6 +1312,76 @@ final class HighPerformanceOptimizationTests: XCTestCase {
         }
     }
 
+    /// The read task can hold a batch decrypted off-actor while the session
+    /// rebuilds its SRTP state. Those can be the stream's first packets, so
+    /// they are dropped only when the keys behind them are really gone.
+    func testSRTPBatchDecryptedBeforeContextRebuildCanBeReauthenticated() throws {
+        // Synthetic cipher-suite-5 vector shared with AppleSRTPContextTests.
+        let key = try XCTUnwrap(Data(base64Encoded:
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLQ=="))
+        let protected = try XCTUnwrap(Data(base64Encoded:
+            "kGASNAECAwQRIjNEvt4AAaChoqP5uBi2sP75CY69L33Z/+U/WzaVmrZS0yJWMzsBZefJem06t3Hqh9pN49XoRfBwPuON97n+31NigxWW"))
+        let plaintext = try XCTUnwrap(Data(base64Encoded:
+            "kGASNAECAwQRIjNEvt4AAaChoqMAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8="))
+
+        let decryptor = AppleMediaSRTPDecryptor()
+        let original = try AppleSRTPContext(mediaKey: key)
+        let originalGeneration = decryptor.configure(contexts: [original], expectsSRTP: true)
+        let batch = decryptor.decryptBatch([PosixUDPDatagram(data: protected, arrivalNanos: 7)])
+        guard case .decrypted(let rtp, let wire, let ssrc, let context, let arrival)? = batch.items.first else {
+            return XCTFail("Expected the packet to be decrypted off-actor")
+        }
+        XCTAssertEqual(rtp, plaintext)
+        XCTAssertEqual(wire, protected, "The wire datagram must travel with the decrypted packet")
+        XCTAssertEqual(ssrc, 0x1122_3344)
+        XCTAssertEqual(arrival, 7)
+        XCTAssertTrue(context === original)
+
+        func disposition(
+            activeGeneration: UInt64,
+            activeContexts: [AppleSRTPContext]
+        ) -> AppleMediaSRTPDecryptor.Disposition {
+            AppleMediaSRTPDecryptor.disposition(
+                ofPacketAuthenticatedBy: context,
+                batchGeneration: batch.generation,
+                activeGeneration: activeGeneration,
+                activeContexts: activeContexts)
+        }
+
+        XCTAssertEqual(
+            disposition(activeGeneration: originalGeneration, activeContexts: [original]),
+            .accept)
+
+        // Rebuilt from the same keys: the packet is still wanted, and the
+        // replacement context authenticates its wire form.
+        let rebuilt = try AppleSRTPContext(mediaKey: key)
+        let rebuiltGeneration = decryptor.configure(contexts: [rebuilt], expectsSRTP: true)
+        XCTAssertNotEqual(rebuiltGeneration, batch.generation)
+        XCTAssertEqual(
+            disposition(activeGeneration: rebuiltGeneration, activeContexts: [rebuilt]),
+            .reauthenticate)
+        XCTAssertEqual(try rebuilt.unprotect(wire), plaintext)
+
+        // A generation bump that kept the authenticating context changes nothing.
+        XCTAssertEqual(
+            disposition(activeGeneration: rebuiltGeneration, activeContexts: [original]),
+            .accept)
+
+        // Renegotiated keys: the wire datagram is offered to them and rejected,
+        // so a retired stream cannot reach the replacement's reorder buffer.
+        let renegotiated = try AppleSRTPContext(
+            mediaKey: Data((0..<46).map { UInt8($0 + 100) }))
+        XCTAssertEqual(
+            disposition(activeGeneration: rebuiltGeneration &+ 1, activeContexts: [renegotiated]),
+            .reauthenticate)
+        XCTAssertThrowsError(try renegotiated.unprotect(wire))
+
+        // Keys retired with nothing installed in their place.
+        XCTAssertEqual(
+            disposition(activeGeneration: decryptor.clear(), activeContexts: []),
+            .drop)
+    }
+
     // MARK: - AppleMediaRTPReorderBuffer Fast Path & LTR Completion Tests
 
     func testReorderBufferInOrderFastPathAndLTRCompletion() {
@@ -854,10 +1479,12 @@ final class HighPerformanceOptimizationTests: XCTestCase {
         try await channel.start()
 
         // Register a batch waiter FIRST, then a single waiter SECOND.
+        // Each waiter is confirmed parked before the next step, so the order
+        // does not depend on how quickly the tasks happen to be scheduled.
         let batchTask = Task { try await channel.receiveDatagramBatch(maxCount: 2) }
-        try await Task.sleep(for: .milliseconds(20))
+        try await waitForParkedReceivers(1, on: channel)
         let singleTask = Task { try await channel.receiveDatagram() }
-        try await Task.sleep(for: .milliseconds(20))
+        try await waitForParkedReceivers(2, on: channel)
 
         // Send 3 datagrams sequentially; the earlier batch waiter must get the
         // first packet(s) and must NOT be starved by the later single waiter.

@@ -11,6 +11,11 @@ public enum VNCPresentedFrame {
     case surfaces([Surface])
 
     public struct Surface {
+        /// The display's surface. Its pixel format varies: `32BGRA` for
+        /// stitched bands, or the decoder's bi-planar YCbCr surface (`444f`,
+        /// `420v`, ...) for a single picture shown without a copy. Read it
+        /// through a format-aware API such as `CIImage(cvPixelBuffer:)`, not
+        /// as packed BGRA bytes.
         public let pixelBuffer: CVPixelBuffer
         /// Where the surface sits in the presented picture, in picture
         /// pixels with a top-left origin.

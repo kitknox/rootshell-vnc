@@ -69,6 +69,51 @@ final class OrderedMediaPacketCoalescerTests: XCTestCase {
         XCTAssertEqual(batches.snapshot.flatMap { $0 }, packets)
     }
 
+    /// Resolving a batch's delays parses RTP and takes the playback
+    /// synchronizer's lock. Packets already due must stay drainable meanwhile.
+    func testBatchEnqueueResolvesDelaysWithoutBlockingDrain() {
+        let queue = DispatchQueue(label: "OrderedMediaPacketCoalescerTests.batchDelay")
+        let first = Data([1])
+        let second = Data([2])
+        let delayEntered = DispatchSemaphore(value: 0)
+        let releaseDelay = DispatchSemaphore(value: 0)
+        let firstConsumed = expectation(description: "due packet drained during delay resolution")
+        let secondConsumed = expectation(description: "second batch drained")
+        let batches = LockedBatches()
+        let coalescer = OrderedMediaPacketCoalescer(
+            queue: queue,
+            delayNanos: { packet in
+                if packet == second {
+                    delayEntered.signal()
+                    releaseDelay.wait()
+                }
+                return 0
+            }
+        ) { batch in
+            batches.append(batch)
+            if batch == [first] {
+                firstConsumed.fulfill()
+            } else {
+                secondConsumed.fulfill()
+            }
+        }
+
+        // Queue the first packet's drain, then hold a second batch inside its
+        // delay computation before letting that drain run.
+        queue.suspend()
+        coalescer.enqueue(contentsOf: [first])
+        DispatchQueue.global(qos: .userInitiated).async {
+            coalescer.enqueue(contentsOf: [second])
+        }
+        XCTAssertEqual(delayEntered.wait(timeout: .now() + 10), .success)
+        queue.resume()
+
+        wait(for: [firstConsumed], timeout: 10)
+        releaseDelay.signal()
+        wait(for: [secondConsumed], timeout: 10)
+        XCTAssertEqual(batches.snapshot, [[first], [second]])
+    }
+
     func testDiscardPendingInvalidatesRetiredGenerationTimer() {
         let queue = DispatchQueue(label: "OrderedMediaPacketCoalescerTests.generation")
         let consumed = expectation(description: "consumed current generation")

@@ -64,11 +64,30 @@ public struct VideoFrameGeometry: Sendable, Equatable {
     public let width: Int
     public let height: Int
     public let mediaGeneration: UInt64
+    /// The `DecodeProgress.streamGeneration` of the stream that reported these
+    /// dimensions, or nil when the value was not produced by a stream.
+    /// `mediaGeneration` restarts at 1 with every stream, so only this tells
+    /// an update from a retired stream apart from one for its replacement.
+    public let streamGeneration: UInt64?
 
     public init(width: Int, height: Int, mediaGeneration: UInt64) {
+        self.init(
+            width: width,
+            height: height,
+            mediaGeneration: mediaGeneration,
+            streamGeneration: nil)
+    }
+
+    public init(
+        width: Int,
+        height: Int,
+        mediaGeneration: UInt64,
+        streamGeneration: UInt64?
+    ) {
         self.width = width
         self.height = height
         self.mediaGeneration = mediaGeneration
+        self.streamGeneration = streamGeneration
     }
 }
 
@@ -126,6 +145,40 @@ public final class VideoStreamManager: @unchecked Sendable {
     public typealias FrameCallback = @Sendable (CVPixelBuffer, UInt32) -> Void
 
     private let lock = NSLock()
+    /// Held while one packet is processed, and by `startStream`/`stopStream`
+    /// while they replace the stream. Packet processing takes `lock` many
+    /// times and works between those holds with the demuxer and decoder it
+    /// read; without this, a restart from another thread could land between
+    /// two of them and receive the retired stream's parameter sets or
+    /// pictures. A start or stop now waits for at most the packet in flight.
+    /// Always taken before `lock`.
+    ///
+    /// No owner callback runs while it is held. `onLossDetected`,
+    /// `onDecoderFailure` and `onFrameGeometryChange` raised by a packet are
+    /// collected and delivered after the packet, with no lock held, so a
+    /// handler is free to stop or restart the stream, on this thread or by
+    /// waiting on another one.
+    private let feedLock = NSRecursiveLock()
+
+    /// Owner callbacks raised while a packet is processed under `feedLock`.
+    private struct DeferredCallbacks {
+        private var pending: [() -> Void] = []
+
+        mutating func add(_ callback: @escaping () -> Void) {
+            pending.append(callback)
+        }
+
+        /// Call with no lock held.
+        mutating func deliver() {
+            let callbacks = pending
+            pending.removeAll()
+            for callback in callbacks { callback() }
+        }
+    }
+
+    /// Test hook: runs under `feedLock` once a batch packet has been
+    /// confirmed to belong to the active stream.
+    var packetInFlightHookForTesting: (@Sendable () -> Void)?
     private var decoder: HEVCDecoder?
     private var demuxer: RTPDemuxer
     private var frameCallback: FrameCallback?
@@ -195,8 +248,9 @@ public final class VideoStreamManager: @unchecked Sendable {
     /// playback; enable the gate (ROOTSHELL_VNC_ENABLE_IRAP_GATE=1) only for
     /// diagnostics.
     var irapGateEnabled = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_ENABLE_IRAP_GATE"] == "1"
-    /// Fired (off-lock) when a fresh loss is detected while no recovery is in
-    /// flight. VNCSession wires this to the transport's keyframe request.
+    /// Fired when a fresh loss is detected while no recovery is in flight,
+    /// after the packet that revealed it has been processed and with no lock
+    /// held. VNCSession wires this to the transport's keyframe request.
     public var onLossDetected: (@Sendable (UInt32?) -> Void)?
 
     /// Fired once when VideoToolbox asynchronously rejects a submitted frame.
@@ -301,6 +355,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         numberOfTiles: Int? = nil,
         frameCallback: @escaping FrameCallback
     ) {
+        feedLock.lock()
         lock.lock()
         let retiredDecoders = _stopStreamLocked()
         self.streamID = streamID
@@ -328,6 +383,7 @@ public final class VideoStreamManager: @unchecked Sendable {
             mediaGeneration: mediaGeneration,
             frameCallback: frameCallback)
         lock.unlock()
+        feedLock.unlock()
         retireDecoders(retiredDecoders)
     }
 
@@ -409,52 +465,155 @@ public final class VideoStreamManager: @unchecked Sendable {
     /// lock snapshots. Returns the total number of submitted HEVC access units.
     @discardableResult
     public func feedRTPBatch(_ packets: [Data]) -> Int {
+        feedRTPBatch(packets, streamGeneration: nil)
+    }
+
+    /// Feed a batch on behalf of one specific stream.
+    ///
+    /// - Parameter expectedStreamGeneration: The `decodeProgress.streamGeneration`
+    ///   the caller's packets belong to. A packet source created for one
+    ///   stream can still deliver after this manager has been restarted for
+    ///   the next (a drain delayed for audio sync, a block already queued);
+    ///   binding it to its generation drops those packets instead of feeding
+    ///   them to the replacement. Nil feeds whichever stream is active.
+    @discardableResult
+    public func feedRTPBatch(
+        _ packets: [Data],
+        streamGeneration expectedStreamGeneration: UInt64?
+    ) -> Int {
         guard !packets.isEmpty else { return 0 }
         lock.lock()
-        guard _isActive else {
+        guard _isActive,
+              expectedStreamGeneration == nil
+                || expectedStreamGeneration == streamGeneration else {
             lock.unlock()
             return 0
         }
         let demuxerRef = demuxer
         let usesDON = usesDecodingOrderNumbers
+        let batchStream = FeedStream(
+            generation: streamGeneration,
+            demuxer: demuxerRef)
         lock.unlock()
 
         let batchNowNanos = DispatchTime.now().uptimeNanoseconds
         var totalDecoded = 0
         for data in packets {
             guard !RTPDemuxer.isRTCPPacket(data) else { continue }
-            do {
-                let packet = try RTPDemuxer.parsePacket(data)
-                guard packet.payloadType == 100 else { continue }
-                let gap = noteVideoPacketAndDetectGap(
-                    ssrc: packet.ssrc,
-                    sequence: packet.sequenceNumber,
-                    nowNanos: batchNowNanos)
-                if gap.detected, !usesDON {
-                    discardPartialSequentialAccessUnit()
-                }
-                if gap.shouldRequestRecovery {
-                    onLossDetected?(packet.ssrc)
-                }
-                let demuxed = demuxerRef.feedPacket(packet)
-                guard !demuxed.isEmpty else { continue }
-                totalDecoded += try submitDemuxedUnits(
-                    demuxed,
-                    usesDON: usesDON)
-            } catch {
-                let freshLoss = gateAllBands(nowNanos: batchNowNanos)
-                if freshLoss { onLossDetected?(nil) }
-                logDroppedPacket(error: error, byteCount: data.count)
-            }
+            // A batch can hold the whole startup backlog, so the stream may be
+            // stopped or restarted while it is being fed. Each packet is
+            // processed under `feedLock`, which excludes that for the packet's
+            // duration, and starts by confirming it still belongs to the
+            // active stream. The rest of a retired stream's batch therefore
+            // neither touches the replacement's state nor reaches its decoder
+            // through the retired demuxer.
+            var callbacks = DeferredCallbacks()
+            feedLock.lock()
+            let decoded = feedBatchPacketLocked(
+                data,
+                stream: batchStream,
+                usesDON: usesDON,
+                nowNanos: batchNowNanos,
+                callbacks: &callbacks)
+            feedLock.unlock()
+            callbacks.deliver()
+            guard let decoded else { break }
+            totalDecoded += decoded
         }
         return totalDecoded
+    }
+
+    /// Process one batch packet with `feedLock` held. Returns nil when the
+    /// packet's stream is no longer the active one.
+    private func feedBatchPacketLocked(
+        _ data: Data,
+        stream: FeedStream,
+        usesDON: Bool,
+        nowNanos: UInt64,
+        callbacks: inout DeferredCallbacks
+    ) -> Int? {
+        do {
+            let packet = try RTPDemuxer.parsePacket(data)
+            guard packet.payloadType == 100 else { return 0 }
+            guard let gap = noteVideoPacketAndDetectGap(
+                ssrc: packet.ssrc,
+                sequence: packet.sequenceNumber,
+                nowNanos: nowNanos,
+                expecting: stream) else { return nil }
+            packetInFlightHookForTesting?()
+            if gap.detected, !usesDON {
+                discardPartialSequentialAccessUnit()
+            }
+            if gap.shouldRequestRecovery, let onLossDetected {
+                let ssrc = packet.ssrc
+                callbacks.add { onLossDetected(ssrc) }
+            }
+            let demuxed = stream.demuxer.feedPacket(packet)
+            guard !demuxed.isEmpty else { return 0 }
+            return try submitDemuxedUnits(
+                demuxed,
+                usesDON: usesDON,
+                callbacks: &callbacks)
+        } catch {
+            guard isCurrentFeedStream(stream) else { return nil }
+            let freshLoss = gateAllBands(nowNanos: nowNanos)
+            if freshLoss, let onLossDetected {
+                callbacks.add { onLossDetected(nil) }
+            }
+            logDroppedPacket(error: error, byteCount: data.count)
+            return 0
+        }
+    }
+
+    /// Identity of the stream a packet batch was snapshotted from.
+    private struct FeedStream {
+        let generation: UInt64
+        let demuxer: RTPDemuxer
+    }
+
+    private func isCurrentFeedStreamLocked(_ stream: FeedStream) -> Bool {
+        _isActive && streamGeneration == stream.generation && demuxer === stream.demuxer
+    }
+
+    private func isCurrentFeedStream(_ stream: FeedStream) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isCurrentFeedStreamLocked(stream)
     }
 
     /// Feed an RTP-shaped media packet (UDP or Apple's encrypted TCP fallback).
     @discardableResult
     public func feedRTPData(_ data: Data) -> VideoStreamFeedResult {
+        feedRTPData(data, streamGeneration: nil)
+    }
+
+    /// Feed one packet on behalf of one specific stream; see
+    /// `feedRTPBatch(_:streamGeneration:)`.
+    @discardableResult
+    public func feedRTPData(
+        _ data: Data,
+        streamGeneration expectedStreamGeneration: UInt64?
+    ) -> VideoStreamFeedResult {
+        var callbacks = DeferredCallbacks()
+        feedLock.lock()
+        let result = feedRTPDataLocked(
+            data,
+            expectedStreamGeneration: expectedStreamGeneration,
+            callbacks: &callbacks)
+        feedLock.unlock()
+        callbacks.deliver()
+        return result
+    }
+
+    private func feedRTPDataLocked(
+        _ data: Data,
+        expectedStreamGeneration: UInt64?,
+        callbacks: inout DeferredCallbacks
+    ) -> VideoStreamFeedResult {
         lock.lock()
-        guard _isActive else {
+        guard _isActive,
+              expectedStreamGeneration == nil
+                || expectedStreamGeneration == streamGeneration else {
             lock.unlock()
             return VideoStreamFeedResult(byteCount: data.count, isActive: false)
         }
@@ -487,8 +646,9 @@ public final class VideoStreamManager: @unchecked Sendable {
             if gap.detected, !usesDON {
                 discardPartialSequentialAccessUnit()
             }
-            if gap.shouldRequestRecovery {
-                onLossDetected?(packet.ssrc)
+            if gap.shouldRequestRecovery, let onLossDetected {
+                let ssrc = packet.ssrc
+                callbacks.add { onLossDetected(ssrc) }
             }
 
             let demuxed = demuxerRef.feedPacket(packet)
@@ -505,7 +665,8 @@ public final class VideoStreamManager: @unchecked Sendable {
             }
             let decodedCount = try submitDemuxedUnits(
                 demuxed,
-                usesDON: usesDON)
+                usesDON: usesDON,
+                callbacks: &callbacks)
 
             return VideoStreamFeedResult(
                 byteCount: data.count, isActive: true,
@@ -516,7 +677,9 @@ public final class VideoStreamManager: @unchecked Sendable {
             // A packet we couldn't parse/decode is as gone as one that never
             // arrived — latch the gate so the broken chain isn't rendered.
             let freshLoss = gateAllBands()
-            if freshLoss { onLossDetected?(nil) }
+            if freshLoss, let onLossDetected {
+                callbacks.add { onLossDetected(nil) }
+            }
             logDroppedPacket(error: error, byteCount: data.count)
             return VideoStreamFeedResult(
                 byteCount: data.count, isActive: true,
@@ -526,7 +689,8 @@ public final class VideoStreamManager: @unchecked Sendable {
 
     private func submitDemuxedUnits(
         _ demuxed: [RTPDemuxer.DemuxedNAL],
-        usesDON: Bool
+        usesDON: Bool,
+        callbacks: inout DeferredCallbacks
     ) throws -> Int {
         // Parameter sets are not pictures and may share a DON with a later
         // IRAP, so apply them immediately. Buffer only VCL units by DON.
@@ -535,9 +699,9 @@ public final class VideoStreamManager: @unchecked Sendable {
             guard unit.nal.count >= 2 else { continue }
             let type = (unit.nal[unit.nal.startIndex] >> 1) & 0x3f
             switch type {
-            case 32: handleParameterSet(nalUnit: unit.nal, type: .vps)
-            case 33: handleParameterSet(nalUnit: unit.nal, type: .sps)
-            case 34: handleParameterSet(nalUnit: unit.nal, type: .pps)
+            case 32: handleParameterSet(nalUnit: unit.nal, type: .vps, callbacks: &callbacks)
+            case 33: handleParameterSet(nalUnit: unit.nal, type: .sps, callbacks: &callbacks)
+            case 34: handleParameterSet(nalUnit: unit.nal, type: .pps, callbacks: &callbacks)
             case 0...31:
                 if usesDON {
                     orderedVCL.append(contentsOf:
@@ -614,7 +778,8 @@ public final class VideoStreamManager: @unchecked Sendable {
                     recordSynchronousDecoderFailure(
                         status: status,
                         presentationTime: pts,
-                        ssrc: accessUnit.ssrc)
+                        ssrc: accessUnit.ssrc,
+                        callbacks: &callbacks)
                     throw HEVCDecoderError.decodeFailed(status)
                 } catch {
                     if recoveryIDRArmed {
@@ -639,6 +804,34 @@ public final class VideoStreamManager: @unchecked Sendable {
     ) -> (detected: Bool, shouldRequestRecovery: Bool) {
         lock.lock()
         defer { lock.unlock() }
+        return noteVideoPacketAndDetectGapLocked(
+            ssrc: ssrc,
+            sequence: sequence,
+            nowNanos: nowNanos)
+    }
+
+    /// Batch variant: returns nil, leaving all state untouched, when `stream`
+    /// is no longer the active one.
+    private func noteVideoPacketAndDetectGap(
+        ssrc: UInt32,
+        sequence: UInt16,
+        nowNanos: UInt64,
+        expecting stream: FeedStream
+    ) -> (detected: Bool, shouldRequestRecovery: Bool)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard isCurrentFeedStreamLocked(stream) else { return nil }
+        return noteVideoPacketAndDetectGapLocked(
+            ssrc: ssrc,
+            sequence: sequence,
+            nowNanos: nowNanos)
+    }
+
+    private func noteVideoPacketAndDetectGapLocked(
+        ssrc: UInt32,
+        sequence: UInt16,
+        nowNanos: UInt64
+    ) -> (detected: Bool, shouldRequestRecovery: Bool) {
         let now = nowNanos
         let followedLongSilence = lastVideoPacketArrivalNanos[ssrc].map {
             now &- $0 >= 1_000_000_000
@@ -773,7 +966,7 @@ public final class VideoStreamManager: @unchecked Sendable {
             mediaGeneration: media,
             status: status,
             presentationTime: CMTime(value: 0, timescale: 90000),
-            ssrc: ssrc)
+            ssrc: ssrc)?()
     }
 
     func installCompoundRecoveryGateForTesting(sources: Set<UInt32>) {
@@ -845,9 +1038,11 @@ public final class VideoStreamManager: @unchecked Sendable {
     }
 
     public func stopStream() {
+        feedLock.lock()
         lock.lock()
         let retiredDecoders = _stopStreamLocked()
         lock.unlock()
+        feedLock.unlock()
         retireDecoders(retiredDecoders)
     }
 
@@ -1004,34 +1199,39 @@ public final class VideoStreamManager: @unchecked Sendable {
     private func recordSynchronousDecoderFailure(
         status: OSStatus,
         presentationTime: CMTime,
-        ssrc: UInt32
+        ssrc: UInt32,
+        callbacks: inout DeferredCallbacks
     ) {
         lock.lock()
         let generation = streamGeneration
         let currentMediaGeneration = mediaGeneration
         lock.unlock()
-        recordDecoderFailure(
+        if let notifyOwner = recordDecoderFailure(
             streamGeneration: generation,
             mediaGeneration: currentMediaGeneration,
             status: status,
             presentationTime: presentationTime,
-            ssrc: ssrc)
+            ssrc: ssrc) {
+            callbacks.add(notifyOwner)
+        }
     }
 
+    /// Latch a decoder failure. Returns the `onDecoderFailure` notification
+    /// for the caller to run once it holds no lock, when the failure needs one.
     private func recordDecoderFailure(
         streamGeneration: UInt64,
         mediaGeneration: UInt64,
         status: OSStatus,
         presentationTime: CMTime,
         ssrc: UInt32
-    ) {
+    ) -> (() -> Void)? {
         if Self.nonFatalDecodeStatuses.contains(status) {
             lock.lock()
             guard streamGeneration == self.streamGeneration,
                   mediaGeneration == self.mediaGeneration,
                   _isActive else {
                 lock.unlock()
-                return
+                return nil
             }
             nonFatalDecodeFailureCount &+= 1
             let count = nonFatalDecodeFailureCount
@@ -1043,7 +1243,7 @@ public final class VideoStreamManager: @unchecked Sendable {
                         + "ssrc=0x\(String(ssrc, radix: 16)) count=\(count); "
                         + "keeping session for intra-refresh recovery")
             }
-            return
+            return nil
         }
 
         let failure = VideoDecoderFailure(status: status, ssrc: ssrc)
@@ -1055,7 +1255,7 @@ public final class VideoStreamManager: @unchecked Sendable {
               _isActive,
               decoderFailureLatch.record(failure) else {
             lock.unlock()
-            return
+            return nil
         }
         pendingRecoveryIDRPresentationTimes.remove(presentationTime.value)
         _ = markLossLocked(affectedSSRC: ssrc)
@@ -1065,7 +1265,8 @@ public final class VideoStreamManager: @unchecked Sendable {
         log.error(
             "VideoToolbox decoder failed asynchronously status=\(status) "
                 + "ssrc=0x\(String(ssrc, radix: 16)); rebuilding in media session")
-        callback?(failure)
+        guard let callback else { return nil }
+        return { callback(failure) }
     }
 
     private var isDecoderRecoveryPending: Bool {
@@ -1153,7 +1354,11 @@ public final class VideoStreamManager: @unchecked Sendable {
         return true
     }
 
-    private func handleParameterSet(nalUnit: Data, type: ParameterSetType) {
+    private func handleParameterSet(
+        nalUnit: Data,
+        type: ParameterSetType,
+        callbacks: inout DeferredCallbacks
+    ) {
         lock.lock()
         switch type {
         case .vps: pendingVPS = nalUnit
@@ -1188,9 +1393,11 @@ public final class VideoStreamManager: @unchecked Sendable {
         if let codedDimensions,
            codedDimensions.width > 0,
            codedDimensions.height > 0 {
-            acceptCodedDimensions(
+            if let notifyOwner = applyCodedDimensions(
                 width: Int(codedDimensions.width),
-                height: Int(codedDimensions.height))
+                height: Int(codedDimensions.height))?.notifyOwner {
+                callbacks.add(notifyOwner)
+            }
         }
         drainEarlyVCLIfReady()
     }
@@ -1201,6 +1408,20 @@ public final class VideoStreamManager: @unchecked Sendable {
     /// using explicit RFB geometry for the full height.
     @discardableResult
     func acceptCodedDimensions(width: Int, height: Int) -> VideoFrameGeometry? {
+        guard let applied = applyCodedDimensions(width: width, height: height) else {
+            return nil
+        }
+        applied.notifyOwner?()
+        return applied.update
+    }
+
+    /// Returns the geometry update, if the dimensions changed it, with the
+    /// `onFrameGeometryChange` notification for the caller to run once it
+    /// holds no lock.
+    private func applyCodedDimensions(
+        width: Int,
+        height: Int
+    ) -> (update: VideoFrameGeometry, notifyOwner: (() -> Void)?)? {
         guard width > 0, height > 0 else { return nil }
 
         let update: VideoFrameGeometry?
@@ -1214,7 +1435,8 @@ public final class VideoStreamManager: @unchecked Sendable {
             update = VideoFrameGeometry(
                 width: width,
                 height: height,
-                mediaGeneration: mediaGeneration)
+                mediaGeneration: mediaGeneration,
+                streamGeneration: streamGeneration)
             callback = onFrameGeometryChange
         } else {
             update = nil
@@ -1223,13 +1445,12 @@ public final class VideoStreamManager: @unchecked Sendable {
         updateExpectedBandCountLocked()
         lock.unlock()
 
-        if let update {
-            log.info(
-                "HEVC media geometry \(update.width)x\(update.height) "
-                    + "generation=\(update.mediaGeneration)")
-            callback?(update)
-        }
-        return update
+        guard let update else { return nil }
+        log.info(
+            "HEVC media geometry \(update.width)x\(update.height) "
+                + "generation=\(update.mediaGeneration)")
+        guard let callback else { return (update, nil) }
+        return (update, { callback(update) })
     }
 
     private func updateExpectedBandCountLocked() {
@@ -1336,12 +1557,13 @@ public final class VideoStreamManager: @unchecked Sendable {
                     ssrc: frameTag)
             },
             failureCallback: { [weak self] status, pts, frameTag in
+                // VideoToolbox's callback thread holds none of our locks.
                 self?.recordDecoderFailure(
                     streamGeneration: streamGeneration,
                     mediaGeneration: mediaGeneration,
                     status: status,
                     presentationTime: pts,
-                    ssrc: frameTag)
+                    ssrc: frameTag)?()
             })
     }
 

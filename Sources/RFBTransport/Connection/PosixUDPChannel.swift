@@ -421,6 +421,12 @@ public actor PosixUDPChannel {
         stateLock.withLock { lockedReceivedDatagram }
     }
 
+    /// Test hook: receivers currently parked waiting for a datagram, so a test
+    /// can order its waiters by observing registration instead of sleeping.
+    nonisolated var receiveWaiterCountForTesting: Int {
+        stateLock.withLock { receiveWaiters.count }
+    }
+
     /// Nanoseconds since the last successful send, or nil before the first.
     public var nanosecondsSinceLastSend: UInt64? {
         lastSendNanos.map { DispatchTime.now().uptimeNanoseconds &- $0 }

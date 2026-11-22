@@ -18,7 +18,31 @@ import simd
 ///
 /// Designed to run on a dedicated background serial queue off `@MainActor` so
 /// GPU scheduling and completion waits never stall touch/pointer/keyboard input.
+///
+/// The main thread still reaches this object: `reset()` on every disconnect or
+/// renegotiation, and a synchronous `compose` when a prepared frame cannot be
+/// used. Neither may wait behind the composite queue's slow work, so no lock is
+/// held across shader compilation, and only `renderLock` is held across a GPU
+/// wait:
+/// - `stateLock` guards the destination pool and the published Metal state for
+///   a few instructions at a time. It is the only lock `reset()` takes.
+/// - `metalSetupLock` serializes the one-time shader compilation.
+/// - `renderLock` serializes use of the shared texture cache while one frame
+///   is encoded and completed, which bounds a main-thread compose to waiting
+///   for at most the single frame already in flight.
 final class VideoBandCompositor: @unchecked Sendable {
+
+    /// How a `compose` call obtains the Metal pipelines, which are compiled
+    /// once on first use and take tens to hundreds of milliseconds cold.
+    enum MetalSetup {
+        /// Compile on the calling thread if they are not ready. For the
+        /// composite queue, where waiting stalls nothing but the first frame.
+        case blocking
+        /// Never compile or wait: use Metal only if it is already available,
+        /// otherwise compose this frame with Core Image while the pipelines
+        /// are built in the background. For the main thread.
+        case background
+    }
 
     private struct YCbCrParams {
         var row0: SIMD4<Float>
@@ -113,49 +137,104 @@ final class VideoBandCompositor: @unchecked Sendable {
         }
         """#
 
-    private let lock = NSLock()
-    private var metalStateInitialized = false
+    private static let metalSetupQueue = DispatchQueue(
+        label: "com.rootshell.vnc.band.metal-setup",
+        qos: .userInitiated)
+
+    private let stateLock = NSLock()
+    private let metalSetupLock = NSLock()
+    private let renderLock = NSLock()
+    private let coreImageContextLock = NSLock()
+    /// Guarded by `stateLock`.
+    private var metalSetupTriggered = false
+    private var metalSetupFinished = false
     private var metalStateStorage: MetalState?
-    private lazy var ciContext = CIContext(options: [.cacheIntermediates: false])
-    private let sRGBColorSpace = CGColorSpace(name: CGColorSpace.sRGB)
     private var pool: CVPixelBufferPool?
     private var poolWidth = 0
     private var poolHeight = 0
+    /// Guarded by `coreImageContextLock`.
+    private var coreImageContextStorage: CIContext?
+    private let sRGBColorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+    private let metalSetupWillBeginForTesting: (@Sendable () -> Void)?
+
+    /// - Parameter metalSetupWillBeginForTesting: Test hook that runs on the
+    ///   compiling thread immediately before shader compilation, so a test can
+    ///   hold the compositor in that state.
+    init(metalSetupWillBeginForTesting: (@Sendable () -> Void)? = nil) {
+        self.metalSetupWillBeginForTesting = metalSetupWillBeginForTesting
+    }
 
     /// Diagnostics/test hook: true when Metal compositing is active on this host.
     var isMetalAvailable: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return ensureMetalStateLocked() != nil
+        metalState(.blocking) != nil
     }
 
     /// Diagnostics/test hook: whether Metal shader compilation has been triggered.
     var isMetalInitializedForTesting: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return metalStateInitialized
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return metalSetupTriggered
     }
 
-    private func ensureMetalStateLocked() -> MetalState? {
-        if !metalStateInitialized {
-            metalStateInitialized = true
-            metalStateStorage = Self.makeMetalState()
+    private func metalState(_ setup: MetalSetup) -> MetalState? {
+        stateLock.lock()
+        if metalSetupFinished {
+            let state = metalStateStorage
+            stateLock.unlock()
+            return state
         }
-        return metalStateStorage
+        let firstTrigger = !metalSetupTriggered
+        metalSetupTriggered = true
+        stateLock.unlock()
+
+        if case .background = setup {
+            if firstTrigger {
+                Self.metalSetupQueue.async { [weak self] in
+                    _ = self?.metalState(.blocking)
+                }
+            }
+            return nil
+        }
+
+        metalSetupLock.lock()
+        defer { metalSetupLock.unlock() }
+        stateLock.lock()
+        if metalSetupFinished {
+            let state = metalStateStorage
+            stateLock.unlock()
+            return state
+        }
+        stateLock.unlock()
+
+        metalSetupWillBeginForTesting?()
+        let state = Self.makeMetalState()
+        stateLock.lock()
+        metalStateStorage = state
+        metalSetupFinished = true
+        stateLock.unlock()
+        return state
     }
 
+    private func coreImageContext() -> CIContext {
+        coreImageContextLock.lock()
+        defer { coreImageContextLock.unlock() }
+        if let context = coreImageContextStorage { return context }
+        let context = CIContext(options: [.cacheIntermediates: false])
+        coreImageContextStorage = context
+        return context
+    }
+
+    /// Drop the destination pool. Safe to call from the main thread at any
+    /// time: it takes only `stateLock`, so it never waits for a composite or
+    /// for shader compilation, and it never compiles shaders itself. The
+    /// texture cache needs no flush here because every Metal composite evicts
+    /// the wrappers it created before returning.
     func reset() {
-        lock.lock()
+        stateLock.lock()
         pool = nil
         poolWidth = 0
         poolHeight = 0
-        // Flush only an already-initialized cache so resetting an unused
-        // renderer (e.g. Standard mode or startup setup) never compiles Metal
-        // shaders on the caller's thread.
-        if let cache = metalStateStorage?.textureCache {
-            CVMetalTextureCacheFlush(cache, 0)
-        }
-        lock.unlock()
+        stateLock.unlock()
     }
 
     /// Compose one display frame from the active SSRC-keyed screen bands.
@@ -165,7 +244,8 @@ final class VideoBandCompositor: @unchecked Sendable {
         bands: [UInt32: CVPixelBuffer],
         width: Int,
         height: Int,
-        centersSinglePicture: Bool = false
+        centersSinglePicture: Bool = false,
+        metalSetup: MetalSetup = .blocking
     ) -> CVPixelBuffer? {
         guard !bands.isEmpty, width > 0, height > 0 else { return nil }
 
@@ -182,10 +262,7 @@ final class VideoBandCompositor: @unchecked Sendable {
             }
         }
 
-        lock.lock()
-        defer { lock.unlock() }
-
-        guard let destination = makeDestinationLocked(width: width, height: height) else {
+        guard let destination = makeDestination(width: width, height: height) else {
             return nil
         }
 
@@ -193,8 +270,8 @@ final class VideoBandCompositor: @unchecked Sendable {
         let centered = centersSinglePicture && sortedBands.count == 1
 
         if sortedBands.allSatisfy({ Self.isMetalSupportedFormat(CVPixelBufferGetPixelFormatType($0.value)) }),
-           let metal = ensureMetalStateLocked(),
-           composeWithMetalLocked(
+           let metal = metalState(metalSetup),
+           composeWithMetal(
                metal: metal,
                sortedBands: sortedBands,
                destination: destination,
@@ -205,7 +282,7 @@ final class VideoBandCompositor: @unchecked Sendable {
             return destination
         }
 
-        composeWithCoreImageLocked(
+        composeWithCoreImage(
             sortedBands: sortedBands,
             destination: destination,
             width: width,
@@ -223,13 +300,11 @@ final class VideoBandCompositor: @unchecked Sendable {
         centersSinglePicture: Bool = false
     ) -> CVPixelBuffer? {
         guard !bands.isEmpty, width > 0, height > 0 else { return nil }
-        lock.lock()
-        defer { lock.unlock() }
-        guard let destination = makeDestinationLocked(width: width, height: height) else {
+        guard let destination = makeDestination(width: width, height: height) else {
             return nil
         }
         let sortedBands = bands.sorted(by: { $0.key < $1.key })
-        composeWithCoreImageLocked(
+        composeWithCoreImage(
             sortedBands: sortedBands,
             destination: destination,
             width: width,
@@ -251,7 +326,30 @@ final class VideoBandCompositor: @unchecked Sendable {
         let copyHeight: Int
     }
 
-    private func composeWithMetalLocked(
+    private func composeWithMetal(
+        metal: MetalState,
+        sortedBands: [(key: UInt32, value: CVPixelBuffer)],
+        destination: CVPixelBuffer,
+        width: Int,
+        height: Int,
+        centered: Bool
+    ) -> Bool {
+        renderLock.lock()
+        defer { renderLock.unlock() }
+        // The texture wrappers live only inside this call, so the flush below
+        // evicts all of them whether the composite completed or bailed out.
+        let completed = encodeAndCompleteMetalComposite(
+            metal: metal,
+            sortedBands: sortedBands,
+            destination: destination,
+            width: width,
+            height: height,
+            centered: centered)
+        CVMetalTextureCacheFlush(metal.textureCache, 0)
+        return completed
+    }
+
+    private func encodeAndCompleteMetalComposite(
         metal: MetalState,
         sortedBands: [(key: UInt32, value: CVPixelBuffer)],
         destination: CVPixelBuffer,
@@ -307,7 +405,7 @@ final class VideoBandCompositor: @unchecked Sendable {
             fullyCovered = false
         }
 
-        // Keep CVMetalTexture wrappers alive until after commandBuffer.waitUntilCompleted().
+        // Keep CVMetalTexture wrappers alive until the command buffer completes.
         var retainedCVTextures: [CVMetalTexture] = []
         retainedCVTextures.reserveCapacity(1 + placements.count * 2)
 
@@ -466,11 +564,13 @@ final class VideoBandCompositor: @unchecked Sendable {
             sourceBuffer: placements.first?.buffer,
             to: destination)
 
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        retainedCVTextures.removeAll(keepingCapacity: false)
-        CVMetalTextureCacheFlush(metal.textureCache, 0)
-        return commandBuffer.status == .completed
+        // Swift may end a local's lifetime at its last use, so pin the texture
+        // wrappers explicitly until the GPU has finished reading them.
+        return withExtendedLifetime(retainedCVTextures) {
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            return commandBuffer.status == .completed
+        }
     }
 
     private struct BandColorSignature: Equatable {
@@ -803,7 +903,7 @@ final class VideoBandCompositor: @unchecked Sendable {
 
     // MARK: - Core Image Fallback
 
-    private func composeWithCoreImageLocked(
+    private func composeWithCoreImage(
         sortedBands: [(key: UInt32, value: CVPixelBuffer)],
         destination: CVPixelBuffer,
         width: Int,
@@ -839,16 +939,78 @@ final class VideoBandCompositor: @unchecked Sendable {
             top += sourceHeight
         }
 
-        ciContext.render(
+        // The Metal path writes the bands' own R'G'B' values and tags the
+        // frame with their color attachments. Produce the same frame here when
+        // the bands share one such description: a main-thread compose uses
+        // this path until the Metal pipelines are ready, and on a static
+        // desktop that frame can stay on screen. Converting to sRGB instead
+        // would clip wide-gamut bands and leave the frame untagged.
+        let sharedColor = Self.sharedTaggedColor(of: sortedBands)
+        coreImageContext().render(
             frame,
             to: destination,
             bounds: outputBounds,
-            colorSpace: sRGBColorSpace)
+            colorSpace: sharedColor?.colorSpace ?? sRGBColorSpace)
+        applyColorAttachments(
+            signature: sharedColor?.signature,
+            sourceBuffer: sharedColor?.sourceBuffer,
+            to: destination)
+    }
+
+    /// The color description every band carries, when there is exactly one,
+    /// it is one the Metal path would propagate, and Core Video can express it
+    /// as a color space to render into.
+    private static func sharedTaggedColor(
+        of sortedBands: [(key: UInt32, value: CVPixelBuffer)]
+    ) -> (signature: BandColorSignature, sourceBuffer: CVPixelBuffer, colorSpace: CGColorSpace)? {
+        guard let first = sortedBands.first?.value,
+              let signature = extractMetalSafeColorSignature(first),
+              signature.primaries != nil
+                || signature.transfer != nil
+                || signature.gammaLevel != nil
+                || signature.cgColorSpaceName != nil,
+              sortedBands.dropFirst().allSatisfy({
+                  extractMetalSafeColorSignature($0.value) == signature
+              }) else {
+            return nil
+        }
+
+        if let attached = CVBufferCopyAttachment(first, kCVImageBufferCGColorSpaceKey, nil),
+           CFGetTypeID(attached) == CGColorSpace.typeID {
+            return (signature, first, attached as! CGColorSpace)
+        }
+        guard let attachments = CVBufferCopyAttachments(first, .shouldPropagate) else {
+            return nil
+        }
+        if let colorSpace = CVImageBufferCreateColorSpaceFromAttachments(attachments)?
+            .takeRetainedValue() {
+            return (signature, first, colorSpace)
+        }
+        // Core Video may decline to describe a buffer that has no YCbCr
+        // matrix, which RGB bands never carry. The matrix has no bearing on
+        // the RGB color space, so supply one and ask again.
+        guard CFDictionaryGetValue(
+            attachments,
+            Unmanaged.passUnretained(kCVImageBufferYCbCrMatrixKey).toOpaque()) == nil,
+              let completed = CFDictionaryCreateMutableCopy(nil, 0, attachments) else {
+            return nil
+        }
+        CFDictionarySetValue(
+            completed,
+            Unmanaged.passUnretained(kCVImageBufferYCbCrMatrixKey).toOpaque(),
+            Unmanaged.passUnretained(kCVImageBufferYCbCrMatrix_ITU_R_709_2).toOpaque())
+        guard let colorSpace = CVImageBufferCreateColorSpaceFromAttachments(completed)?
+            .takeRetainedValue() else {
+            return nil
+        }
+        return (signature, first, colorSpace)
     }
 
     // MARK: - Destination Pool
 
-    private func makeDestinationLocked(width: Int, height: Int) -> CVPixelBuffer? {
+    private func makeDestination(width: Int, height: Int) -> CVPixelBuffer? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         if pool == nil || poolWidth != width || poolHeight != height {
             let poolAttributes: [String: Any] = [
                 kCVPixelBufferPoolMinimumBufferCountKey as String: 4,

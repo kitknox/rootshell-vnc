@@ -528,19 +528,26 @@ final class OrderedMediaPacketCoalescer: @unchecked Sendable {
     func enqueue(contentsOf packets: [Data]) {
         guard !packets.isEmpty else { return }
         if let delayNanos {
+            // Resolve every delay before taking the lock, as the single-packet
+            // path does. `delayNanos` parses RTP and takes the playback
+            // synchronizer's lock; doing that per packet under this lock held
+            // `drain` off packets that were already due for decode.
             var batchNow: UInt64 = 0
-            lock.lock()
+            var candidateDeadlines: [UInt64] = []
+            candidateDeadlines.reserveCapacity(packets.count)
             for packet in packets {
                 let delay = delayNanos(packet)
-                let candidateDeadline: UInt64
                 if delay > 0 {
                     if batchNow == 0 {
                         batchNow = DispatchTime.now().uptimeNanoseconds
                     }
-                    candidateDeadline = batchNow &+ delay
+                    candidateDeadlines.append(batchNow &+ delay)
                 } else {
-                    candidateDeadline = 0
+                    candidateDeadlines.append(0)
                 }
+            }
+            lock.lock()
+            for (packet, candidateDeadline) in zip(packets, candidateDeadlines) {
                 let deadline = max(candidateDeadline, lastDeadlineNanos)
                 lastDeadlineNanos = deadline
                 pending.append(PendingPacket(deadlineNanos: deadline, data: packet))
@@ -2857,6 +2864,12 @@ public final class VNCSession {
         from manager: VideoStreamManager
     ) async {
         guard videoStreamManager === manager else { return }
+        // The manager is reused across stream offers and its media generation
+        // restarts at 1 each time, so a retired stream's update has to be
+        // recognized by the stream generation it carries.
+        guard geometry.streamGeneration == nil
+                || geometry.streamGeneration == manager.decodeProgress.streamGeneration
+        else { return }
         guard manager.currentMediaGeneration == geometry.mediaGeneration else { return }
         guard geometry.mediaGeneration >= appliedMediaGeometryGeneration else { return }
         guard geometry.width > 0, geometry.height > 0,
@@ -2937,7 +2950,8 @@ public final class VNCSession {
             return VideoFrameGeometry(
                 width: size.width,
                 height: size.height,
-                mediaGeneration: geometry.mediaGeneration)
+                mediaGeneration: geometry.mediaGeneration,
+                streamGeneration: geometry.streamGeneration)
         }
         return geometry
     }
@@ -4924,22 +4938,31 @@ public final class VNCSession {
                 queue: queue,
                 delayNanos: videoDelay
             ) { packets in
+                // A repeated offer restarts this same manager and replaces
+                // this coalescer, which can still hold a drain delayed for
+                // audio sync. Bound to its own stream generation, that drain
+                // is dropped instead of feeding the replacement stream.
                 if let stats = RenderCommitStats.shared {
                     for packet in packets {
                         stats.noteVideoPacket(bytes: packet.count)
-                        let result = sinkManager.feedRTPData(packet)
+                        let result = sinkManager.feedRTPData(
+                            packet,
+                            streamGeneration: streamGeneration)
                         stats.noteSubmittedAccessUnits(result.decodedNALUnitCount)
                     }
                 } else {
-                    sinkManager.feedRTPBatch(packets)
+                    sinkManager.feedRTPBatch(packets, streamGeneration: streamGeneration)
                 }
             }
             let secondaryVideoPacketCoalescer = secondaryManager.map { manager in
-                OrderedMediaPacketCoalescer(
+                let secondaryStreamGeneration = manager.decodeProgress.streamGeneration
+                return OrderedMediaPacketCoalescer(
                     queue: queue,
                     delayNanos: videoDelay
                 ) { packets in
-                    manager.feedRTPBatch(packets)
+                    manager.feedRTPBatch(
+                        packets,
+                        streamGeneration: secondaryStreamGeneration)
                 }
             }
             secondaryManager?.onLossDetected = { [weak transport, weak secondaryManager] ssrc in
@@ -5066,7 +5089,12 @@ public final class VNCSession {
                         height: height)
                 }
             }
-            await transport.setAppleMediaRoutedRTPBatchSink { packets in
+            // Scoped to this offer: the transport detaches the sink when it
+            // publishes the next one and holds that stream's first packets
+            // until this function has restarted the decoder and installed the
+            // replacement. Left attached, they would land in this stream's
+            // coalescer, which is bound to a generation the restart retires.
+            await transport.setAppleMediaRoutedRTPBatchSink({ packets in
                 var primaryBatch: [Data] = []
                 var secondaryBatch: [Data] = []
                 primaryBatch.reserveCapacity(packets.count)
@@ -5086,7 +5114,7 @@ public final class VNCSession {
                 if !secondaryBatch.isEmpty {
                     secondaryVideoPacketCoalescer?.enqueue(contentsOf: secondaryBatch)
                 }
-            }
+            }, retiresOnStreamOffer: true)
         }
     }
 

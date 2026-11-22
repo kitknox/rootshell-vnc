@@ -3,9 +3,20 @@
 import Foundation
 import PackageDescription
 
-// A gitignored `.optimize-debug` marker builds Debug with release optimization
-// for a local checkout. Remote checkouts never have it, which matters because
-// SwiftPM rejects version-pinned dependencies that use unsafe flags.
+// A gitignored `.optimize-debug` marker next to this manifest builds Debug with
+// release optimization for a local checkout. Remote checkouts never have it,
+// which matters because SwiftPM rejects version-pinned dependencies that use
+// unsafe flags. The switch is deliberately a file in the checkout rather than
+// an environment variable: a variable set for a host build would also reach
+// this manifest in a pinned checkout and get the package rejected.
+//
+// The marker is read when this manifest is evaluated, and SwiftPM and Xcode
+// cache that evaluation by this file's contents, not by the marker. Creating
+// or removing the marker therefore has no effect until the cached evaluation
+// is discarded: delete ~/Library/Caches/org.swift.swiftpm/manifests and, for
+// Xcode or xcodebuild, the project's DerivedData as well. `swift build
+// --manifest-cache none` reads the marker afresh, but only for that one
+// invocation; the next ordinary build goes back to the cached evaluation.
 let optimizeDebug = FileManager.default.fileExists(
     atPath: Context.packageDirectory + "/.optimize-debug"
 )

@@ -597,6 +597,9 @@ public actor TransportSession {
     /// video2). Incoming datagrams are matched to a context by SSRC.
     private var appleMediaSRTPContexts: [AppleSRTPContext] = []
     private var appleMediaSRTPContextBySSRC: [UInt32: AppleSRTPContext] = [:]
+    /// Keeps a receive context, and with it each source's rollover counter,
+    /// when the SRTP state is rebuilt with an unchanged key.
+    private var appleMediaSRTPReceiveContexts = AppleMediaSRTPReceiveContextStore()
     /// Off-actor SRTP batch decryptor used by the UDP receive task so high-rate
     /// HEVC decryption does not contend with input sends on this actor.
     private nonisolated let appleMediaSRTPDecryptor = AppleMediaSRTPDecryptor()
@@ -5179,6 +5182,16 @@ public actor TransportSession {
         return true
     }
 
+    /// Publish a stream offer to the session owner. Media for the offered
+    /// stream can follow as soon as the offer is answered, so a sink scoped
+    /// to the previous offer is detached first.
+    private func publishAppleMediaStreamOffer(_ offer: AppleMediaStreamOffer) {
+        if appleMediaPacketHandoff.retireOfferScopedSink() {
+            log.info("Holding media packets until the sink for the new stream offer is installed")
+        }
+        continuation?.yield(.mediaStreamOffer(offer))
+    }
+
     private func handleAppleMediaStreamOfferPayload(_ offerData: Data) async throws {
         if virtualDisplayReleaseRequested {
             // Not a stream to set up: the offer only confirms the request.
@@ -5202,7 +5215,7 @@ public actor TransportSession {
         }
         try configureAppleMediaComCryptionIfPresent(offer.rawPayload)
         try await configureAppleMediaUDP(for: offer)
-        continuation?.yield(.mediaStreamOffer(offer))
+        publishAppleMediaStreamOffer(offer)
         let actions = stateMachine.handle(event: .receivedMediaStreamOffer(offer))
         try await executeActions(actions)
     }
@@ -6313,7 +6326,7 @@ public actor TransportSession {
                 audioStreamUDPPort: audioPort,
                 videoStream1UDPPort: videoPort,
                 videoStreamDisplayCount: appleMediaDisplayCount)
-            continuation?.yield(.mediaStreamOffer(offer))
+            publishAppleMediaStreamOffer(offer)
             log.info("Published password-only Apple media offer for decoder startup")
         }
 
@@ -6355,6 +6368,7 @@ public actor TransportSession {
         appleMediaSRTPKeys = nil
         appleMediaSRTPContexts.removeAll(keepingCapacity: true)
         appleMediaSRTPContextBySSRC.removeAll(keepingCapacity: true)
+        appleMediaSRTPReceiveContexts.removeAll()
         appleMediaSRTPDecryptorGeneration = appleMediaSRTPDecryptor.configure(
             contexts: [],
             expectsSRTP: true)
@@ -6658,35 +6672,67 @@ public actor TransportSession {
         releasedBatch.reserveCapacity(items.count)
         var needsReorderSchedule = false
         var latestArrivalNanos = processingStart
+        var reauthenticatedCount = 0
+        var replacedKeyRejectCount = 0
+        var retiredKeyDropCount = 0
 
         for (index, item) in items.enumerated() {
             if index > 0 && (index & 63) == 0 {
                 batchClockNanos = DispatchTime.now().uptimeNanoseconds
             }
             switch item {
-            case .decrypted(let packet, let wireByteCount, let ssrc, let context, let arrivalNanos):
-                // Reject packets authenticated with retired SRTP keys after a
-                // media renegotiation or teardown so stale SSRCs/frames never
-                // enter the replacement stream's reorder buffer.
-                guard generationMatches,
-                      appleMediaSRTPContexts.contains(where: { $0 === context }) else {
-                    continue
+            case .decrypted(let packet, let wire, let ssrc, let context, let arrivalNanos):
+                let disposition: AppleMediaSRTPDecryptor.Disposition = generationMatches
+                    ? .accept
+                    : AppleMediaSRTPDecryptor.disposition(
+                        ofPacketAuthenticatedBy: context,
+                        batchGeneration: batch.generation,
+                        activeGeneration: appleMediaSRTPDecryptorGeneration,
+                        activeContexts: appleMediaSRTPContexts)
+                switch disposition {
+                case .accept:
+                    if appleMediaFeedbackRouteByRemoteSSRC[ssrc] == nil {
+                        bindAppleMediaFeedbackRouteIfAvailable(
+                            receiveContext: context,
+                            remoteSSRC: ssrc)
+                    }
+                    acceptAppleMediaRTPPacket(
+                        packet,
+                        wireByteCount: wire.count,
+                        arrivalNanos: arrivalNanos,
+                        processingNanos: batchClockNanos,
+                        from: channel,
+                        releasedBatch: &releasedBatch,
+                        deferReorderSchedule: true)
+                    needsReorderSchedule = true
+                    latestArrivalNanos = arrivalNanos
+                case .reauthenticate:
+                    // The context that authenticated this packet was replaced
+                    // while the batch waited for the actor. A rebuild with
+                    // unchanged keys keeps its contexts, so this is a key
+                    // change, but the decision belongs to the current keys:
+                    // offer them the wire datagram. Packets from retired keys
+                    // fail that check and never reach the replacement
+                    // stream's reorder buffer.
+                    if !releasedBatch.isEmpty {
+                        emitAppleMediaRTPBatch(releasedBatch)
+                        releasedBatch.removeAll(keepingCapacity: true)
+                    }
+                    let failuresBefore = appleMediaUnprotectFailures
+                    handleAppleMediaUDPDatagram(
+                        wire,
+                        arrivalNanos: arrivalNanos,
+                        from: channel)
+                    if appleMediaUnprotectFailures == failuresBefore {
+                        reauthenticatedCount += 1
+                    } else {
+                        replacedKeyRejectCount += 1
+                    }
+                case .drop:
+                    // Authenticated by keys a renegotiation or teardown has
+                    // since retired, with no replacement installed yet.
+                    retiredKeyDropCount += 1
                 }
-                if appleMediaFeedbackRouteByRemoteSSRC[ssrc] == nil {
-                    bindAppleMediaFeedbackRouteIfAvailable(
-                        receiveContext: context,
-                        remoteSSRC: ssrc)
-                }
-                acceptAppleMediaRTPPacket(
-                    packet,
-                    wireByteCount: wireByteCount,
-                    arrivalNanos: arrivalNanos,
-                    processingNanos: batchClockNanos,
-                    from: channel,
-                    releasedBatch: &releasedBatch,
-                    deferReorderSchedule: true)
-                needsReorderSchedule = true
-                latestArrivalNanos = arrivalNanos
             case .raw(let datagram, let arrivalNanos):
                 if !releasedBatch.isEmpty {
                     emitAppleMediaRTPBatch(releasedBatch)
@@ -6704,6 +6750,21 @@ public actor TransportSession {
         }
         if needsReorderSchedule {
             scheduleAppleMediaReorderFlush(nowNanos: latestArrivalNanos)
+        }
+        if reauthenticatedCount > 0 {
+            log.info(
+                "Re-authenticated \(reauthenticatedCount) media packets decrypted "
+                    + "before an SRTP context rebuild")
+        }
+        if replacedKeyRejectCount > 0 {
+            log.info(
+                "Rejected \(replacedKeyRejectCount) media packets decrypted with "
+                    + "SRTP keys that have since been replaced")
+        }
+        if retiredKeyDropCount > 0 {
+            log.info(
+                "Dropped \(retiredKeyDropCount) media packets authenticated by "
+                    + "retired SRTP keys")
         }
 
         let processingEnd = DispatchTime.now().uptimeNanoseconds
@@ -6764,6 +6825,7 @@ public actor TransportSession {
         appleMediaSRTPKeys = nil
         appleMediaSRTPContexts.removeAll()
         appleMediaSRTPContextBySSRC.removeAll()
+        appleMediaSRTPReceiveContexts.removeAll()
         appleMediaSRTPDecryptorGeneration = appleMediaSRTPDecryptor.clear()
         appleMediaFeedbackRoutes.removeAll()
         appleMediaFeedbackRouteByRemoteSSRC.removeAll()
@@ -6795,6 +6857,13 @@ public actor TransportSession {
     /// packets by SSRC on first use.
     private func rebuildAppleMediaSRTPContexts() {
         guard let keys = appleMediaSRTPKeys else { return }
+        // This runs twice per negotiation with the same keys (before the
+        // server configuration, then after the stream answer) while media may
+        // already be flowing. Receive contexts for unchanged keys are kept so
+        // their rollover counters, and packets the read task has already
+        // decrypted with them, stay valid.
+        appleMediaSRTPReceiveContexts.beginRebuild()
+        defer { appleMediaSRTPReceiveContexts.finishRebuild() }
         appleMediaSRTPContexts.removeAll(keepingCapacity: true)
         appleMediaSRTPContextBySSRC.removeAll(keepingCapacity: true)
         appleMediaFeedbackRoutes.removeAll(keepingCapacity: true)
@@ -6811,7 +6880,8 @@ public actor TransportSession {
                   let localSSRC,
                   serverToViewer.count >= 46,
                   viewerToServer.count >= 46,
-                  let receiveContext = try? AppleSRTPContext(mediaKey: serverToViewer),
+                  let receiveContext = try? appleMediaSRTPReceiveContexts.context(
+                    forMediaKey: serverToViewer),
                   let sendRTCPContext = try? AppleSRTCPContext(mediaKey: viewerToServer),
                   let receiveRTCPContext = try? AppleSRTCPContext(mediaKey: serverToViewer)
             else { return }
@@ -6840,7 +6910,8 @@ public actor TransportSession {
         if keys.audioServerToViewer.count >= 46,
            keys.audioViewerToServer.count >= 46,
            appleMediaAudioLocalSSRC != 0,
-           let audioContext = try? AppleSRTPContext(mediaKey: keys.audioServerToViewer),
+           let audioContext = try? appleMediaSRTPReceiveContexts.context(
+                forMediaKey: keys.audioServerToViewer),
            let sendRTCPContext = try? AppleSRTCPContext(
                 mediaKey: keys.audioViewerToServer),
            let receiveRTCPContext = try? AppleSRTCPContext(
@@ -6954,7 +7025,25 @@ public actor TransportSession {
     public func setAppleMediaRoutedRTPBatchSink(
         _ sink: (@Sendable ([(data: Data, displayIndex: Int?)]) -> Void)?
     ) {
-        let drained = appleMediaPacketHandoff.installBatchSink(sink)
+        setAppleMediaRoutedRTPBatchSink(sink, retiresOnStreamOffer: false)
+    }
+
+    /// Install a batch sink, optionally scoped to the current stream offer.
+    ///
+    /// An owner that rebuilds its decoder for every `.mediaStreamOffer` event
+    /// and then installs a fresh sink should pass `retiresOnStreamOffer:
+    /// true`. The transport then detaches the sink as it publishes the next
+    /// offer, before answering it, and holds the new stream's packets in
+    /// order until the replacement is installed. Otherwise the first packets
+    /// of the new stream (its parameter sets and keyframe) reach the old sink
+    /// while the owner is still tearing that stream down.
+    public func setAppleMediaRoutedRTPBatchSink(
+        _ sink: (@Sendable ([(data: Data, displayIndex: Int?)]) -> Void)?,
+        retiresOnStreamOffer: Bool
+    ) {
+        let drained = appleMediaPacketHandoff.installBatchSink(
+            sink,
+            retiresOnStreamOffer: retiresOnStreamOffer)
         if drained.packetCount > 0 {
             log.info("Drained \(drained.packetCount) ordered startup RTP packets "
                 + "(\(drained.byteCount) bytes) into the media batch sink")
