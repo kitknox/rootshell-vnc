@@ -228,6 +228,15 @@ struct HUDMenu<SessionActions: View, SessionDisplay: View>: View {
                 shortcutButtons(RemoteMenuShortcut.documents, platform: platform)
             }
             Menu(String(localized: "Special Keys", bundle: .module)) {
+                if keyboardCapture.canSwitchLocalInputSource {
+                    Button {
+                        keyboardCapture.switchLocalInputSource()
+                    } label: {
+                        Label(
+                            String(localized: "Switch Keyboard Language", bundle: .module),
+                            systemImage: "globe")
+                    }
+                }
                 shortcutButtons(RemoteMenuShortcut.keys, platform: platform)
                 commandButtons(RemoteCommand.keys)
             }
@@ -310,6 +319,22 @@ struct HUDMenu<SessionActions: View, SessionDisplay: View>: View {
             }
 
             if hardwareKeyboardAttached {
+                #if os(iOS) && !targetEnvironment(macCatalyst)
+                if !keyboardHandler.forwardsPhysicalKeys {
+                    Toggle(isOn: Binding(
+                        get: { keyboardCapture.routesControlSpaceToRemote },
+                        set: { keyboardCapture.routesControlSpaceToRemote = $0 }
+                    )) {
+                        Label(String(localized: "Send Control-Space to Remote Computer", bundle: .module), systemImage: "arrowshape.turn.up.right")
+                    }
+                    Toggle(isOn: Binding(
+                        get: { keyboardCapture.capsLockSwitchesInputSource },
+                        set: { keyboardCapture.capsLockSwitchesInputSource = $0 }
+                    )) {
+                        Label(String(localized: "Caps Lock Switches Keyboard Language", bundle: .module), systemImage: "globe")
+                    }
+                }
+                #endif
                 if keyboardCapture.hasReservedHostShortcuts {
                     Toggle(isOn: Binding(
                         get: { keyboardCapture.routesReservedHostShortcutsToVNC },

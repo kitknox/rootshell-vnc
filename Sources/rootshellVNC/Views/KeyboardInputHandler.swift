@@ -128,18 +128,19 @@ public struct KeyboardInputHandler {
 
     private let sendPhysicalKeyEvent: PhysicalKeyEventHandler?
 
-    /// A copy that calls `onKeyDown` before every key press it sends.
-    func notifyingKeyDown(_ onKeyDown: @escaping @MainActor () -> Void) -> KeyboardInputHandler {
+    /// A copy that reports the keysym before every key press it sends.
+    /// Text-input adapters can distinguish a bare Shift from a caret change.
+    func notifyingKeyDown(_ onKeyDown: @escaping @MainActor (UInt32) -> Void) -> KeyboardInputHandler {
         var physical: PhysicalKeyEventHandler?
         if let send = sendPhysicalKeyEvent {
             physical = { (downFlag: Bool, usage: UInt32, keysym: UInt32) in
-                if downFlag { onKeyDown() }
+                if downFlag { onKeyDown(keysym) }
                 send(downFlag, usage, keysym)
             }
         }
         return KeyboardInputHandler(
             sendKeyEvent: { [sendKeyEvent] downFlag, keysym in
-                if downFlag { onKeyDown() }
+                if downFlag { onKeyDown(keysym) }
                 sendKeyEvent(downFlag, keysym)
             },
             usesAppleModifierConvention: usesAppleModifierConvention,

@@ -119,6 +119,7 @@ struct RemoteInteractionView: UIViewRepresentable {
 @MainActor
 private final class RemoteInputObserver {
     var onInput: (() -> Void)?
+    var onKeyInput: ((UInt32) -> Void)?
 }
 
 @MainActor
@@ -137,6 +138,233 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private let touchHandler: TouchInputHandler
     private let keyboardHandler: KeyboardInputHandler
     private let keyboardCapture: VNCKeyboardCapture
+
+    #if os(iOS) && !targetEnvironment(macCatalyst)
+    private var localInputSource = LocalInputSourceState()
+    private var preferredLocalInputLanguage: String?
+    private var observedLocalInputLanguage: String?
+    private var inputLanguageParkingField: UITextField?
+    private var isRefreshingLocalInputSource = false
+    private var claimedLocalCapsLockPress = false
+    private var controlSpaceKeys = UniversalCommandKeyState()
+    private var localHardwareText: (characters: String, shift: Bool)?
+
+    private lazy var controlSpaceKeyCommand = makeViewerCommand(
+        title: String(localized: "Control-Space", bundle: .module),
+        input: " ", modifiers: .control,
+        action: #selector(handleControlSpaceCommand(_:)))
+
+    private var localInputLanguages: [String] {
+        guard !keyboardHandler.forwardsPhysicalKeys else { return [] }
+        return LocalInputSourceState.availableLanguages(
+            UITextInputMode.activeInputModes.compactMap(\.primaryLanguage))
+    }
+
+    private var usesLocalTextInput: Bool {
+        localInputLanguages.count > 1
+            && (!keyboardCapture.routesControlSpaceToRemote
+                || keyboardCapture.capsLockSwitchesInputSource
+                || preferredLocalInputLanguage != nil)
+    }
+
+    private var currentLocalInputLanguage: String? {
+        preferredLocalInputLanguage ?? observedLocalInputLanguage
+            ?? super.textInputMode?.primaryLanguage ?? localInputLanguages.first
+    }
+
+    private func inputSourceRoutingDidChange() {
+        if let commit = textDocument.unmark() { commitComposition(commit) }
+        localHardwareText = nil
+        if !keyboardCapture.capsLockSwitchesInputSource { localInputSource.releaseCapsLock() }
+        releaseAllPressedKeys()
+        updateLocalInputSourceAvailability()
+        UIMenuSystem.main.setNeedsRebuild()
+    }
+
+    override var textInputMode: UITextInputMode? {
+        let systemMode = super.textInputMode
+        guard systemMode?.primaryLanguage != "emoji", localInputLanguages.count > 1,
+              let language = preferredLocalInputLanguage else { return systemMode }
+        return UITextInputMode.activeInputModes.first { $0.primaryLanguage == language }
+            ?? systemMode
+    }
+
+    private func updateLocalInputSourceAvailability() {
+        keyboardCapture.canSwitchLocalInputSource = localInputLanguages.count > 1
+    }
+
+    @objc private func localInputModeDidChange() {
+        updateLocalInputSourceAvailability()
+        // Keep the pre-press language if iPadOS switches before the GC callback.
+        let keyboard = monitoredCatalystKeyboardInput
+        let controlSpaceIsDown = keyboard.map {
+            $0.button(forKeyCode: .spacebar)?.isPressed == true
+                && Self.gameControllerModifierFlags($0).contains(.control)
+        } ?? false
+        guard isFirstResponder, !isRefreshingLocalInputSource,
+              !localInputSource.capsLockIsDown,
+              controlSpaceKeys.pressed.isEmpty, !controlSpaceIsDown,
+              monitoredCatalystKeyboardInput?.button(forKeyCode: .capsLock)?.isPressed != true else { return }
+        preferredLocalInputLanguage = nil
+        observedLocalInputLanguage = super.textInputMode?.primaryLanguage
+        updateLocalInputSourceAvailability()
+    }
+
+    private var canSwitchLocalInputSource: Bool {
+        acceptsHardwareInput && keyboardCapture.isCaptured && window?.isKeyWindow == true
+            && (isFirstResponder || (isRefreshingLocalInputSource && inputLanguageParkingField?.isFirstResponder == true))
+            && localInputLanguages.count > 1
+    }
+
+    private func switchLocalInputSource(to language: String? = nil) {
+        guard canSwitchLocalInputSource,
+              let target = language ?? LocalInputSourceState.nextLanguage(
+                current: currentLocalInputLanguage,
+                languages: localInputLanguages) else { return }
+
+        if let commit = textDocument.unmark() { commitComposition(commit) }
+        preferredLocalInputLanguage = target
+        observedLocalInputLanguage = target
+        updateLocalInputSourceAvailability()
+        // Rapid taps update the target without interrupting the pending focus return.
+        if isRefreshingLocalInputSource { return }
+
+        let parking: UITextField
+        if let existing = inputLanguageParkingField {
+            parking = existing
+        } else {
+            parking = UITextField(frame: CGRect(x: -2, y: -2, width: 1, height: 1))
+            parking.isHidden = true
+            parking.autocorrectionType = .no
+            parking.autocapitalizationType = .none
+            addSubview(parking)
+            inputLanguageParkingField = parking
+        }
+        parking.inputView = inputView
+        parking.inputAccessoryView = inputAccessoryView
+        isRefreshingLocalInputSource = true
+        guard parking.becomeFirstResponder() else {
+            isRefreshingLocalInputSource = false
+            reloadInputViews()
+            return
+        }
+        DispatchQueue.main.async { [weak self, weak parking] in
+            guard let self else { return }
+            defer { self.isRefreshingLocalInputSource = false }
+            // A credential prompt, tab change or inactive window wins focus.
+            guard parking?.isFirstResponder == true else { return }
+            guard self.acceptsHardwareInput, self.keyboardCapture.isCaptured,
+                  self.window?.isKeyWindow == true else {
+                parking?.resignFirstResponder()
+                return
+            }
+            _ = self.becomeFirstResponder()
+        }
+    }
+
+    /// GC owns Caps Lock edges when available; UIKit consumes its duplicate.
+    /// Keeping one owner avoids two language changes for a single physical tap.
+    private func handleLocalCapsLock(
+        usage: UInt32, pressed: Bool, flags: UIKeyModifierFlags, fromMonitor: Bool
+    ) -> Bool {
+        guard usage == 0x39 else { return false }
+        let monitorOwnsCapsLock = monitoredCatalystKeyboardInput?.button(forKeyCode: .capsLock) != nil
+        if !pressed {
+            let consumed = fromMonitor ? localInputSource.capsLockIsDown : claimedLocalCapsLockPress
+            if !fromMonitor { claimedLocalCapsLockPress = false }
+            if fromMonitor == monitorOwnsCapsLock {
+                let wasLocked = localInputSource.uppercaseLocked
+                if localInputSource.releaseCapsLock(at: CACurrentMediaTime()) {
+                    switchLocalInputSource()
+                } else if localInputSource.uppercaseLocked != wasLocked {
+                    switchLocalInputSource(to: currentLocalInputLanguage)
+                }
+            }
+            return consumed
+        }
+        if localInputSource.capsLockIsDown {
+            if !fromMonitor { claimedLocalCapsLockPress = true }
+            return true
+        }
+        guard keyboardCapture.capsLockSwitchesInputSource, canSwitchLocalInputSource,
+              flags.intersection([.control, .alternate, .command]).isEmpty,
+              super.textInputMode?.primaryLanguage != "emoji" else { return false }
+        if !fromMonitor { claimedLocalCapsLockPress = true }
+        guard fromMonitor == monitorOwnsCapsLock else { return true }
+        if localInputSource.pressCapsLock(shift: flags.contains(.shift), at: CACurrentMediaTime()) {
+            if flags.contains(.shift) {
+                switchLocalInputSource(to: currentLocalInputLanguage)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + LocalInputSourceState.capsLockHoldDuration) { [weak self] in
+                guard let self, self.canSwitchLocalInputSource else { return }
+                let wasLocked = self.localInputSource.uppercaseLocked
+                self.localInputSource.holdCapsLock(at: CACurrentMediaTime())
+                if self.localInputSource.uppercaseLocked != wasLocked {
+                    self.switchLocalInputSource(to: self.currentLocalInputLanguage)
+                }
+            }
+        }
+        return true
+    }
+
+    @objc private func handleControlSpaceCommand(_ command: UIKeyCommand) {
+        guard command.input == " ",
+              canHandleControlSpace(command.modifierFlags) else { return }
+        // GC owns physical edges when available; the command only claims the chord.
+        guard monitoredCatalystKeyboardInput?.button(forKeyCode: .spacebar) == nil else { return }
+        if controlSpaceKeys.routeCommand(keysym: 0x20) == .tap {
+            routeControlSpace()
+        }
+    }
+
+    private func canHandleControlSpace(_ flags: UIKeyModifierFlags) -> Bool {
+        !keyboardHandler.forwardsPhysicalKeys && acceptsHardwareInput
+            && keyboardCapture.isCaptured && window?.isKeyWindow == true
+            && (isFirstResponder || (isRefreshingLocalInputSource && inputLanguageParkingField?.isFirstResponder == true))
+            && super.textInputMode?.primaryLanguage != "emoji"
+            && flags.intersection([.control, .alternate, .shift, .command]) == .control
+            && !isReservedHostShortcut(input: " ", modifiers: .control)
+    }
+
+    private func routeControlSpace() {
+        if keyboardCapture.routesControlSpaceToRemote {
+            releaseAllPressedKeys()
+            keyboardHandler.handleMenuShortcut(.controlSpace)
+        } else {
+            switchLocalInputSource()
+        }
+    }
+
+    private func handleControlSpace(
+        usage: UInt32, pressed: Bool, flags: UIKeyModifierFlags, fromMonitor: Bool
+    ) -> Bool {
+        guard usage == 0x2C else { return false }
+        let monitorOwnsSpace = monitoredCatalystKeyboardInput?.button(forKeyCode: .spacebar) != nil
+        if !pressed {
+            let consumed = controlSpaceKeys.pressed[usage] != nil
+            if fromMonitor == monitorOwnsSpace {
+                controlSpaceKeys.release(usage: usage, keysym: 0x20)
+            }
+            return consumed
+        }
+        if controlSpaceKeys.pressed[usage] != nil { return true }
+        guard canHandleControlSpace(flags) else { return false }
+        guard fromMonitor == monitorOwnsSpace else { return true }
+        if controlSpaceKeys.beginPhysical(usage: usage, keysym: 0x20) {
+            routeControlSpace()
+        }
+        return true
+    }
+
+    private func usesLocalTextInput(for key: UIKey) -> Bool {
+        guard usesLocalTextInput,
+              key.modifierFlags.intersection([.control, .alternate, .command]).isEmpty else { return false }
+        let usage = key.keyCode.rawValue
+        // UIKit owns composition and candidate selection for the active language.
+        return (0x04...0x38).contains(usage)
+            || (textDocument.marked != nil && (0x4F...0x52).contains(usage))
+    }
+    #endif
 
     /// What the software keyboard thinks it is editing; see
     /// `RemoteTextInputDocument`.
@@ -430,12 +658,21 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             + catalystEditingKeyCommands
             + remoteControlKeyCommands
         #else
-        let commands = reservedHostKeyCommands
+        var commands = reservedHostKeyCommands
             + commandCompatibilityKeyCommands
             + standardRemoteKeyCommands
             + remoteNavigationKeyCommands
             + viewerCommandKeyCommands
             + remoteCommandKeyCommands
+        #if os(iOS)
+        if usesLocalTextInput, textDocument.marked != nil {
+            commands.removeAll { $0.action == #selector(handleRemoteNavigationKey(_:)) }
+        }
+        if !keyboardHandler.forwardsPhysicalKeys,
+           !isReservedHostShortcut(input: " ", modifiers: .control) {
+            commands.append(controlSpaceKeyCommand)
+        }
+        #endif
         #endif
         guard keyboardCapture.controlOptionAsCommand else { return commands }
         return universalCommandKeyCommands + commands.filter {
@@ -811,9 +1048,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     ) {
         let remoteInput = RemoteInputObserver()
         self.touchHandler = touchHandler.notifyingButtonDown { remoteInput.onInput?() }
-        self.keyboardHandler = keyboardHandler.notifyingKeyDown { [weak keyboardCapture] in
+        self.keyboardHandler = keyboardHandler.notifyingKeyDown { [weak keyboardCapture] keysym in
             keyboardCapture?.noteKeyboardInput()
-            remoteInput.onInput?()
+            remoteInput.onKeyInput?(keysym)
         }
         self.keyboardCapture = keyboardCapture
         self.requestPasswordSend = requestPasswordSend
@@ -827,7 +1064,28 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             self.discardTextDocument()
         }
         remoteInput.onInput = discardTextDocument
+        remoteInput.onKeyInput = { [weak self] keysym in
+            guard let self, !self.isTypingText else { return }
+            #if os(iOS) && !targetEnvironment(macCatalyst)
+            if self.usesLocalTextInput, self.textDocument.marked != nil {
+                // Shift participates in composition. Commit before a remote
+                // shortcut modifier can change the meaning of the pending text.
+                if keysym == KeyboardInputHandler.keysymShiftL
+                    || keysym == KeyboardInputHandler.keysymShiftR { return }
+                if let commit = self.textDocument.unmark() { self.commitComposition(commit) }
+            }
+            #endif
+            self.discardTextDocument()
+        }
         keyboardCapture.onExternalInput = discardTextDocument
+        #if os(iOS) && !targetEnvironment(macCatalyst)
+        keyboardCapture.onSwitchLocalInputSource = { [weak self] in self?.switchLocalInputSource() }
+        keyboardCapture.onInputSourceRoutingChanged = { [weak self] in self?.inputSourceRoutingDidChange() }
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(localInputModeDidChange),
+            name: UITextInputMode.currentInputModeDidChangeNotification, object: nil)
+        updateLocalInputSourceAvailability()
+        #endif
         hardwareKeyboard.controlOptionAsCommand = keyboardCapture.controlOptionAsCommand
         backgroundColor = .clear
         isMultipleTouchEnabled = true
@@ -923,6 +1181,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         let became = super.becomeFirstResponder()
         if became {
             configureHardwareKeyboardMonitor(for: GCKeyboard.coalesced)
+            #if os(iOS) && !targetEnvironment(macCatalyst)
+            if !isRefreshingLocalInputSource {
+                observedLocalInputLanguage = textInputMode?.primaryLanguage
+            }
+            updateLocalInputSourceAvailability()
+            #endif
             clearInputAssistants()
             keyboardCapture.setRemoteInputIsFirstResponder(true)
             #if targetEnvironment(macCatalyst)
@@ -998,6 +1262,14 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     override func resignFirstResponder() -> Bool {
         // A refused resign keeps the keyboard, so held keys stay held.
         guard canResignFirstResponder else { return false }
+        #if os(iOS) && !targetEnvironment(macCatalyst)
+        if !isRefreshingLocalInputSource {
+            localInputSource.releaseCapsLock()
+            claimedLocalCapsLockPress = false
+            controlSpaceKeys.releaseAll()
+            localHardwareText = nil
+        }
+        #endif
         releaseAllPressedKeys()
         discardTextDocument()
         let resigned = super.resignFirstResponder()
@@ -1168,7 +1440,11 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         let inputViewsChanged = inputViewsGeneration != lastSeenInputViewsGeneration
         lastSeenInputViewsGeneration = inputViewsGeneration
         if keyboardCaptured {
+            #if os(iOS) && !targetEnvironment(macCatalyst)
+            if !isFirstResponder, !isRefreshingLocalInputSource { _ = becomeFirstResponder() }
+            #else
             if !isFirstResponder { _ = becomeFirstResponder() }
+            #endif
             if keyboardModeChanged || (inputViewsChanged && isFirstResponder) {
                 reloadInputViews()
             }
@@ -1235,6 +1511,15 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     func insertText(_ text: String) {
+        #if os(iOS) && !targetEnvironment(macCatalyst)
+        var text = text
+        if keyboardCapture.capsLockSwitchesInputSource, textDocument.marked == nil,
+           let hardwareText = localHardwareText, text.count == 1,
+           text.caseInsensitiveCompare(hardwareText.characters) == .orderedSame {
+            text = localInputSource.hardwareCharacters(text, shift: hardwareText.shift)
+        }
+        localHardwareText = nil
+        #endif
         let modifiers = keyboardCapture.supplementalModifiers
         // A modifier chord is a shortcut, and Return or Tab acts on the whole
         // remote line: both go to the remote caret, not the keyboard's.
@@ -1330,6 +1615,19 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
                 continue
             }
             let usage = UInt32(key.keyCode.rawValue)
+            #if os(iOS) && !targetEnvironment(macCatalyst)
+            if handleLocalCapsLock(usage: usage, pressed: true, flags: key.modifierFlags, fromMonitor: false) {
+                continue
+            }
+            if handleControlSpace(usage: usage, pressed: true, flags: key.modifierFlags, fromMonitor: false) {
+                continue
+            }
+            if usesLocalTextInput(for: key) {
+                localHardwareText = (key.characters, key.modifierFlags.contains(.shift))
+                unhandled.insert(press)
+                continue
+            }
+            #endif
             if keyboardCapture.controlOptionAsCommand {
                 if (0xE0...0xE7).contains(usage) {
                     _ = hardwareKeyboard.press(usage: usage,
@@ -1369,11 +1667,17 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             // Control/Command are represented by separate RFB modifier events.
             // UIKit may put an ASCII control byte in `characters` for those
             // chords, so use the printable layout result instead.
-            let characters = KeyboardInputHandler.hardwareCharacters(
+            var characters = KeyboardInputHandler.hardwareCharacters(
                 characters: key.characters,
                 charactersIgnoringModifiers: key.charactersIgnoringModifiers,
                 controlOrCommandDown: !key.modifierFlags
                     .intersection([.control, .command]).isEmpty)
+            #if os(iOS) && !targetEnvironment(macCatalyst)
+            if keyboardCapture.capsLockSwitchesInputSource, localInputLanguages.count > 1 {
+                characters = localInputSource.hardwareCharacters(
+                    characters, shift: key.modifierFlags.contains(.shift))
+            }
+            #endif
             let keysym = KeyboardInputHandler.keysymForHIDUsage(
                 usage,
                 characters: characters,
@@ -1649,6 +1953,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     @objc private func hardwareKeyboardDidDisconnect(_ notification: Notification) {
+        #if os(iOS) && !targetEnvironment(macCatalyst)
+        controlSpaceKeys.releaseAll()
+        localInputSource.releaseCapsLock()
+        claimedLocalCapsLockPress = false
+        localHardwareText = nil
+        #endif
         releaseAllPressedKeys()
         // GameController may post before `coalesced` drops the disconnected
         // instance. Read it on the next main-loop turn so multiple connected
@@ -1674,6 +1984,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             let usage = UInt32(keyCode.rawValue)
             DispatchQueue.main.async { [weak self] in
                 MainActor.assumeIsolated {
+                    #if os(iOS) && !targetEnvironment(macCatalyst)
+                    if self?.handleLocalCapsLock(
+                        usage: usage, pressed: pressed, flags: snapshot, fromMonitor: true) == true { return }
+                    if self?.handleControlSpace(
+                        usage: usage, pressed: pressed, flags: snapshot, fromMonitor: true) == true { return }
+                    #endif
                     self?.handleMonitoredUniversalKey(usage: usage, pressed: pressed, flags: snapshot)
                 }
             }
@@ -2297,6 +2613,14 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        #if os(iOS) && !targetEnvironment(macCatalyst)
+        if !isRefreshingLocalInputSource {
+            controlSpaceKeys.releaseAll()
+            localInputSource.releaseCapsLock()
+            claimedLocalCapsLockPress = false
+            localHardwareText = nil
+        }
+        #endif
         consumedRemoteAliasUsages.removeAll()
         releaseAllPressedKeys()
         super.pressesCancelled(presses, with: event)
@@ -2310,6 +2634,17 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
                 continue
             }
             let usage = UInt32(key.keyCode.rawValue)
+            #if os(iOS) && !targetEnvironment(macCatalyst)
+            localHardwareText = nil
+            if usage == 0x39, handleLocalCapsLock(
+                usage: usage, pressed: false, flags: key.modifierFlags, fromMonitor: false) {
+                continue
+            }
+            if handleControlSpace(
+                usage: usage, pressed: false, flags: key.modifierFlags, fromMonitor: false) {
+                continue
+            }
+            #endif
             if keyboardCapture.controlOptionAsCommand, (0xE0...0xE7).contains(usage) {
                 _ = hardwareKeyboard.release(usage: usage)
                 clearPendingTapsIfChordEnded()

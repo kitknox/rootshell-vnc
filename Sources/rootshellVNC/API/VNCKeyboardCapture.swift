@@ -179,6 +179,26 @@ public final class VNCKeyboardCapture {
     /// explicit menu commands and toolbar modifiers keep their original meaning.
     public var controlOptionAsCommand: Bool = true
 
+    /// On iOS, send Control-Space to the remote computer. When false, cycle
+    /// installed input languages locally. Physical-key hosts and Catalyst ignore it.
+    public var routesControlSpaceToRemote = true {
+        didSet { onInputSourceRoutingChanged?() }
+    }
+
+    /// Opt in to using Caps Lock for local language switching on iOS.
+    /// Hold Caps Lock or use Shift-Caps Lock for case locking. Requires two languages.
+    public var capsLockSwitchesInputSource = false {
+        didSet { onInputSourceRoutingChanged?() }
+    }
+
+    @ObservationIgnored var onInputSourceRoutingChanged: (@MainActor () -> Void)?
+
+    public internal(set) var canSwitchLocalInputSource = false
+    @ObservationIgnored var onSwitchLocalInputSource: (@MainActor () -> Void)?
+
+    /// Changes the local input language without sending a remote shortcut.
+    public func switchLocalInputSource() { onSwitchLocalInputSource?() }
+
     /// Mac: the host has turned off the local system shortcuts on Space
     /// (Spotlight, input sources). Those presses then reach no responder,
     /// so the hardware monitor sends them. Control+Option+Space goes out as
