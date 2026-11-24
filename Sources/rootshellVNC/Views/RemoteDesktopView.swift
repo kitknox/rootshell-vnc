@@ -289,6 +289,15 @@ public struct RemoteDesktopView: View {
                         framebufferSize: framebufferSize)
                     #if !canImport(UIKit)
                     updateRemoteDisplaySize(for: newSize)
+                    #elseif targetEnvironment(macCatalyst)
+                    // A Mac window has no docked software keyboard, so the
+                    // laid-out size is the viewport. Do not depend on the
+                    // keyboard metrics reader to see a window resize.
+                    if newSize.width > 0, newSize.height > hudReserve {
+                        updateRemoteDisplaySize(for: CGSize(
+                            width: newSize.width,
+                            height: newSize.height - hudReserve))
+                    }
                     #endif
                 }
                 .onChange(of: framebufferSize) { _, newSize in
