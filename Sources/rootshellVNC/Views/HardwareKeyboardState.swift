@@ -126,6 +126,11 @@ struct SupplementalHardwareModifierState: Sendable {
         endAll { if case .pointer = $0 { true } else { false } }
     }
 
+    /// Ends every physical modifier owner. Keysyms a toolbar or pointer owner also holds stay down.
+    mutating func releasePhysicalModifierOwners() -> [HardwareKeyboardTransition] {
+        endAll { if case .physicalModifier = $0 { true } else { false } }
+    }
+
     mutating func releaseAll() -> [HardwareKeyboardTransition] {
         let transitions = activationOrder.reversed().map {
             HardwareKeyboardTransition(downFlag: false, keysym: $0)
@@ -361,6 +366,11 @@ final class HardwareKeyboardController {
     }
 
     var hasPressedKeys: Bool { !state.isEmpty || !commandModifiers.physical.isEmpty }
+
+    /// Held keys that are not modifiers (for the stuck-key log: a count only, never the keys).
+    var pressedNonModifierCount: Int {
+        state.pressedKeysyms.keys.filter { !(0xE0...0xE7).contains($0) }.count
+    }
 
     func contains(usage: UInt32) -> Bool {
         state.contains(usage) || commandModifiers.physical[usage] != nil

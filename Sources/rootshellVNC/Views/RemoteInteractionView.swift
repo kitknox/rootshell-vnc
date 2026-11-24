@@ -297,6 +297,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private var catalystArrowRepeatTimer: Timer?
     private var catalystArrowRepeatUsage: UInt32?
     #endif
+    /// Modifier key transitions and stuck-key releases. Key names of modifiers only; never other keys.
+    private let keyLog = VNCLogger(category: "Keyboard")
+    /// While set, modifier releases are collected for the "released stuck keys" log line.
+    private var releasedModifierNames: [String]?
     #if DEBUG
     private let inputLog = VNCLogger(category: "InputRouting")
     private var inputLogBudget = 128
@@ -873,6 +877,16 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             object: nil)
         NotificationCenter.default.addObserver(
             self,
+            selector: #selector(sceneDidDeactivate(_:)),
+            name: UIScene.willDeactivateNotification,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(sceneDidDeactivate(_:)),
+            name: UIScene.didEnterBackgroundNotification,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
             selector: #selector(clearInputAssistants),
             name: UITextInputMode.currentInputModeDidChangeNotification,
             object: nil)
@@ -998,7 +1012,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     override func resignFirstResponder() -> Bool {
         // A refused resign keeps the keyboard, so held keys stay held.
         guard canResignFirstResponder else { return false }
-        releaseAllPressedKeys()
+        releaseAllPressedKeys(reason: "view resigned first responder")
         discardTextDocument()
         let resigned = super.resignFirstResponder()
         if resigned { keyboardCapture.setRemoteInputIsFirstResponder(false) }
@@ -1011,7 +1025,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             releasePointerDrag()
             releaseTouchHoldDrag()
             releasePhysicalButtonPress()
-            releaseAllPressedKeys()
+            releaseAllPressedKeys(reason: "view left its window")
             releasePointerModifiersNow()
             cancelScrollInteraction()
             stopEdgeScrolling()
@@ -1324,6 +1338,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             return
         }
         var unhandled: Set<UIPress> = []
+        reconcileModifiers(with: event?.modifierFlags ?? [], presses: presses)
         for press in presses {
             guard let key = press.key else {
                 unhandled.insert(press)
@@ -2291,6 +2306,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
 
     override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
         let unhandled = releaseHardwarePresses(presses)
+        reconcileModifiers(with: event?.modifierFlags ?? [], presses: presses)
         if !unhandled.isEmpty {
             super.pressesEnded(unhandled, with: event)
         }
@@ -2298,7 +2314,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
 
     override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
         consumedRemoteAliasUsages.removeAll()
-        releaseAllPressedKeys()
+        releaseAllPressedKeys(reason: "presses cancelled")
         super.pressesCancelled(presses, with: event)
     }
 
@@ -2330,10 +2346,20 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         return unhandled
     }
 
-    private func releaseAllPressedKeys() {
+    private func releaseAllPressedKeys(reason: String = "reset") {
+        let otherKeys = hardwareKeyboard.pressedNonModifierCount
+        let outer = releasedModifierNames
+        releasedModifierNames = []
         universalKeys.releaseAll()
         hardwareKeyboard.releaseAll()
         releaseAllSupplementalModifiers()
+        // A physical modifier the controller no longer knows would stay down on the server: end it too.
+        supplementalModifierState.releasePhysicalModifierOwners().forEach(sendSupplementalTransition)
+        let names = releasedModifierNames ?? []
+        releasedModifierNames = outer
+        if !names.isEmpty || otherKeys > 0 {
+            keyLog.info("Released stuck keys (\(reason)): modifiers [\(names.joined(separator: ", "))], \(otherKeys) other keys")
+        }
         #if targetEnvironment(macCatalyst)
         catalystWindowChordUsages.removeAll()
         catalystBorrowedModifiers.removeAll()
@@ -2415,12 +2441,67 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         sendSharedModifier(transition, usage: nil)
     }
 
+    /// Key names of modifiers for the log. Never used for other keys (passwords are typed).
+    /// Cmd is sent as Super; Option as Alt or Meta, depending on the server.
+    private static func modifierName(forKeysym keysym: UInt32) -> String? {
+        switch keysym {
+        case KeyboardInputHandler.keysymShiftL, KeyboardInputHandler.keysymShiftR: "Shift"
+        case KeyboardInputHandler.keysymControlL, KeyboardInputHandler.keysymControlR: "Control"
+        case KeyboardInputHandler.keysymAltL, KeyboardInputHandler.keysymAltR,
+             KeyboardInputHandler.keysymMetaL, KeyboardInputHandler.keysymMetaR: "Option"
+        case KeyboardInputHandler.keysymSuperL, KeyboardInputHandler.keysymSuperR: "Cmd"
+        case KeyboardInputHandler.keysymCapsLock: "Caps Lock"
+        default: nil
+        }
+    }
+
+    /// A key event says which modifiers are held. A modifier we think is down but the event says is up lost its
+    /// key-up (a menu, a system shortcut or a focus change took it): send the key-up now.
+    /// Modifiers that are part of `presses` are left alone: their own event is handled by the caller.
+    private func reconcileModifiers(with flags: UIKeyModifierFlags, presses: Set<UIPress>) {
+        var current = flags
+        var inPresses: Set<UInt32> = []
+        for press in presses {
+            guard let key = press.key else { continue }
+            current.formUnion(key.modifierFlags)
+            inPresses.insert(UInt32(key.keyCode.rawValue))
+        }
+        let groups: [(flag: UIKeyModifierFlags, name: String, usages: [UInt32], keysyms: [UInt32])] = [
+            (.shift, "Shift", [0xE1, 0xE5],
+             [KeyboardInputHandler.keysymShiftL, KeyboardInputHandler.keysymShiftR]),
+            (.control, "Control", [0xE0, 0xE4],
+             [KeyboardInputHandler.keysymControlL, KeyboardInputHandler.keysymControlR]),
+            (.alternate, "Option", [0xE2, 0xE6],
+             [KeyboardInputHandler.keysymAltL, KeyboardInputHandler.keysymAltR,
+              KeyboardInputHandler.keysymMetaL, KeyboardInputHandler.keysymMetaR]),
+            (.command, "Cmd", [0xE3, 0xE7],
+             [KeyboardInputHandler.keysymSuperL, KeyboardInputHandler.keysymSuperR]),
+        ]
+        for group in groups where !current.contains(group.flag) {
+            if group.usages.contains(where: inPresses.contains) { continue }
+            var stale = false
+            for usage in group.usages where hardwareKeyboard.contains(usage: usage) {
+                hardwareKeyboard.release(usage: usage)
+                stale = true
+            }
+            for keysym in group.keysyms where supplementalModifierState.contains(.physicalModifier(keysym)) {
+                supplementalModifierState.end(.physicalModifier(keysym)).forEach(sendSupplementalTransition)
+                stale = true
+            }
+            if stale { keyLog.info("Released stuck keys (event says up): modifiers [\(group.name)]") }
+        }
+    }
+
     /// Every shared-state emission goes through here so a release always
     /// takes the same API (HID usage or keysym) as the press it ends.
     private func sendSharedModifier(
         _ transition: HardwareKeyboardTransition,
         usage offered: UInt32?
     ) {
+        if let name = Self.modifierName(forKeysym: transition.keysym) {
+            keyLog.debug("Modifier \(name) \(transition.downFlag ? "down" : "up")")
+            if !transition.downFlag { releasedModifierNames?.append(name) }
+        }
         if let usage = modifierPressRoutes.usage(for: transition, offered: offered) {
             keyboardHandler.handlePhysicalKey(
                 downFlag: transition.downFlag,
@@ -2450,7 +2531,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     @objc private func applicationWillResignActive() {
-        releaseAllPressedKeys()
+        releaseAllPressedKeys(reason: "app resigned active")
         releasePointerDrag()
         releaseTouchHoldDrag()
         releasePhysicalButtonPress()
@@ -2462,9 +2543,15 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         #endif
     }
 
+    /// The scene goes inactive or to the background (Cmd+Tab, Mission Control, a closed window): no key-up will come.
+    @objc private func sceneDidDeactivate(_ notification: Notification) {
+        guard let scene = notification.object as? UIScene, scene === window?.windowScene else { return }
+        releaseAllPressedKeys(reason: "scene inactive or in background")
+    }
+
     @objc private func windowDidResignKey(_ notification: Notification) {
         guard notification.object as AnyObject? === window else { return }
-        releaseAllPressedKeys()
+        releaseAllPressedKeys(reason: "window lost key status")
         releasePointerDrag()
         releaseTouchHoldDrag()
         releasePhysicalButtonPress()
