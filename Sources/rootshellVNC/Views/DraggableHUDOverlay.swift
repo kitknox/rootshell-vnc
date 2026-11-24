@@ -266,6 +266,9 @@ struct DraggableHUDOverlay<Content: View>: UIViewRepresentable {
         _ uiView: DraggableHUDOverlayHostView,
         coordinator: Coordinator
     ) {
+        // A deferred report could otherwise land after the parent cleared its measurements.
+        uiView.onReserveChange = nil
+        uiView.onFrameChange = nil
         coordinator.host?.willMove(toParent: nil)
         coordinator.host?.view.removeFromSuperview()
         coordinator.host?.removeFromParent()

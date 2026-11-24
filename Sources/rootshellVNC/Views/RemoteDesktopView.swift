@@ -391,7 +391,26 @@ public struct RemoteDesktopView: View {
                 keyboardActive = requested
             }
         }
+        .onChange(of: desktopControlRequests) { old, new in
+            guard new.controller != nil, old.controller == new.controller else { return }
+            #if canImport(UIKit)
+            // Two toggles can land in one update; only the parity moves the panel.
+            if (new.fileTransferToggles &- old.fileTransferToggles) & 1 != 0 {
+                showsFileTransfers.toggle()
+            }
+            #endif
+            if new.curtainPrompts != old.curtainPrompts {
+                presentHostCurtainPrompt()
+            }
+        }
         #if canImport(UIKit)
+        // The overlay's teardown never reports, so its last measurements would
+        // keep shortening the screen and steering the composition preview.
+        .onChange(of: hidesHUD) { _, hidden in
+            guard hidden else { return }
+            hudReserve = 0
+            hudFrame.frame = .zero
+        }
         .background {
             DockedKeyboardInsetReader(
                 metrics: $keyboardViewportMetrics,
@@ -520,15 +539,17 @@ public struct RemoteDesktopView: View {
                 safeAreaEdges: hudSafeAreaEdges)
         }
         #else
-        VStack {
-            Spacer()
-            HStack {
+        if !hidesHUD {
+            VStack {
                 Spacer()
-                hudMenu
+                HStack {
+                    Spacer()
+                    hudMenu
+                }
+                .padding(12)
             }
-            .padding(12)
+            .allowsHitTesting(true)
         }
-        .allowsHitTesting(true)
         #endif
     }
 
@@ -578,12 +599,6 @@ public struct RemoteDesktopView: View {
         }
         .onChange(of: transfers.transfers.count) { oldCount, newCount in
             if newCount > oldCount { showsFileTransfers = true }
-        }
-        .onChange(of: desktopControls?.fileTransfersToggleRequests) { _, _ in
-            showsFileTransfers.toggle()
-        }
-        .onChange(of: desktopControls?.curtainPromptRequests) { _, _ in
-            curtainPromptPresented = true
         }
     }
 
@@ -725,6 +740,30 @@ public struct RemoteDesktopView: View {
                     systemImage: session.isCurtained ? "eye.slash.fill" : "eye.slash")
             }
         }
+    }
+
+    private struct DesktopControlRequests: Equatable {
+        var controller: UUID?
+        var fileTransferToggles = 0
+        var curtainPrompts = 0
+    }
+
+    private var desktopControlRequests: DesktopControlRequests {
+        guard let desktopControls else { return DesktopControlRequests() }
+        var requests = DesktopControlRequests(
+            controller: desktopControls.identity,
+            curtainPrompts: desktopControls.curtainPromptRequests)
+        #if canImport(UIKit)
+        requests.fileTransferToggles = desktopControls.fileTransfersToggleRequests
+        #endif
+        return requests
+    }
+
+    /// Same gate as the HUD's toggle: confirming would otherwise send nothing.
+    private func presentHostCurtainPrompt() {
+        guard session.connectionState.isConnected,
+              session.supportsCurtainMode else { return }
+        curtainPromptPresented = true
     }
 
     private func requestPasswordSend() {
