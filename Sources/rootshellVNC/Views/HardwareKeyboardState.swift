@@ -269,13 +269,28 @@ struct CommandModifierState: Sendable {
     }
 
     mutating func release(usage: UInt32) -> [HardwareKeyboardTransition] {
+        forget(usage: usage)
+        return reconcile()
+    }
+
+    /// Key-ups plus the groups a snapshot reports up, reconciled once, so a
+    /// missed Option key-up never surfaces as Option down then up.
+    mutating func release(
+        usages: [UInt32],
+        liftingAbsentFrom modifiers: VNCKeyboardModifiers
+    ) -> [HardwareKeyboardTransition] {
+        usages.forEach { forget(usage: $0) }
+        // The Option keysym is read only when inferring.
+        return synchronize(modifiers: modifiers, optionKeysym: 0, inferMissing: false)
+    }
+
+    private mutating func forget(usage: UInt32) {
         physical.removeValue(forKey: usage)
         inferredUsages.remove(usage)
         for inferred in inferredUsages.filter({ ($0 & 3) == (usage & 3) }) {
             physical.removeValue(forKey: inferred)
             inferredUsages.remove(inferred)
         }
-        return reconcile()
     }
 
     /// `inferMissing` false only lifts modifiers absent from `modifiers`, for
@@ -411,6 +426,60 @@ final class HardwareKeyboardController {
         stopRepeat()
         state.releaseAllWithUsages().forEach { send($0.transition, usage: $0.usage) }
         commandModifiers.releaseAll().forEach(sendModifier)
+    }
+
+    static let modifierGroups: [(modifier: VNCKeyboardModifiers, usages: [UInt32])] = [
+        (.control, [0xE0, 0xE4]), (.shift, [0xE1, 0xE5]),
+        (.option, [0xE2, 0xE6]), (.command, [0xE3, 0xE7]),
+    ]
+
+    /// What a key event says is held, and which modifier keys it releases.
+    /// A pressed modifier counts as held; on key-up only the event's flags
+    /// decide whether the other side is still down. `flags` is nil without an
+    /// event: then only the keys' own flags count, and no keys means no news.
+    static func modifierSnapshot(
+        flags: VNCKeyboardModifiers?,
+        keys: [(usage: UInt32, flags: VNCKeyboardModifiers)],
+        releasing: Bool
+    ) -> (held: VNCKeyboardModifiers, released: [UInt32]) {
+        var held = flags ?? (keys.isEmpty ? [.control, .option, .shift, .command] : [])
+        var released: [UInt32] = []
+        for key in keys {
+            let group = modifierGroups.first { $0.usages.contains(key.usage) }
+            if releasing, group != nil {
+                released.append(key.usage)
+                if flags == nil { held.formUnion(key.flags) }
+                continue
+            }
+            held.formUnion(key.flags)
+            if let group { held.insert(group.modifier) }
+        }
+        return (held, released)
+    }
+
+    /// Releases modifier `usages` and lifts held modifiers that `modifiers`
+    /// reports up, in one update so a translated chord never passes through a
+    /// lone Control or Option. Never presses one. Returns the groups lifted
+    /// for the snapshot alone (a missed key-up).
+    @discardableResult
+    func releaseModifiers(
+        _ usages: [UInt32] = [],
+        absentFrom modifiers: VNCKeyboardModifiers
+    ) -> VNCKeyboardModifiers {
+        var lifted: VNCKeyboardModifiers = []
+        for group in Self.modifierGroups where !modifiers.contains(group.modifier)
+            && group.usages.contains(where: { contains(usage: $0) && !usages.contains($0) }) {
+            lifted.insert(group.modifier)
+        }
+        if controlOptionAsCommand {
+            commandModifiers.release(usages: usages, liftingAbsentFrom: modifiers).forEach(sendModifier)
+        } else {
+            usages.forEach { release(usage: $0) }
+            for group in Self.modifierGroups where lifted.contains(group.modifier) {
+                group.usages.forEach { release(usage: $0) }
+            }
+        }
+        return lifted
     }
 
     func synchronizeModifiers(_ modifiers: VNCKeyboardModifiers, inferMissing: Bool = true) {
