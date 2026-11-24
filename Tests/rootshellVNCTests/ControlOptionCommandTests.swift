@@ -280,6 +280,145 @@ final class ControlOptionCommandIntegrationTests: XCTestCase {
     }
 
     @MainActor
+    private func makeView(_ record: @escaping (HardwareKeyboardTransition) -> Void) -> RemoteInputUIView {
+        RemoteInputUIView(
+            touchHandler: TouchInputHandler { _, _, _ in },
+            keyboardHandler: KeyboardInputHandler(sendKeyEvent: {
+                record(HardwareKeyboardTransition(downFlag: $0, keysym: $1))
+            }),
+            keyboardCapture: VNCKeyboardCapture(),
+            requestPasswordSend: {}, requestDictation: {}, toggleFullScreen: nil, disconnect: {})
+    }
+
+    @MainActor
+    private func pressControlOptionTab(on view: RemoteInputUIView) {
+        let tab = UIKeyCommand(input: "\t", modifierFlags: [.control, .alternate],
+            action: NSSelectorFromString("handleUniversalCommandKey:"))
+        _ = view.perform(tab.action, with: tab)
+    }
+
+    /// Tab events under the chord report Control and Option but never Command.
+    @MainActor
+    func testReconcilingKeepsCommandHeldAcrossControlOptionTabs() {
+        var events: [HardwareKeyboardTransition] = []
+        let view = makeView { events.append($0) }
+        for _ in 0..<2 {
+            pressControlOptionTab(on: view)
+            view.reconcileModifiers(with: [.control, .alternate], presses: [])
+            XCTAssertEqual(events.filter { $0.keysym == 0xFFEB }.map(\.downFlag), [true])
+        }
+        XCTAssertEqual(events.filter { $0.keysym == 0xFF09 }.map(\.downFlag), [true, false, true, false])
+        XCTAssertFalse(events.contains { [UInt32(0xFFE3), 0xFFE9, 0xFFE7].contains($0.keysym) })
+        _ = view.resignFirstResponder()
+        XCTAssertEqual(events.last, HardwareKeyboardTransition(downFlag: false, keysym: 0xFFEB))
+    }
+
+    /// Both releases missed: Command goes up alone, with no Option tap between.
+    @MainActor
+    func testReconcilingBothMissedReleasesLiftsCommandWithoutAnOptionTap() {
+        var events: [HardwareKeyboardTransition] = []
+        let view = makeView { events.append($0) }
+        pressControlOptionTab(on: view)
+        view.reconcileModifiers(with: [], presses: [])
+        XCTAssertEqual(events.filter { $0.keysym == 0xFFEB }.map(\.downFlag), [true, false])
+        XCTAssertFalse(events.contains { [UInt32(0xFFE3), 0xFFE9, 0xFFE7].contains($0.keysym) })
+        let count = events.count
+        _ = view.resignFirstResponder()
+        XCTAssertEqual(events.count, count)
+    }
+
+    /// Option's key-up was lost; Control's arrives with nothing held. UIKit's
+    /// snapshot keeps the released key's own group, GameController's does not.
+    @MainActor
+    func testControlKeyUpAfterMissedOptionKeyUpSendsOnlyCommandUp() {
+        for snapshot in [VNCKeyboardModifiers.control, []] {
+            var events: [HardwareKeyboardTransition] = []
+            let controller = HardwareKeyboardController(keyboardHandler: KeyboardInputHandler(sendKeyEvent: {
+                events.append(HardwareKeyboardTransition(downFlag: $0, keysym: $1))
+            }))
+            controller.press(usage: 0xE0, keysym: 0xFFE3)
+            controller.press(usage: 0xE2, keysym: 0xFFE9)
+            XCTAssertEqual(events.last, HardwareKeyboardTransition(downFlag: true, keysym: 0xFFEB))
+            events.removeAll()
+            XCTAssertEqual(controller.releaseModifiers([0xE0], absentFrom: snapshot), [.option])
+            XCTAssertEqual(events, [HardwareKeyboardTransition(downFlag: false, keysym: 0xFFEB)])
+            XCTAssertFalse(controller.hasPressedKeys)
+        }
+    }
+
+    /// Both Commands held, left key-up lost, right released. The key-up's own
+    /// key never counts as held: the event's flags decide the left side.
+    @MainActor
+    func testCommandKeyUpLetsTheFlagsDecideTheOtherSide() {
+        for snapshot in [VNCKeyboardModifiers(), .command] {
+            var events: [HardwareKeyboardTransition] = []
+            let controller = HardwareKeyboardController(keyboardHandler: KeyboardInputHandler(sendKeyEvent: {
+                events.append(HardwareKeyboardTransition(downFlag: $0, keysym: $1))
+            }))
+            controller.controlOptionAsCommand = false
+            controller.press(usage: 0xE3, keysym: KeyboardInputHandler.keysymSuperL)
+            controller.press(usage: 0xE7, keysym: KeyboardInputHandler.keysymSuperR)
+            controller.release(usage: 0xE7)
+            let (held, released) = HardwareKeyboardController.modifierSnapshot(
+                flags: snapshot, keys: [(0xE7, [.command])], releasing: true)
+            XCTAssertEqual(held, snapshot)
+            XCTAssertEqual(released, [0xE7])
+            controller.releaseModifiers(released, absentFrom: held)
+            XCTAssertEqual(controller.contains(usage: 0xE3), snapshot == .command)
+            XCTAssertEqual(events.filter { $0.keysym == KeyboardInputHandler.keysymSuperL }.map(\.downFlag),
+                           snapshot == .command ? [true] : [true, false])
+        }
+    }
+
+    /// Shift held, Command released with no UIKit event: the key's own flags
+    /// still say Shift, so only Command goes up.
+    @MainActor
+    func testCommandKeyUpWithoutAnEventKeepsShiftHeld() {
+        for translated in [false, true] {
+            var events: [HardwareKeyboardTransition] = []
+            let controller = HardwareKeyboardController(keyboardHandler: KeyboardInputHandler(sendKeyEvent: {
+                events.append(HardwareKeyboardTransition(downFlag: $0, keysym: $1))
+            }))
+            controller.controlOptionAsCommand = translated
+            controller.press(usage: 0xE1, keysym: KeyboardInputHandler.keysymShiftL)
+            controller.press(usage: 0xE3, keysym: KeyboardInputHandler.keysymSuperL)
+            events.removeAll()
+            // Without translation, releaseHardwarePresses has already sent the key-up.
+            if !translated { controller.release(usage: 0xE3) }
+            let (held, released) = HardwareKeyboardController.modifierSnapshot(
+                flags: nil, keys: [(0xE3, [.shift])], releasing: true)
+            controller.releaseModifiers(released, absentFrom: held)
+            XCTAssertEqual(events, [HardwareKeyboardTransition(downFlag: false, keysym: KeyboardInputHandler.keysymSuperL)])
+            XCTAssertTrue(controller.contains(usage: 0xE1))
+        }
+        let unknown = HardwareKeyboardController.modifierSnapshot(flags: nil, keys: [], releasing: true)
+        XCTAssertEqual(unknown.held, [.control, .option, .shift, .command], "No event and no keys lifts nothing")
+    }
+
+    @MainActor
+    func testPressedModifierCountsAsHeldOnlyOnKeyDown() {
+        let down = HardwareKeyboardController.modifierSnapshot(
+            flags: [], keys: [(0xE3, []), (0x2B, [.shift])], releasing: false)
+        XCTAssertEqual(down.held, [.command, .shift])
+        XCTAssertTrue(down.released.isEmpty)
+    }
+
+    @MainActor
+    func testReleaseModifiersLiftsOnlyAbsentGroupsWhenDisabled() {
+        var events: [HardwareKeyboardTransition] = []
+        let controller = HardwareKeyboardController(keyboardHandler: KeyboardInputHandler(sendKeyEvent: {
+            events.append(HardwareKeyboardTransition(downFlag: $0, keysym: $1))
+        }))
+        controller.controlOptionAsCommand = false
+        controller.press(usage: 0xE0, keysym: 0xFFE3)
+        controller.press(usage: 0xE2, keysym: 0xFFE9)
+        XCTAssertEqual(controller.releaseModifiers(absentFrom: [.control, .shift]), [.option])
+        XCTAssertEqual(events.last, HardwareKeyboardTransition(downFlag: false, keysym: 0xFFE9))
+        XCTAssertTrue(controller.contains(usage: 0xE0))
+        XCTAssertTrue(controller.releaseModifiers(absentFrom: [.control]).isEmpty)
+    }
+
+    @MainActor
     func testMappedKeysAndOverlappingPressesReleaseCleanlyWhenDisabled() {
         for (usage, characters) in [(UInt32(0x04), "a"), (0x36, ","), (0x52, ""),
                                     (0x29, ""), (0x2A, ""), (0x4C, "")] {
