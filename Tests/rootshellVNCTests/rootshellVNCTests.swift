@@ -1726,11 +1726,11 @@ final class RemoteDisplaySizeTests: XCTestCase {
         XCTAssertEqual(r?.pixelHeight, 2160)
     }
 
-    func testCoreAreaNeverAboveUHDAndNoDimensionAbove5120Pixels() {
+    func testCoreAreaNeverAboveUHDAndNoDimensionAbove5120Pixels() throws {
         let sizes = [CGSize(width: 2560, height: 1600), CGSize(width: 3000, height: 3000), CGSize(width: 1720, height: 1200),
                      CGSize(width: 5000, height: 900), CGSize(width: 900, height: 5000), CGSize(width: 1920, height: 1080)]
         for size in sizes {
-            guard let r = RemoteDisplaySize.matching(viewSize: size) else { continue }
+            let r = try XCTUnwrap(RemoteDisplaySize.matching(viewSize: size), "\(size)")
             XCTAssertLessThanOrEqual(Int(r.pixelWidth) * Int(r.pixelHeight), 3840 * 2160, "\(size)")
             XCTAssertLessThanOrEqual(Int(r.pixelWidth), 5120, "\(size)")
             XCTAssertLessThanOrEqual(Int(r.pixelHeight), 5120, "\(size)")

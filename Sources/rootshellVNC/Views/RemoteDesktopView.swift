@@ -29,6 +29,22 @@ struct DockedKeyboardViewportMetrics: Equatable {
             && abs(containerSize.height - other.containerSize.height) <= 0.5
             && abs(keyboardInset - other.keyboardInset) <= 0.5
     }
+
+    /// The size Match Client fills, above a docked HUD bar. A non-nil
+    /// `layoutSize` wins over this reader, which can miss a Mac Catalyst
+    /// window resize.
+    func matchClientSize(
+        layoutSize: CGSize?,
+        hudReserve: CGFloat,
+        avoidanceMode: VNCKeyboardAvoidanceMode,
+        reservingObstruction: Bool
+    ) -> CGSize? {
+        let size = layoutSize ?? (avoidanceMode == .automatic
+            ? availableSize(reservingObstruction: reservingObstruction)
+            : containerSize)
+        guard size.width > 0, size.height > hudReserve else { return nil }
+        return CGSize(width: size.width, height: size.height - hudReserve)
+    }
 }
 
 /// Chooses which layer owns keyboard and accessory clearance for the remote
@@ -59,6 +75,11 @@ public struct RemoteDesktopView: View {
     @State private var hardwareKeyboardAttached = false
     @State private var showsFileTransfers = false
     @State private var hudFrame = HUDFrameModel()
+    #endif
+    #if targetEnvironment(macCatalyst)
+    /// A Mac window has no docked software keyboard, so the laid-out size is
+    /// the viewport.
+    @State private var catalystLayoutSize: CGSize?
     #endif
 
     #if !canImport(UIKit)
@@ -290,14 +311,8 @@ public struct RemoteDesktopView: View {
                     #if !canImport(UIKit)
                     updateRemoteDisplaySize(for: newSize)
                     #elseif targetEnvironment(macCatalyst)
-                    // A Mac window has no docked software keyboard, so the
-                    // laid-out size is the viewport. Do not depend on the
-                    // keyboard metrics reader to see a window resize.
-                    if newSize.width > 0, newSize.height > hudReserve {
-                        updateRemoteDisplaySize(for: CGSize(
-                            width: newSize.width,
-                            height: newSize.height - hudReserve))
-                    }
+                    catalystLayoutSize = newSize
+                    updateRemoteDisplaySizeFromMeasuredContainer()
                     #endif
                 }
                 .onChange(of: framebufferSize) { _, newSize in
@@ -317,6 +332,8 @@ public struct RemoteDesktopView: View {
                     presentPendingLoginPasswordPrompt()
                     #if !canImport(UIKit)
                     updateRemoteDisplaySize(for: geometry.size)
+                    #elseif targetEnvironment(macCatalyst)
+                    catalystLayoutSize = geometry.size
                     #endif
                 }
                 .onChange(of: session.loginPasswordPromptPending) { _, pending in
@@ -802,13 +819,17 @@ public struct RemoteDesktopView: View {
 
     #if canImport(UIKit)
     private func updateRemoteDisplaySizeFromMeasuredContainer() {
-        let size = keyboardAvoidanceMode == .automatic
-            ? keyboardViewportMetrics.availableSize(
-                reservingObstruction: shouldReserveKeyboardInset)
-            : keyboardViewportMetrics.containerSize
-        guard size.width > 0, size.height > hudReserve else { return }
-        // Match Client fills the area above a docked HUD bar.
-        updateRemoteDisplaySize(for: CGSize(width: size.width, height: size.height - hudReserve))
+        #if targetEnvironment(macCatalyst)
+        let layoutSize = catalystLayoutSize
+        #else
+        let layoutSize: CGSize? = nil
+        #endif
+        guard let size = keyboardViewportMetrics.matchClientSize(
+            layoutSize: layoutSize,
+            hudReserve: hudReserve,
+            avoidanceMode: keyboardAvoidanceMode,
+            reservingObstruction: shouldReserveKeyboardInset) else { return }
+        updateRemoteDisplaySize(for: size)
     }
     #endif
 
