@@ -17,6 +17,7 @@ final class LiveFileTransferProbeTests: XCTestCase {
         defer { session.disconnect() }
         let transfers = session.fileTransfers
         print("FILE PROBE canUpload=\(transfers.canUpload) canDownload=\(transfers.canDownload)")
+        defer { print("FILE PROBE encryption=\(String(describing: session.negotiatedContentEncryption))") }
         XCTAssertTrue(transfers.canUpload)
         XCTAssertTrue(transfers.canDownload)
 

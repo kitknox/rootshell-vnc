@@ -20,6 +20,7 @@ actor ScriptedRFBConnection: RFBConnection {
     private var disconnectHandler: (@Sendable (VNCProtocolError) -> Void)?
     private var readWaiters: [CheckedContinuation<Void, Never>] = []
     private var sendsHeld = false
+    private var failsNextSend = false
     private var heldSendWaiters: [CheckedContinuation<Void, Never>] = []
     private var onSend: (@Sendable (Data) -> Data?)?
     private var tlsUpgradeEndpoint: (String, UInt16)?
@@ -56,6 +57,11 @@ actor ScriptedRFBConnection: RFBConnection {
     /// session actor while one of its writes is in flight.
     func holdSends() {
         sendsHeld = true
+    }
+
+    /// The next client send throws without delivering anything.
+    func failNextSend() {
+        failsNextSend = true
     }
 
     func releaseSends() {
@@ -113,6 +119,10 @@ actor ScriptedRFBConnection: RFBConnection {
     func send(_ data: Data) async throws {
         while sendsHeld {
             await withCheckedContinuation { heldSendWaiters.append($0) }
+        }
+        if failsNextSend {
+            failsNextSend = false
+            throw VNCProtocolError.ioError("scripted send failure")
         }
         if closed { throw VNCProtocolError.connectionClosed }
         sent.append(data)

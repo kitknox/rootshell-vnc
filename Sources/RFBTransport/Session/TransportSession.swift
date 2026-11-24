@@ -221,6 +221,11 @@ public enum SessionEvent: Sendable {
     /// Apple encryption info pseudo-encoding received.
     case encryptionInfo(AppleEncryptionInfo)
 
+    /// A Standard session switched the whole control stream to encryption:
+    /// every update after the one that carried the key is encrypted, and
+    /// `handshakeInfo.contentEncryption` now reports it.
+    case standardStreamEncrypted
+
     /// Apple display info pseudo-encoding received.
     case displayInfo(AppleDisplayInfo)
 
@@ -394,7 +399,7 @@ public actor TransportSession {
     private nonisolated let appleMediaOutgoingRTCPDumpPath: String?
     private let rctlEnabled: Bool
     private let rateControlEnabled: Bool
-    private var continuation: AsyncStream<SessionEvent>.Continuation?
+    private var continuation: SessionEventGate?
     /// Single ordered handoff for all decrypted media RTP. It buffers startup
     /// packets until the decoder sink is ready and drains them atomically, so
     /// the former AsyncStream/direct-path boundary cannot reorder the IRAP burst.
@@ -506,6 +511,27 @@ public actor TransportSession {
     private var controlReadOffset = 0
     private static let controlReadChunkSize = 64 * 1024
     private static let controlReadCompactionThreshold = 64 * 1024
+    /// Standard-mode whole-stream encryption (SetEncryption level 1). Once
+    /// set, control-channel bytes in both directions travel as length-framed
+    /// ComCryption records below the RFB parser.
+    private var standardStreamChannel: AppleComCryptionChannel?
+    private var standardStreamCiphertext = Data()
+    private var standardStreamCiphertextOffset = 0
+    private var standardStreamServerPacketID: UInt32 = 0
+    private var standardStreamClientPacketID: UInt32 = 0
+    private var standardStreamPlaintextPrefix: Data?
+    private var requestedStandardStreamEncryption = false
+    private var controlSendInFlight = false
+    private var controlSendWaiters: [CheckedContinuation<Void, Never>] = []
+    /// ServerInit, held back from the app until the first update after the
+    /// SetEncryption burst settles whether the stream is encrypted.
+    private var deferredServerInit: ServerInit?
+    private var streamKeyNegotiationWaiter: CheckedContinuation<Void, Error>?
+    private var disconnectRequested = false
+    private var encryptedWriteFailure: VNCProtocolError?
+    private var announcesStandardStreamEncryption = false
+    /// Stream key and IV from the 0x44f update; installed once it ends.
+    private var pendingStandardStreamKey: (key: Data, iv: Data)?
     /// Optional direct off-MainActor consumer for framebuffer updates.
     /// Returning `false` falls back to `continuation?.yield(.framebufferUpdate)`.
     private var framebufferUpdateSink: (@Sendable ([(FramebufferRect, Data)]) -> Bool)?
@@ -1015,7 +1041,7 @@ public actor TransportSession {
         self.events = AsyncStream<SessionEvent> { continuation in
             cont = continuation
         }
-        self.continuation = cont
+        self.continuation = SessionEventGate(cont)
     }
 
     // MARK: - Public API
@@ -1043,6 +1069,18 @@ public actor TransportSession {
         controlChannelBytesSent = 0
         controlReadBuffer.removeAll(keepingCapacity: true)
         controlReadOffset = 0
+        standardStreamChannel = nil
+        standardStreamCiphertext.removeAll(keepingCapacity: false)
+        standardStreamCiphertextOffset = 0
+        standardStreamServerPacketID = 0
+        standardStreamClientPacketID = 0
+        standardStreamPlaintextPrefix = nil
+        requestedStandardStreamEncryption = false
+        pendingStandardStreamKey = nil
+        deferredServerInit = nil
+        encryptedWriteFailure = nil
+        disconnectRequested = false
+        announcesStandardStreamEncryption = false
         unacknowledgedUpdates = 0
         unacknowledgedUpdateBytesQueue.removeAll(keepingCapacity: true)
         unacknowledgedUpdateBytes = 0
@@ -1103,6 +1141,20 @@ public actor TransportSession {
         readTask = Task { [weak self] in
             await self?.readLoop()
         }
+        if requestedStandardStreamEncryption {
+            // Callers write as soon as this returns: settle encryption first.
+            if disconnectRequested { throw CancellationError() }
+            guard !isDisconnecting, !terminalDisconnectHandled else {
+                throw VNCProtocolError.connectionClosed
+            }
+            do {
+                try await awaitStreamKeyNegotiation()
+            } catch is CancellationError where !disconnectRequested {
+                // The caller gave up on a half-open session: end it.
+                await disconnect()
+                throw CancellationError()
+            }
+        }
     }
 
     /// Tailscale MagicDNS names deliberately keep the resolver in the UDP
@@ -1134,7 +1186,7 @@ public actor TransportSession {
 
     /// Send a key event to the server.
     public func sendKeyEvent(downFlag: Bool, key: UInt32) async throws {
-        try await sendClientPayload(keyMessage(downFlag: downFlag, keysym: key))
+        try await sendClientPayload { [self] in keyMessage(downFlag: downFlag, keysym: key) }
     }
 
     /// The input key for command 0x10, when this Mac server takes it.
@@ -1174,23 +1226,29 @@ public actor TransportSession {
     /// one awaited write per 6-8 byte message.
     public func sendInputEvents(_ events: [ClientInputEvent]) async throws {
         guard !events.isEmpty else { return }
-        var payload = Data()
-        for event in events {
-            switch event {
-            case .key(let downFlag, let key):
-                payload.append(keyMessage(downFlag: downFlag, keysym: key))
-            case .pointer(let buttonMask, let x, let y):
-                pointerButtonMask = buttonMask
-                payload.append(pointerMessage(buttonMask: buttonMask, x: x, y: y))
-            }
+        for case .pointer(let buttonMask, _, _) in events {
+            pointerButtonMask = buttonMask
         }
-        try await sendClientPayload(payload)
+        try await sendClientPayload { [self] in
+            var payload = Data()
+            for event in events {
+                switch event {
+                case .key(let downFlag, let key):
+                    payload.append(keyMessage(downFlag: downFlag, keysym: key))
+                case .pointer(let buttonMask, let x, let y):
+                    payload.append(pointerMessage(buttonMask: buttonMask, x: x, y: y))
+                }
+            }
+            return payload
+        }
     }
 
     /// Send a pointer (mouse/touch) event to the server.
     public func sendPointerEvent(buttonMask: UInt8, x: UInt16, y: UInt16) async throws {
         pointerButtonMask = buttonMask
-        try await sendClientPayload(pointerMessage(buttonMask: buttonMask, x: x, y: y))
+        try await sendClientPayload { [self] in
+            pointerMessage(buttonMask: buttonMask, x: x, y: y)
+        }
     }
 
     /// Mac servers that take command 0x10 get the encrypted mouse event, which
@@ -1480,6 +1538,9 @@ public actor TransportSession {
         let contentEncryption: VNCContentEncryption
         if stateMachine.selectedSecurityType == .vencrypt {
             contentEncryption = .tlsX509
+        } else if standardStreamChannel != nil {
+            contentEncryption = .appleComCryption(
+                cipherMode: nil, keyLength: 128, mediaSRTP: false)
         } else if appleEncryptedControlChannel != nil {
             contentEncryption = .appleComCryption(
                 cipherMode: lastAppleEncryptionInfo?.cipherMode,
@@ -1830,6 +1891,10 @@ public actor TransportSession {
     /// Disconnect from the server.
     public func disconnect() async {
         log.info("Disconnecting")
+        // First: a key arriving during the display release must not let a
+        // pending connect() succeed. The read loop stays up for that reply.
+        disconnectRequested = true
+        abandonStreamKeyNegotiation(throwing: CancellationError())
         await prepareVirtualDisplayRelease()
         // A second disconnect must not leave the first one waiting.
         finishVirtualDisplayRelease(confirmed: false)
@@ -2224,7 +2289,10 @@ public actor TransportSession {
         }
 
         let actions = stateMachine.handle(event: .receivedServerInit(serverInit))
-        emitState()
+        // Operational invites writes, so with encryption coming it is
+        // published once that is settled, together with ServerInit.
+        let mayEncrypt = canRequestStandardStreamEncryption
+        if !mayEncrypt { emitState() }
         // High Performance still begins with the ordinary post-ServerInit
         // negotiation. `executeActions` flushes SetPixelFormat/SetEncodings
         // before the authentication-specific media setup. Password-only Pro
@@ -2233,7 +2301,15 @@ public actor TransportSession {
         // ordinary actions leaves the control stream immediately desynchronized.
         try await executeActions(actions)
 
-        continuation?.yield(.serverInit(serverInit))
+        if requestedStandardStreamEncryption {
+            // The app writes only once connected: it hears of the session
+            // when the stream's encryption is settled, not before.
+            deferredServerInit = serverInit
+            continuation?.hold()
+        } else {
+            if mayEncrypt { emitState() }
+            continuation?.yield(.serverInit(serverInit))
+        }
     }
 
     /// ClientInit mode `0xc1` adds a session-selection
@@ -2440,6 +2516,10 @@ public actor TransportSession {
     }
 
     private func fillControlBuffer(minimumNeeded: Int) async throws {
+        if let channel = standardStreamChannel {
+            try await fillDecryptedControlBuffer(channel: channel)
+            return
+        }
         let requestSize = max(Self.controlReadChunkSize, minimumNeeded)
         let chunk = try await tcp.read(upTo: requestSize)
         noteControlChannelActivity(byteCount: chunk.count)
@@ -2450,6 +2530,81 @@ public actor TransportSession {
         } else {
             controlReadBuffer.append(chunk)
         }
+    }
+
+    /// Reads until a record yields plaintext, decrypting it straight into
+    /// the read buffer. A partial record stays buffered.
+    private func fillDecryptedControlBuffer(channel: AppleComCryptionChannel) async throws {
+        if controlBufferedCount == 0 {
+            controlReadBuffer.removeAll(keepingCapacity: true)
+            controlReadOffset = 0
+        }
+        while true {
+            // One record at a time: a key update must be parsed before the
+            // records after it are decrypted.
+            let consumedBefore = standardStreamCiphertextOffset
+            let produced = try channel.decryptFramedRecords(
+                in: standardStreamCiphertext,
+                offset: &standardStreamCiphertextOffset,
+                expectedPacketID: &standardStreamServerPacketID,
+                appendingTo: &controlReadBuffer,
+                maxRecords: 1)
+            let consumedRecord = standardStreamCiphertextOffset != consumedBefore
+            if standardStreamCiphertextOffset == standardStreamCiphertext.count {
+                standardStreamCiphertext.removeAll(keepingCapacity: true)
+                standardStreamCiphertextOffset = 0
+            }
+            if produced > 0 { return }
+            if consumedRecord { continue }
+
+            let chunk = try await tcp.read(upTo: Self.controlReadChunkSize)
+            noteControlChannelActivity(byteCount: chunk.count)
+            guard !chunk.isEmpty else { return }
+            if standardStreamCiphertext.isEmpty {
+                standardStreamCiphertext = chunk
+            } else {
+                if standardStreamCiphertextOffset > 0 {
+                    // Only a partial record remains: drop the consumed prefix.
+                    standardStreamCiphertext.removeSubrange(
+                        standardStreamCiphertext.startIndex
+                            ..< standardStreamCiphertext.startIndex + standardStreamCiphertextOffset)
+                    standardStreamCiphertextOffset = 0
+                }
+                standardStreamCiphertext.append(chunk)
+            }
+        }
+    }
+
+    /// The server encrypts every message after the update that carried the
+    /// stream key. A later key update (the 0x12 of a display release
+    /// re-keys) applies to the records not yet decrypted.
+    private func startStandardStreamEncryption(key: Data, iv: Data) async throws {
+        let isRekey = standardStreamChannel != nil
+        if !isRekey {
+            // Bytes buffered past the update are already ciphertext.
+            let start = controlReadBuffer.startIndex + controlReadOffset
+            standardStreamCiphertext = Data(controlReadBuffer[start...])
+            standardStreamCiphertextOffset = 0
+            controlReadBuffer.removeAll(keepingCapacity: true)
+            controlReadOffset = 0
+        }
+        standardStreamServerPacketID = 0
+        standardStreamClientPacketID = 0
+        standardStreamChannel = try AppleComCryptionChannel(key: key, iv: iv)
+        // The Mac decrypts 0x10 input with the stream key from here on.
+        appleInputEncryptionKey = key
+        guard !isRekey else {
+            log.info("Standard session stream key renewed")
+            return
+        }
+        // Plaintext SetEncryption command 2: the Mac decrypts everything
+        // after it, so it leads the first encrypted write.
+        standardStreamPlaintextPrefix = ClientMessage.appleDecryptReceived.serialize()
+        try await sendControlChannel(Data())
+        // Announced once the update that carried the key is delivered: it
+        // was read in plaintext, everything after it is encrypted.
+        announcesStandardStreamEncryption = true
+        log.info("Standard session switched to whole-stream encryption")
     }
 
     private func readControlChannel(exactly count: Int) async throws -> Data {
@@ -2470,7 +2625,8 @@ public actor TransportSession {
         if controlBufferedCount >= count {
             return consumeControlBuffer(count)
         }
-        if controlBufferedCount == 0 && count >= Self.controlReadChunkSize {
+        if controlBufferedCount == 0 && count >= Self.controlReadChunkSize
+            && standardStreamChannel == nil {
             let data = try await tcp.read(exactly: count)
             noteControlChannelActivity(byteCount: data.count)
             return data
@@ -2483,6 +2639,10 @@ public actor TransportSession {
 
     private func readControlChannel(upTo maxCount: Int) async throws -> Data {
         if handshakeComplete && controlBufferedCount > 0 {
+            return consumeControlBuffer(min(controlBufferedCount, maxCount))
+        }
+        if let channel = standardStreamChannel {
+            try await fillDecryptedControlBuffer(channel: channel)
             return consumeControlBuffer(min(controlBufferedCount, maxCount))
         }
         let data = try await tcp.read(upTo: maxCount)
@@ -2537,10 +2697,58 @@ public actor TransportSession {
     /// call a session "starved" while our own input events were still keeping
     /// the connection warm, and point the diagnosis at the wrong cause.
     private func sendControlChannel(_ data: Data) async throws {
-        try await tcp.send(data)
-        guard !data.isEmpty else { return }
+        try await sendControlChannel { data }
+    }
+
+    /// Writes go out one at a time in call order, and `build` runs only when
+    /// its turn comes: a stateful cipher's records must reach the wire in the
+    /// order they were encrypted, even across actor reentrancy or a
+    /// transport that suspends before writing.
+    private func sendControlChannel(building build: () throws -> Data) async throws {
+        if controlSendInFlight {
+            await withCheckedContinuation { controlSendWaiters.append($0) }
+        }
+        controlSendInFlight = true
+        defer {
+            if controlSendWaiters.isEmpty {
+                controlSendInFlight = false
+            } else {
+                controlSendWaiters.removeFirst().resume()
+            }
+        }
+        if let encryptedWriteFailure { throw encryptedWriteFailure }
+
+        var wire = try build()
+        if let channel = standardStreamChannel {
+            // The plaintext switch command leads the first encrypted write.
+            var records = standardStreamPlaintextPrefix ?? Data()
+            standardStreamPlaintextPrefix = nil
+            if !wire.isEmpty {
+                standardStreamClientPacketID = try channel.appendFramedRecords(
+                    of: wire, firstPacketID: standardStreamClientPacketID, to: &records)
+            }
+            wire = records
+        }
+        guard !wire.isEmpty else { return }
+        let chainsCipherState = standardStreamChannel != nil || appleMediaComCryptionChannel != nil
+        do {
+            try await tcp.send(wire)
+        } catch {
+            if chainsCipherState {
+                // The CBC chain and packet ID already moved past a record the
+                // Mac never got: nothing later can decrypt, so end the session.
+                let failure = (error as? VNCProtocolError) ?? .ioError(error.localizedDescription)
+                encryptedWriteFailure = failure
+                log.error("Encrypted write failed; ending the session: \(failure.localizedDescription)")
+                // Published here: a local close never reaches the TCP state
+                // callback, and the read loop may be parked on credit.
+                continuation?.yield(.error(failure))
+                await terminateUnexpectedConnection(failure, origin: "encrypted-write")
+            }
+            throw error
+        }
         lastControlChannelSendNanos = DispatchTime.now().uptimeNanoseconds
-        controlChannelBytesSent &+= UInt64(data.count)
+        controlChannelBytesSent &+= UInt64(wire.count)
     }
 
     private func noteControlChannelActivity(byteCount: Int) {
@@ -2599,6 +2807,7 @@ public actor TransportSession {
         guard !isDisconnecting, !terminalDisconnectHandled else { return }
         terminalDisconnectHandled = true
         finishVirtualDisplayRelease(confirmed: false)
+        abandonStreamKeyNegotiation(throwing: error)
         await logDisconnectSummary(error, origin: origin)
         readTask?.cancel()
         appleAutoUpdateRefreshTask?.cancel()
@@ -2767,7 +2976,16 @@ public actor TransportSession {
             case .mediaStreamOffer:
                 // Apple RFBMediaStreamMessage1: current macOS payload is 36 bytes.
                 let offerData = try await readControlChannel(exactly: AppleMediaStreamOffer.wirePayloadSize)
-                try await handleAppleMediaStreamOfferPayload(offerData)
+                // The first offer answers our SetEncryption; only a later one
+                // can confirm a display release's own 0x12.
+                let answersSetEncryption = deferredServerInit != nil
+                if requestedStandardStreamEncryption {
+                    try noteStandardStreamKey(offerData)
+                }
+                if !requestedStandardStreamEncryption
+                    || (virtualDisplayReleaseRequested && !answersSetEncryption) {
+                    try await handleAppleMediaStreamOfferPayload(offerData)
+                }
                 pixelData = offerData
 
             case .appleH264:
@@ -3051,6 +3269,12 @@ public actor TransportSession {
             framebufferRequestSentNanos = 0
         }
 
+        if let streamKey = pendingStandardStreamKey {
+            pendingStandardStreamKey = nil
+            try await startStandardStreamEncryption(key: streamKey.key, iv: streamKey.iv)
+        }
+        publishDeferredServerInit()
+
         // Track in-flight credit BEFORE delivering to a direct off-MainActor
         // sink so a fast sink returning credit synchronously or immediately
         // on another queue can never underflow `unacknowledgedUpdates`.
@@ -3069,6 +3293,10 @@ public actor TransportSession {
         if !deliveredDirectly {
             pendingAsyncStreamFramebufferUpdates += 1
             continuation?.yield(.framebufferUpdate(rectsWithData))
+        }
+        if announcesStandardStreamEncryption {
+            announcesStandardStreamEncryption = false
+            continuation?.yield(.standardStreamEncrypted)
         }
 
         // Pipeline the next incremental request the moment this update is
@@ -3447,9 +3675,23 @@ public actor TransportSession {
                     }
                     try await sendAppleMediaStreamSetupIfNeeded()
                 } else {
+                    let requestsEncryption = canRequestStandardStreamEncryption
+                        && !requestedStandardStreamEncryption
+                    var encodings = encodings
+                    if requestsEncryption, !encodings.contains(.mediaStreamOffer) {
+                        // 0x44f carries the stream key.
+                        encodings.append(.mediaStreamOffer)
+                    }
                     pending.append(ClientMessage.setEncodings(encodings).serialize())
                     noteAdvertisedEncodings(encodings)
                     log.debug("Queued SetEncodings (\(encodings.count) encodings)")
+                    if requestsEncryption {
+                        // Ahead of the first update request, so no pixels
+                        // leave the Mac before the key update.
+                        pending.append(ClientMessage.appleSetEncryption(level: 1).serialize())
+                        requestedStandardStreamEncryption = true
+                        log.info("Requested whole-stream encryption for this Standard session")
+                    }
                     if requestedDisplayCount > 1,
                        (appleServerCapabilities != nil
                            || stateMachine.negotiatedVersion?.isApple == true),
@@ -3487,6 +3729,76 @@ public actor TransportSession {
         if !pending.isEmpty {
             try await sendClientPayload(pending)
         }
+    }
+
+    /// Only Apple servers that take SetEncryption, after an Apple key
+    /// exchange, in Standard mode. Every other server keeps the plain stream.
+    private var canRequestStandardStreamEncryption: Bool {
+        !requestAppleMediaStream
+            && stateMachine.negotiatedVersion?.isApple == true
+            && stateMachine.selectedSecurityType != .vencrypt
+            && appleSessionKey != nil
+            && appleServerCapabilities?.supportsServerCommand(
+                ClientMessage.appleSetEncryption(level: 1).messageType) == true
+    }
+
+    /// SetEncryption and the first update request go out in one write and the
+    /// Mac answers in order, so the first update settles the negotiation:
+    /// the key, or a decline. The app connects, and starts writing, after.
+    private func awaitStreamKeyNegotiation() async throws {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    streamKeyNegotiationWaiter = continuation
+                }
+            }
+        } onCancel: { [weak self] in
+            Task { await self?.finishStreamKeyNegotiation(throwing: CancellationError()) }
+        }
+    }
+
+    private func abandonStreamKeyNegotiation(throwing error: Error) {
+        deferredServerInit = nil
+        continuation?.drop()
+        finishStreamKeyNegotiation(throwing: error)
+    }
+
+    /// connect() succeeds only once negotiation settles; teardown fails it.
+    private func finishStreamKeyNegotiation(throwing error: Error? = nil) {
+        guard let waiter = streamKeyNegotiationWaiter else { return }
+        streamKeyNegotiationWaiter = nil
+        if let error {
+            waiter.resume(throwing: error)
+        } else {
+            waiter.resume()
+        }
+    }
+
+    private func publishDeferredServerInit() {
+        guard let serverInit = deferredServerInit else { return }
+        deferredServerInit = nil
+        finishStreamKeyNegotiation()
+        if standardStreamChannel == nil, pendingStandardStreamKey == nil {
+            log.warning("The Mac answered without a key update; the session stays unencrypted")
+        }
+        emitState()
+        continuation?.release(leadingWith: .serverInit(serverInit))
+    }
+
+    /// The Mac answers each SetEncryption with a 0x44f update carrying the
+    /// stream key; it takes effect when that update ends.
+    private func noteStandardStreamKey(_ payload: Data) throws {
+        guard let wrapped = wrappedAppleComCryptionKey(payload),
+              let sessionKey = appleSessionKey else {
+            log.warning("Ignoring a Standard 0x44f update that carries no stream key")
+            return
+        }
+        let unwrap = try AESCBCChannel(sendKey: sessionKey, recvKey: sessionKey)
+        pendingStandardStreamKey = (
+            try unwrap.decryptECBBlock(wrapped.key),
+            try unwrap.decryptECBBlock(wrapped.iv))
     }
 
     private func executeAction(_ action: ConnectionAction) async throws {
@@ -4653,38 +4965,56 @@ public actor TransportSession {
     }
 
     private func sendClientPayload(_ payload: Data) async throws {
+        try await sendClientPayload { payload }
+    }
+
+    /// `build` runs at the write's turn, so 0x10 input is encrypted with the
+    /// input key in force when it reaches the wire.
+    private func sendClientPayload(building build: () throws -> Data) async throws {
         if acceptedAppleMediaStream {
             let label = hasEncryptedAppleMediaControl
                 ? "client encrypted payload"
                 : "client plaintext media payload"
-            traceAppleMediaClientPayload(label: label, payload: payload)
-            try await sendAppleMediaControlPayload(payload)
-        } else {
-            if requestAppleMediaStream {
-                traceAppleMediaClientPayload(label: "client plaintext payload", payload: payload)
+            try await sendAppleMediaControlPayload { [self] in
+                let payload = try build()
+                traceAppleMediaClientPayload(label: label, payload: payload)
+                return payload
             }
-            try await sendControlChannel(payload)
+        } else {
+            let traces = requestAppleMediaStream
+            try await sendControlChannel { [self] in
+                let payload = try build()
+                if traces {
+                    traceAppleMediaClientPayload(label: "client plaintext payload", payload: payload)
+                }
+                return payload
+            }
         }
     }
 
     private func sendAppleMediaControlPayload(_ payload: Data) async throws {
-        dumpAppleMediaClientRecordIfRequested(payload)
-        if let channel = appleMediaComCryptionChannel {
-            let encrypted = try channel.encryptPayload(payload, packetID: appleMediaClientPacketID)
-            appleMediaClientPacketID &+= 1
-            guard encrypted.count <= Int(UInt16.max) else {
-                throw VNCProtocolError.protocolViolation(
-                    "Apple ComCryption client payload too large: \(encrypted.count) bytes")
-            }
+        try await sendAppleMediaControlPayload { payload }
+    }
 
-            var framed = Data(capacity: 2 + encrypted.count)
-            framed.append(UInt8((encrypted.count >> 8) & 0xFF))
-            framed.append(UInt8(encrypted.count & 0xFF))
-            framed.append(encrypted)
-            traceAppleMediaClientFrame(label: "client ComCryption frame", payload: payload, framed: framed)
-            try await sendControlChannel(framed)
+    private func sendAppleMediaControlPayload(
+        building build: () throws -> Data
+    ) async throws {
+        if let channel = appleMediaComCryptionChannel {
+            try await sendControlChannel { [self] in
+                // Build and encrypt at our turn, with the channel current then.
+                let payload = try build()
+                dumpAppleMediaClientRecordIfRequested(payload)
+                let current = appleMediaComCryptionChannel ?? channel
+                var framed = Data()
+                appleMediaClientPacketID = try current.appendFramedRecords(
+                    of: payload, firstPacketID: appleMediaClientPacketID, to: &framed)
+                traceAppleMediaClientFrame(label: "client ComCryption frame", payload: payload, framed: framed)
+                return framed
+            }
             return
         }
+        let payload = try build()
+        dumpAppleMediaClientRecordIfRequested(payload)
 
         if appleEncryptedControlChannel == nil,
            stateMachine.selectedSecurityType != .vncAuthentication,
@@ -5271,24 +5601,32 @@ public actor TransportSession {
         return true
     }
 
-    private func configureAppleMediaComCryptionIfPresent(_ payload: Data) throws {
-        guard isAppleMediaComCryptionTransition(payload) else { return }
-
+    /// The stream key and IV of a 0x44f ComCryption transition, each wrapped
+    /// in AES-ECB under the session key.
+    private nonisolated func wrappedAppleComCryptionKey(
+        _ payload: Data
+    ) -> (key: Data, iv: Data)? {
+        guard isAppleMediaComCryptionTransition(payload) else { return nil }
         let base = payload.startIndex
         let encryptedKey = Data(payload[base + 4..<base + 20])
         let encryptedIV = Data(payload[base + 20..<base + 36])
         guard !encryptedKey.allSatisfy({ $0 == 0 }),
               !encryptedIV.allSatisfy({ $0 == 0 }) else {
-            return
+            return nil
         }
+        return (encryptedKey, encryptedIV)
+    }
+
+    private func configureAppleMediaComCryptionIfPresent(_ payload: Data) throws {
+        guard let wrapped = wrappedAppleComCryptionKey(payload) else { return }
 
         try ensureAppleEncryptedControlChannel()
         guard let channel = appleEncryptedControlChannel else {
             throw VNCProtocolError.protocolViolation(
                 "Apple encrypted channel is unavailable")
         }
-        let key = try channel.decryptECBBlock(encryptedKey)
-        let iv = try channel.decryptECBBlock(encryptedIV)
+        let key = try channel.decryptECBBlock(wrapped.key)
+        let iv = try channel.decryptECBBlock(wrapped.iv)
         applePreviousMediaComCryptionChannel = appleMediaComCryptionChannel
         applePreviousMediaServerPacketID = appleMediaServerPacketID
         appleMediaComCryptionChannel = try AppleComCryptionChannel(key: key, iv: iv)
@@ -8310,5 +8648,54 @@ public actor TransportSession {
 private extension UUID {
     var bytes: [UInt8] {
         withUnsafeBytes(of: uuid) { Array($0) }
+    }
+}
+
+/// Delivers session events. While ServerInit waits for the encryption
+/// outcome, app-facing events wait behind it and keep their order, so the
+/// app never sees the first update's events before it is connected.
+private final class SessionEventGate {
+    private let continuation: AsyncStream<SessionEvent>.Continuation
+    private var held: [SessionEvent]?
+
+    init(_ continuation: AsyncStream<SessionEvent>.Continuation) {
+        self.continuation = continuation
+    }
+
+    func yield(_ event: SessionEvent) {
+        if held != nil, Self.waits(event) {
+            held?.append(event)
+        } else {
+            continuation.yield(event)
+        }
+    }
+
+    func finish() {
+        held = nil
+        continuation.finish()
+    }
+
+    func hold() {
+        held = []
+    }
+
+    func release(leadingWith event: SessionEvent) {
+        let pending = held ?? []
+        held = nil
+        continuation.yield(event)
+        pending.forEach { continuation.yield($0) }
+    }
+
+    /// Teardown: what waited belonged to a session the app never saw.
+    func drop() {
+        held = nil
+    }
+
+    /// State, failures and the disconnect always pass straight through.
+    private static func waits(_ event: SessionEvent) -> Bool {
+        switch event {
+        case .stateChanged, .error, .disconnected: false
+        default: true
+        }
     }
 }

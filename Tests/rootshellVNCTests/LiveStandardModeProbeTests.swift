@@ -3,6 +3,7 @@ import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
 import Darwin
+import os
 @testable import RFBProtocol
 @testable import RFBTransport
 @testable import RFBRendering
@@ -584,6 +585,137 @@ final class LiveStandardModeProbeTests: XCTestCase {
         await session.disconnect()
 
         XCTAssertTrue(issues.isEmpty, "decode issues (desync canary): \(issues.prefix(5))")
+    }
+
+    /// A Standard session to a Mac switches to whole-stream encryption in
+    /// both directions and keeps decoding updates and taking input.
+    ///
+    /// No screen content may arrive before the key update. The Mac closes
+    /// the socket on a client record it cannot decrypt, so a session that
+    /// survives encrypted requests and input proves both directions.
+    /// VNC_PROBE_ENCODING=tight uses one-shot requests instead of adaptive
+    /// DCT auto updates.
+    func testStandardWholeStreamEncryption() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let host = env["VNC_TEST_HOST"], !host.isEmpty,
+              let pass = env["VNC_TEST_PASSWORD"], !pass.isEmpty else {
+            throw XCTSkip("Set VNC_TEST_HOST and VNC_TEST_PASSWORD")
+        }
+        VNCLogRelay.install(minimumLevel: .info) { _, category, message in
+            guard category == "TransportSession" else { return }
+            print("RELAY \(message.prefix(400))")
+        }
+        defer { VNCLogRelay.install(sink: nil) }
+
+        let session = TransportSession(
+            host: host, port: UInt16(env["VNC_TEST_PORT"] ?? "5900") ?? 5900,
+            password: pass, username: env["VNC_TEST_USERNAME"] ?? "",
+            preferredPixelFormat: .bgra8888,
+            preferredEncodings: (env["VNC_PROBE_ENCODING"] == "tight" ? [] : [.appleMultiVariantScreenshare])
+                + [
+                    .tight, .lastRect, .zrle, .zlib, .copyRect,
+                    .unknown(1105), .unknown(1101), .unknown(1100), .unknown(1104),
+                    .raw, .desktopSize, .extendedDesktopSize, .cursor,
+                ])
+        let counter = OSAllocatedUnfairLock(initialState: (
+            updates: 0, bytes: 0, errors: 0, encrypted: false,
+            pixelRectsBefore: 0, pixelRectsAfter: 0))
+        let eventTask = Task {
+            for await event in session.events {
+                switch event {
+                case .standardStreamEncrypted:
+                    counter.withLock { $0.encrypted = true }
+                case .framebufferUpdate(let rects):
+                    counter.withLock { state in
+                        state.updates += 1
+                        state.bytes += rects.reduce(0) { $0 + $1.1.count }
+                        let pixelRects = rects.filter { $0.0.encoding.isFramebufferContent }.count
+                        if state.encrypted {
+                            state.pixelRectsAfter += pixelRects
+                        } else {
+                            state.pixelRectsBefore += pixelRects
+                        }
+                    }
+                    try? await session.finishFramebufferUpdate()
+                case .error(let error):
+                    counter.withLock { $0.errors += 1 }
+                    print("PROBE ERROR \(error)")
+                default:
+                    break
+                }
+            }
+        }
+        defer { eventTask.cancel() }
+
+        try await session.connect()
+        try await Task.sleep(for: .seconds(4))
+        // Encrypted pointer input after the switch must not end the session.
+        for step in 0..<40 {
+            try await session.sendPointerEvent(
+                buttonMask: 0, x: UInt16(600 + step * 10), y: UInt16(400 + step * 5))
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        try await Task.sleep(for: .seconds(2))
+        let final = counter.withLock { $0 }
+        let encryption = await session.handshakeInfo.contentEncryption
+        print("PROBE encryption=\(encryption) errors=\(final.errors) "
+            + "updates=\(final.updates) bytes=\(final.bytes) "
+            + "pixelRects before=\(final.pixelRectsBefore) after=\(final.pixelRectsAfter)")
+        await session.disconnect()
+
+        guard case .appleComCryption(_, _, let mediaSRTP) = encryption else {
+            return XCTFail("Standard session is not encrypted: \(encryption)")
+        }
+        XCTAssertFalse(mediaSRTP)
+        XCTAssertEqual(final.errors, 0, "transport error before disconnect")
+        XCTAssertEqual(final.pixelRectsBefore, 0, "screen content arrived before the key update")
+        // Byte counts depend on whether the Mac's display is awake.
+        XCTAssertGreaterThan(final.pixelRectsAfter, 0, "no screen content after the key update")
+    }
+
+    /// Match Client in Standard: the encrypted session still gets the Mac's
+    /// confirmation that it will release the virtual display at disconnect.
+    @MainActor
+    func testStandardMatchClientReleaseUnderEncryption() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let host = env["VNC_TEST_HOST"], !host.isEmpty,
+              let pass = env["VNC_TEST_PASSWORD"], !pass.isEmpty else {
+            throw XCTSkip("Set VNC_TEST_HOST and VNC_TEST_PASSWORD")
+        }
+        let lines = OSAllocatedUnfairLock(initialState: [String]())
+        VNCLogRelay.install(minimumLevel: .info) { _, category, message in
+            guard category == "TransportSession" else { return }
+            lines.withLock { $0.append(message) }
+        }
+        defer { VNCLogRelay.install(sink: nil) }
+
+        let session = VNCSession(configuration: VNCConfiguration(
+            videoQualityMode: .standard,
+            displaySizingMode: .matchClient,
+            enableRemoteAudio: false,
+            reconnectionPolicy: VNCReconnectionPolicy(isEnabled: false, maximumAttempts: 0)))
+        session.updateRemoteDisplaySize(viewSize: CGSize(width: 1512, height: 982), displayScale: 2)
+        try await session.connect(credentials: VNCCredentials(
+            host: host, port: UInt16(env["VNC_TEST_PORT"] ?? "5900") ?? 5900,
+            password: pass, username: env["VNC_TEST_USERNAME"]))
+        let deadline = Date().addingTimeInterval(20)
+        while Date() < deadline, session.framebufferWidth == 0 || session.negotiatedContentEncryption == nil
+            || session.negotiatedContentEncryption == VNCContentEncryption.none {
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        let encryption = session.negotiatedContentEncryption
+        print("PROBE matchClient encryption=\(String(describing: encryption)) "
+            + "framebuffer=\(session.framebufferWidth)x\(session.framebufferHeight)")
+        try await Task.sleep(for: .seconds(3))
+        session.disconnect()
+        try await Task.sleep(for: .seconds(6))
+
+        let log = lines.withLock { $0 }
+        for line in log where line.contains("virtual display") || line.contains("Read loop error") {
+            print("RELAY \(line.prefix(300))")
+        }
+        XCTAssertEqual(encryption, .appleComCryption(cipherMode: nil, keyLength: 128, mediaSRTP: false))
+        XCTAssertTrue(log.contains("The server will release the virtual display at disconnect"))
     }
 
     /// Measures the actual high-level `currentImage` publication cadence. This

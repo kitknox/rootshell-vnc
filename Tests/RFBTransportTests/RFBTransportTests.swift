@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import CommonCrypto
 import CryptoKit
 @testable import RFBTransport
 import RFBProtocol
@@ -579,6 +580,133 @@ final class AppleComCryptionChannelTests: XCTestCase {
         let record = try receiver.decryptRecord(encrypted, expectedPacketID: 0)
         XCTAssertEqual(record.packetID, 0)
         XCTAssertEqual(record.payload, payload)
+    }
+
+    /// The in-place core must produce the same bytes as building the record
+    /// plaintext and CBC-encrypting it, chained across records.
+    func testFramedRecordsMatchReferenceLayout() throws {
+        let key = Data((0..<16).map(UInt8.init))
+        let iv = Data((16..<32).map(UInt8.init))
+        let payloads = [Data(), Data([7]), Data(repeating: 0x5A, count: 14),
+                        Data((0..<1_000).map { UInt8(truncatingIfNeeded: $0) })]
+
+        let sender = try AppleComCryptionChannel(key: key, iv: iv)
+        var framed = Data()
+        var packetID: UInt32 = 5
+        for payload in payloads {
+            packetID = try sender.appendFramedRecords(of: payload, firstPacketID: packetID, to: &framed)
+        }
+
+        var expected = Data()
+        var chain = iv
+        for (index, payload) in payloads.enumerated() {
+            var plaintext = Data([UInt8(payload.count >> 8), UInt8(payload.count & 0xFF)]) + payload
+            let remainder = (plaintext.count + 20) % 16
+            plaintext.append(Data(count: remainder == 0 ? 0 : 16 - remainder))
+            var hashed = withUnsafeBytes(of: (UInt32(5 + index)).bigEndian) { Data($0) }
+            hashed.append(plaintext)
+            plaintext.append(Data(Insecure.SHA1.hash(data: hashed)))
+            let ciphertext = Self.cbcEncrypt(plaintext, key: key, iv: chain)
+            chain = ciphertext.suffix(16)
+            expected.append(contentsOf: [UInt8(ciphertext.count >> 8), UInt8(ciphertext.count & 0xFF)])
+            expected.append(ciphertext)
+        }
+        XCTAssertEqual(packetID, 9)
+        XCTAssertEqual(framed, expected)
+    }
+
+    func testFramedRecordsDecryptAcrossPartialReadsAndSplitLargePayloads() throws {
+        let key = Data((0..<16).map(UInt8.init))
+        let iv = Data((16..<32).map(UInt8.init))
+        let large = Data((0..<200_000).map { UInt8(truncatingIfNeeded: $0 &* 13) })
+        let small = Data("after".utf8)
+
+        let sender = try AppleComCryptionChannel(key: key, iv: iv)
+        var wire = Data()
+        var packetID = try sender.appendFramedRecords(of: large, firstPacketID: 0, to: &wire)
+        XCTAssertEqual(packetID, 4, "200 KB needs four records")
+        packetID = try sender.appendFramedRecords(of: small, firstPacketID: packetID, to: &wire)
+
+        let receiver = try AppleComCryptionChannel(key: key, iv: iv)
+        var buffer = Data()
+        var offset = 0
+        var expectedPacketID: UInt32 = 0
+        var plaintext = Data()
+        var position = 0
+        while position < wire.count {
+            let end = min(position + 997, wire.count)
+            buffer.append(wire[position..<end])
+            position = end
+            _ = try receiver.decryptFramedRecords(
+                in: buffer, offset: &offset, expectedPacketID: &expectedPacketID,
+                appendingTo: &plaintext)
+        }
+        XCTAssertEqual(offset, buffer.count)
+        XCTAssertEqual(expectedPacketID, 5)
+        XCTAssertEqual(plaintext, large + small)
+    }
+
+    func testFramedRecordsRejectTamperingAndBadLengths() throws {
+        let key = Data((0..<16).map(UInt8.init))
+        let iv = Data((16..<32).map(UInt8.init))
+        var wire = Data()
+        _ = try AppleComCryptionChannel(key: key, iv: iv)
+            .appendFramedRecords(of: Data("payload".utf8), firstPacketID: 0, to: &wire)
+
+        var tampered = wire
+        tampered[tampered.count - 1] ^= 0x01
+        var offset = 0
+        var packetID: UInt32 = 0
+        var output = Data("kept".utf8)
+        XCTAssertThrowsError(try AppleComCryptionChannel(key: key, iv: iv).decryptFramedRecords(
+            in: tampered, offset: &offset, expectedPacketID: &packetID, appendingTo: &output))
+        XCTAssertEqual(output, Data("kept".utf8), "a failed record leaves the buffer untouched")
+
+        XCTAssertThrowsError(try AppleComCryptionChannel(key: key, iv: iv).decryptFramedRecords(
+            in: Data([0x00, 0x11]) + Data(count: 17), offset: &offset,
+            expectedPacketID: &packetID, appendingTo: &output))
+    }
+
+    /// Prints bulk decrypt throughput for screen-sized Standard traffic.
+    func testFramedRecordThroughput() throws {
+        let key = Data((0..<16).map(UInt8.init))
+        let iv = Data((16..<32).map(UInt8.init))
+        let payload = Data((0..<(32 << 20)).map { UInt8(truncatingIfNeeded: $0) })
+        var wire = Data()
+        let encryptStart = DispatchTime.now().uptimeNanoseconds
+        _ = try AppleComCryptionChannel(key: key, iv: iv)
+            .appendFramedRecords(of: payload, firstPacketID: 0, to: &wire)
+        let decryptStart = DispatchTime.now().uptimeNanoseconds
+        var offset = 0
+        var packetID: UInt32 = 0
+        var plaintext = Data()
+        plaintext.reserveCapacity(payload.count)
+        _ = try AppleComCryptionChannel(key: key, iv: iv).decryptFramedRecords(
+            in: wire, offset: &offset, expectedPacketID: &packetID, appendingTo: &plaintext)
+        let end = DispatchTime.now().uptimeNanoseconds
+        XCTAssertEqual(plaintext.count, payload.count)
+        let megabytes = Double(payload.count) / 1_048_576
+        print(String(
+            format: "COMCRYPTION encrypt %.0f MB/s decrypt %.0f MB/s",
+            megabytes / (Double(decryptStart - encryptStart) / 1e9),
+            megabytes / (Double(end - decryptStart) / 1e9)))
+    }
+
+    private static func cbcEncrypt(_ data: Data, key: Data, iv: Data) -> Data {
+        var output = Data(count: data.count)
+        var moved = 0
+        _ = output.withUnsafeMutableBytes { out in
+            data.withUnsafeBytes { input in
+                key.withUnsafeBytes { keyBytes in
+                    iv.withUnsafeBytes { ivBytes in
+                        CCCrypt(CCOperation(kCCEncrypt), CCAlgorithm(kCCAlgorithmAES), 0,
+                                keyBytes.baseAddress, key.count, ivBytes.baseAddress,
+                                input.baseAddress, data.count, out.baseAddress, data.count, &moved)
+                    }
+                }
+            }
+        }
+        return output
     }
 }
 

@@ -2257,6 +2257,9 @@ public final class VNCSession {
             diagnostics.encryptionMode = "Cipher mode \(info.cipherMode), key length \(info.keyLength)"
             await refreshHandshakeDiagnostics(from: transport)
 
+        case .standardStreamEncrypted:
+            await refreshHandshakeDiagnostics(from: transport)
+
         case .displayInfo(let info):
             noteAppleServerProtocolObserved()
             logger.info("Display info: \(info.width)x\(info.height) at (\(info.originX),\(info.originY))")

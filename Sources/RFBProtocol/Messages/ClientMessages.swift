@@ -54,6 +54,12 @@ public enum ClientMessage: Sendable, Equatable {
     /// Apple message type 18: request/open an accelerated media stream.
     case appleMediaStreamRequest
 
+    /// Apple message type 18 on its own: SetEncryption at `level`.
+    case appleSetEncryption(level: UInt8)
+
+    /// Apple message type 18, command 2: the viewer encrypts from here on.
+    case appleDecryptReceived
+
     /// Apple message type 29: configure one or two virtual displays.
     case appleDisplayConfiguration(AppleDisplayConfiguration)
 
@@ -76,6 +82,8 @@ public enum ClientMessage: Sendable, Equatable {
         case .appleMediaStreamConfiguration: return 0x21
         case .appleViewerInfo:             return 0x21
         case .appleMediaStreamRequest:     return 0x12
+        case .appleSetEncryption:          return 0x12
+        case .appleDecryptReceived:        return 0x12
         case .appleDisplayConfiguration:   return AppleDisplayConfiguration.messageType
         }
     }
@@ -118,6 +126,10 @@ public enum ClientMessage: Sendable, Equatable {
                 acceptedServerMessages: acceptedServerMessages)
         case .appleMediaStreamRequest:
             return MessageWriter.writeAppleMediaStreamRequest()
+        case .appleSetEncryption(let level):
+            return MessageWriter.writeAppleSetEncryption(level: level)
+        case .appleDecryptReceived:
+            return MessageWriter.writeAppleDecryptReceived()
         case .appleDisplayConfiguration(let configuration):
             return MessageWriter.writeAppleDisplayConfiguration(configuration)
         }

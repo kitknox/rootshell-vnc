@@ -311,18 +311,26 @@ public enum MessageWriter: Sendable {
         return data
     }
 
+    /// Serialize Apple SetEncryption (0x12): command 1, `level`, one method
+    /// (1, AES-128). Level 0 protects input only; level 1 has the server
+    /// encrypt every message after the 0x44f update carrying the stream key.
+    public static func writeAppleSetEncryption(level: UInt8) -> Data {
+        Data([0x12, 0x00, 0x00, 0x01, 0x00, level, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01])
+    }
+
+    /// Serialize Apple SetEncryption command 2: from the next message on,
+    /// the server decrypts everything the viewer sends.
+    public static func writeAppleDecryptReceived() -> Data {
+        Data([0x12, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00])
+    }
+
     /// Serialize Apple's client media-stream request.
     ///
     /// Send this `0x12` message immediately after the `0x21` media-stream
     /// configuration. It prompts the server to send the
     /// `RFBMediaStreamMessage1Encoding` offer rectangle.
     public static func writeAppleMediaStreamRequest() -> Data {
-        Data([
-            0x12, 0x00, 0x00, 0x01,
-            0x00, 0x01, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x01,
-            0x0a, 0x00, 0x00, 0x01,
-        ])
+        writeAppleSetEncryption(level: 1) + Data([0x0a, 0x00, 0x00, 0x01])
     }
 
     // MARK: - Handshake messages
