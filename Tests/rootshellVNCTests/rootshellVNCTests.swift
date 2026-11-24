@@ -1688,6 +1688,72 @@ final class AppleRemoteAudioRTPTests: XCTestCase {
 
 final class RemoteDisplaySizeTests: XCTestCase {
 
+    // Dynamic Resolution sizing, as seen working on a Mac (Mac Catalyst host).
+
+    func testCorePixelsAreTwoTimesPointsAndPointsAlignToEight() {
+        for size in [CGSize(width: 1330, height: 957), CGSize(width: 1111, height: 777), CGSize(width: 1366, height: 1024)] {
+            let r = RemoteDisplaySize.matching(viewSize: size)
+            XCTAssertNotNil(r)
+            guard let r else { continue }
+            XCTAssertEqual(Int(r.pixelWidth), Int(r.pointWidth) * 2)
+            XCTAssertEqual(Int(r.pixelHeight), Int(r.pointHeight) * 2)
+            XCTAssertEqual(Int(r.pointWidth) % 8, 0)
+            XCTAssertEqual(Int(r.pointHeight) % 8, 0)
+        }
+    }
+
+    func testCoreLoggedViewSizeRequests2656By1920Pixels() {
+        let r = RemoteDisplaySize.matching(viewSize: CGSize(width: 1330, height: 957))
+        XCTAssertEqual(r?.pixelWidth, 2656)
+        XCTAssertEqual(r?.pixelHeight, 1920)
+    }
+
+    func testCoreTinyViewKeepsAspectRatioAtMinimumWorkspace() throws {
+        let r = try XCTUnwrap(RemoteDisplaySize.matching(viewSize: CGSize(width: 512, height: 300)))
+        XCTAssertEqual(r.pointWidth, 1024)
+        XCTAssertEqual(r.pointHeight, 600)
+        let narrow = try XCTUnwrap(RemoteDisplaySize.matching(viewSize: CGSize(width: 300, height: 600)))
+        XCTAssertGreaterThanOrEqual(narrow.pointWidth, 512)
+        XCTAssertGreaterThanOrEqual(narrow.pointHeight, 1200)
+        XCTAssertEqual(Double(narrow.pointWidth) / Double(narrow.pointHeight), 0.5, accuracy: 0.01)
+    }
+
+    func testCoreFullScreen2560By1440PointsIsCappedTo4K() {
+        let r = RemoteDisplaySize.matching(viewSize: CGSize(width: 2560, height: 1440))
+        XCTAssertEqual(r?.pointWidth, 1920)
+        XCTAssertEqual(r?.pointHeight, 1080)
+        XCTAssertEqual(r?.pixelWidth, 3840)
+        XCTAssertEqual(r?.pixelHeight, 2160)
+    }
+
+    func testCoreAreaNeverAboveUHDAndNoDimensionAbove5120Pixels() throws {
+        let sizes = [CGSize(width: 2560, height: 1600), CGSize(width: 3000, height: 3000), CGSize(width: 1720, height: 1200),
+                     CGSize(width: 5000, height: 900), CGSize(width: 900, height: 5000), CGSize(width: 1920, height: 1080)]
+        for size in sizes {
+            let r = try XCTUnwrap(RemoteDisplaySize.matching(viewSize: size), "\(size)")
+            XCTAssertLessThanOrEqual(Int(r.pixelWidth) * Int(r.pixelHeight), 3840 * 2160, "\(size)")
+            XCTAssertLessThanOrEqual(Int(r.pixelWidth), 5120, "\(size)")
+            XCTAssertLessThanOrEqual(Int(r.pixelHeight), 5120, "\(size)")
+        }
+    }
+
+    func testCoreLogged1720By1200PointRequestIs3440By2400Pixels() {
+        // A size seen in a real log: 1720x1200 points = 3440x2400 pixels (8.26 Mpx, under the 8.29 Mpx cap).
+        let r = RemoteDisplaySize.matching(viewSize: CGSize(width: 1720, height: 1200))
+        XCTAssertEqual(r?.pointWidth, 1720)
+        XCTAssertEqual(r?.pointHeight, 1200)
+        XCTAssertEqual(r?.pixelWidth, 3440)
+        XCTAssertEqual(r?.pixelHeight, 2400)
+    }
+
+    func testCoreInvalidSizesGiveNil() {
+        for size in [CGSize.zero, CGSize(width: 0, height: 500), CGSize(width: 500, height: 0),
+                     CGSize(width: CGFloat.infinity, height: 500), CGSize(width: 500, height: CGFloat.infinity),
+                     CGSize(width: CGFloat.nan, height: 500), CGSize(width: 500, height: CGFloat.nan)] {
+            XCTAssertNil(RemoteDisplaySize.matching(viewSize: size), "\(size)")
+        }
+    }
+
     func testPhoneViewportExpandsToUsableMacWorkspace() {
         XCTAssertEqual(
             RemoteDisplaySize.matching(
