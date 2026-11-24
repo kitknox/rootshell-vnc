@@ -72,6 +72,9 @@ public struct RemoteDesktopView: View {
     private let toggleFullScreen: (() -> Void)?
     private let hudMenuExtras: VNCHUDMenuExtras
     private var screenPlaceholder: AnyView?
+    /// The host shows the HUD's items in its own menu (the Mac menu bar). Off by default.
+    private var hidesHUD = false
+    private var desktopControls: VNCDesktopControls?
     #if canImport(UIKit)
     private var hudAccessory: HUDAccessory?
     #endif
@@ -168,6 +171,21 @@ public struct RemoteDesktopView: View {
                     session.setCurtainMode(false)
                 }
             })
+    }
+
+    /// Hides the floating HUD (menu button and accessory). For a host that offers the same items in its own menu.
+    /// Off by default.
+    public func hidesHUD(_ hidden: Bool) -> Self {
+        var copy = self
+        copy.hidesHUD = hidden
+        return copy
+    }
+
+    /// Lets the host trigger the file transfers panel and the curtain prompt from its own menu.
+    public func desktopControls(_ controls: VNCDesktopControls?) -> Self {
+        var copy = self
+        copy.desktopControls = controls
+        return copy
     }
 
     /// Host content drawn over the remote picture and under the controls,
@@ -373,7 +391,26 @@ public struct RemoteDesktopView: View {
                 keyboardActive = requested
             }
         }
+        .onChange(of: desktopControlRequests) { old, new in
+            guard new.controller != nil, old.controller == new.controller else { return }
+            #if canImport(UIKit)
+            // Two toggles can land in one update; only the parity moves the panel.
+            if (new.fileTransferToggles &- old.fileTransferToggles) & 1 != 0 {
+                showsFileTransfers.toggle()
+            }
+            #endif
+            if new.curtainPrompts != old.curtainPrompts {
+                presentHostCurtainPrompt()
+            }
+        }
         #if canImport(UIKit)
+        // The overlay's teardown never reports, so its last measurements would
+        // keep shortening the screen and steering the composition preview.
+        .onChange(of: hidesHUD) { _, hidden in
+            guard hidden else { return }
+            hudReserve = 0
+            hudFrame.frame = .zero
+        }
         .background {
             DockedKeyboardInsetReader(
                 metrics: $keyboardViewportMetrics,
@@ -480,16 +517,18 @@ public struct RemoteDesktopView: View {
                 safeArea: proxy.safeAreaInsets,
                 safeAreaEdges: hudSafeAreaEdges,
                 margin: margin)
-            DraggableHUDOverlay(
-                inset: margin,
-                safeAreaEdges: hudSafeAreaEdges,
-                pinnedRowHeight: hudAccessory?.docksToBottom == true
-                    ? hudAccessory?.buttonStyle(available).size.height : nil,
-                onReserveChange: { hudReserve = $0 },
-                onFrameChange: { [hudFrame] in hudFrame.frame = $0 }
-            ) {
-                HUDBar(accessory: hudAccessory, availableWidth: available) {
-                    hudMenu
+            if !hidesHUD {
+                DraggableHUDOverlay(
+                    inset: margin,
+                    safeAreaEdges: hudSafeAreaEdges,
+                    pinnedRowHeight: hudAccessory?.docksToBottom == true
+                        ? hudAccessory?.buttonStyle(available).size.height : nil,
+                    onReserveChange: { hudReserve = $0 },
+                    onFrameChange: { [hudFrame] in hudFrame.frame = $0 }
+                ) {
+                    HUDBar(accessory: hudAccessory, availableWidth: available) {
+                        hudMenu
+                    }
                 }
             }
             CompositionPreviewLayer(
@@ -500,15 +539,17 @@ public struct RemoteDesktopView: View {
                 safeAreaEdges: hudSafeAreaEdges)
         }
         #else
-        VStack {
-            Spacer()
-            HStack {
+        if !hidesHUD {
+            VStack {
                 Spacer()
-                hudMenu
+                HStack {
+                    Spacer()
+                    hudMenu
+                }
+                .padding(12)
             }
-            .padding(12)
+            .allowsHitTesting(true)
         }
-        .allowsHitTesting(true)
         #endif
     }
 
@@ -699,6 +740,30 @@ public struct RemoteDesktopView: View {
                     systemImage: session.isCurtained ? "eye.slash.fill" : "eye.slash")
             }
         }
+    }
+
+    private struct DesktopControlRequests: Equatable {
+        var controller: UUID?
+        var fileTransferToggles = 0
+        var curtainPrompts = 0
+    }
+
+    private var desktopControlRequests: DesktopControlRequests {
+        guard let desktopControls else { return DesktopControlRequests() }
+        var requests = DesktopControlRequests(
+            controller: desktopControls.identity,
+            curtainPrompts: desktopControls.curtainPromptRequests)
+        #if canImport(UIKit)
+        requests.fileTransferToggles = desktopControls.fileTransfersToggleRequests
+        #endif
+        return requests
+    }
+
+    /// Same gate as the HUD's toggle: confirming would otherwise send nothing.
+    private func presentHostCurtainPrompt() {
+        guard session.connectionState.isConnected,
+              session.supportsCurtainMode else { return }
+        curtainPromptPresented = true
     }
 
     private func requestPasswordSend() {
