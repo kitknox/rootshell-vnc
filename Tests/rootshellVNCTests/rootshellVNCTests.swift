@@ -1099,6 +1099,61 @@ final class DisplayPresentationTests: XCTestCase {
             normalizedSelectedDisplayRegion(displays, displayCount: 2),
             CGRect(x: 0, y: 0, width: 4480, height: 1440))
     }
+
+    private static let threeDisplays = [
+        AppleDisplayInfo(
+            displayIndex: 1, originX: 0, originY: 0,
+            width: 16, height: 8, flags: 0),
+        AppleDisplayInfo(
+            displayIndex: 2, originX: 16, originY: 0,
+            width: 16, height: 8, flags: 0),
+        AppleDisplayInfo(
+            displayIndex: 3, originX: 32, originY: 0,
+            width: 16, height: 8, flags: 0),
+    ]
+
+    @MainActor
+    func testAllDisplaysPresentsEveryAnnouncedDisplayInStandardMode() async {
+        let session = VNCSession(configuration: VNCConfiguration(
+            videoQualityMode: .standard,
+            displayMode: .allDisplaysCombined))
+        await session.updateRemoteDisplayRegions(Self.threeDisplays)
+
+        XCTAssertEqual(
+            session.presentedFramebufferRegion,
+            CGRect(x: 0, y: 0, width: 48, height: 8),
+            "All Displays must not stop at the second display")
+    }
+
+    @MainActor
+    func testAllDisplaysPresentsEveryAnnouncedDisplayInHighPerformanceMode() async {
+        let session = VNCSession(configuration: VNCConfiguration(
+            videoQualityMode: .adaptive,
+            displayMode: .allDisplaysCombined))
+        await session.updateRemoteDisplayRegions(Self.threeDisplays)
+        await session.applyAcceptedMediaStreamGeometry(VideoFrameGeometry(
+            width: 16,
+            height: 8,
+            mediaGeneration: 1))
+
+        XCTAssertEqual(session.framebufferWidth, 48)
+        XCTAssertEqual(session.framebufferHeight, 8)
+        XCTAssertEqual(
+            session.presentedVideoDisplayRegions,
+            [CGRect(x: 0, y: 0, width: 48, height: 8)])
+    }
+
+    @MainActor
+    func testOneDisplayIgnoresAdditionalAnnouncedDisplays() async {
+        let session = VNCSession(configuration: VNCConfiguration(
+            videoQualityMode: .standard,
+            displayMode: .oneDisplay))
+        await session.updateRemoteDisplayRegions(Self.threeDisplays)
+
+        XCTAssertEqual(
+            session.presentedFramebufferRegion,
+            CGRect(x: 0, y: 0, width: 16, height: 8))
+    }
 }
 
 final class VNCReconnectionPolicyTests: XCTestCase {

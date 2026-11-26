@@ -163,8 +163,10 @@ func appleDisplayInfo2Records(_ payload: Data) -> [AppleDisplayInfo] {
             | UInt32(payload[start + offset + 2]) << 8
             | UInt32(payload[start + offset + 3])
     }
-    let count = Int(uint16(at: 20))
-    guard count > 0, count <= 16 else { return [] }
+    // The Mac lists up to 25 active displays today. The payload bounds the
+    // count, so a larger list is read without a fixed limit.
+    let count = min(Int(uint16(at: 20)), (payload.count - 22 + 55) / 56)
+    guard count > 0 else { return [] }
 
     return (0..<count).compactMap { index in
         // The two-byte payload length precedes a 20-byte desktop header.

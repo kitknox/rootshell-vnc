@@ -856,8 +856,15 @@ public final class VNCSession {
 
     /// Server display rectangles, normalized into framebuffer coordinates and
     /// ordered as announced by the server (primary first). Standard mode uses
-    /// these to present only the number of displays selected by the user.
+    /// these to present only the displays selected by the user.
     private(set) var remoteDisplayRegions: [CGRect] = []
+    /// Leading announced displays to present. The combined mode spans every
+    /// display the server announces, not a fixed pair.
+    private var presentedDisplayCount: Int {
+        configuration.displayMode == .allDisplaysCombined
+            ? max(configuration.displayCount, remoteDisplayRegions.count)
+            : configuration.displayCount
+    }
     @ObservationIgnored
     private var remoteDisplayRegionByID: [UInt32: CGRect] = [:]
     @ObservationIgnored
@@ -2487,7 +2494,7 @@ public final class VNCSession {
               !remoteDisplayRegions.isEmpty else { return }
 
         let selectedCount = min(
-            max(1, configuration.displayCount),
+            max(1, presentedDisplayCount),
             remoteDisplayRegions.count)
         guard let first = remoteDisplayRegions.first else { return }
         let selected = remoteDisplayRegions.prefix(selectedCount)
@@ -2516,7 +2523,7 @@ public final class VNCSession {
         }
         return normalizedSelectedDisplayRegion(
             remoteDisplayRegions,
-            displayCount: configuration.displayCount,
+            displayCount: presentedDisplayCount,
             framebufferSize: CGSize(
                 width: framebufferWidth,
                 height: framebufferHeight))
@@ -2533,13 +2540,13 @@ public final class VNCSession {
         if configuration.displaySizingMode != .matchClient,
            remoteDisplayRegions.count >= count {
             if count == 1,
-               configuration.displayCount > 1,
-               remoteDisplayRegions.count >= configuration.displayCount {
+               presentedDisplayCount > 1,
+               remoteDisplayRegions.count >= presentedDisplayCount {
                 // Apple's physical "All Displays" mode is one HEVC stream
                 // whose format is the union of the selected monitor regions.
                 // Present that stream once at the composite aspect ratio.
                 let selected = Array(
-                    remoteDisplayRegions.prefix(configuration.displayCount))
+                    remoteDisplayRegions.prefix(presentedDisplayCount))
                 guard let first = selected.first else { return [] }
                 let union = selected.dropFirst().reduce(first) { $0.union($1) }
                 return [CGRect(origin: .zero, size: union.size)]
@@ -2731,10 +2738,10 @@ public final class VNCSession {
                remoteDisplayRegions.indices.contains(index) {
                 if index == 0,
                    activeVideoDisplayCount == 1,
-                   configuration.displayCount > 1,
-                   remoteDisplayRegions.count >= configuration.displayCount {
+                   presentedDisplayCount > 1,
+                   remoteDisplayRegions.count >= presentedDisplayCount {
                     let selected = remoteDisplayRegions.prefix(
-                        configuration.displayCount)
+                        presentedDisplayCount)
                     if let first = selected.first {
                         let union = selected.dropFirst().reduce(first) {
                             $0.union($1)
@@ -2890,14 +2897,14 @@ public final class VNCSession {
               geometry.height <= Int(UInt16.max) else { return }
         acceptsDeferredAppleDisplayGeometry = false
         if configuration.displaySizingMode != .matchClient,
-           configuration.displayCount > 1,
-           remoteDisplayRegions.count >= configuration.displayCount {
+           presentedDisplayCount > 1,
+           remoteDisplayRegions.count >= presentedDisplayCount {
             // In Apple's physical All Displays mode the codec raster can stay
             // at the primary encoder size. ScreenConfiguration is the native
             // authority for the combined canvas and pointer coordinates.
             guard let union = normalizedSelectedDisplayRegion(
                 remoteDisplayRegions,
-                displayCount: configuration.displayCount) else { return }
+                displayCount: presentedDisplayCount) else { return }
             let width = Int(union.width)
             let height = Int(union.height)
             guard width > 0, height > 0,
@@ -4467,10 +4474,10 @@ public final class VNCSession {
             if index == 0,
                activeVideoDisplayCount == 1,
                configuration.displaySizingMode != .matchClient,
-               configuration.displayCount > 1,
-               remoteDisplayRegions.count >= configuration.displayCount {
+               presentedDisplayCount > 1,
+               remoteDisplayRegions.count >= presentedDisplayCount {
                 let selected = remoteDisplayRegions.prefix(
-                    configuration.displayCount)
+                    presentedDisplayCount)
                 if let first = selected.first {
                     let union = selected.dropFirst().reduce(first) {
                         $0.union($1)

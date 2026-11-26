@@ -155,6 +155,43 @@ final class DisplayCountTests: XCTestCase {
         XCTAssertEqual(displays[1].height, 1_964)
     }
 
+    private func displayInfo2Payload(
+        declaredCount: Int,
+        recordCount: Int
+    ) -> Data {
+        var payload = Data(repeating: 0, count: 22 + recordCount * 56)
+        func write(_ value: Int, at offset: Int) {
+            payload[offset] = UInt8((value >> 8) & 0xff)
+            payload[offset + 1] = UInt8(value & 0xff)
+        }
+        write(payload.count - 2, at: 0)
+        write(declaredCount, at: 20)
+        for index in 0..<recordCount {
+            let record = 22 + index * 56
+            payload[record + 19] = UInt8(index + 1)
+            write(index * 100, at: record + 30)
+            write(50, at: record + 32)
+            write((index + 1) * 100, at: record + 34)
+        }
+        return payload
+    }
+
+    func testAppleDisplayInfo2DecodesEveryDisplayTheMacCanList() {
+        // The Mac's server enumerates at most 25 active displays.
+        let displays = appleDisplayInfo2Records(
+            displayInfo2Payload(declaredCount: 25, recordCount: 25))
+        XCTAssertEqual(displays.map(\.displayIndex), Array(1...25))
+        XCTAssertEqual(displays.last?.originX, 2_400)
+        XCTAssertEqual(displays.last?.width, 100)
+        XCTAssertEqual(displays.last?.height, 50)
+    }
+
+    func testAppleDisplayInfo2CountIsBoundedByThePayload() {
+        let displays = appleDisplayInfo2Records(
+            displayInfo2Payload(declaredCount: 4_000, recordCount: 3))
+        XCTAssertEqual(displays.map(\.displayIndex), [1, 2, 3])
+    }
+
     func testAdaptiveMediaDisplaySelectionDefaultsToOneReceiver() {
         XCTAssertEqual(
             selectedAppleMediaDisplayCount(offered: 2, requested: 1),
